@@ -50,7 +50,7 @@ import com.oracle.truffle.api.source.SourceSection;
 
 public final class RegexRootNode extends RootNode {
 
-    private static final FrameDescriptor SHARED_EMPTY_FRAMEDESCRIPTOR = new FrameDescriptor();
+    public static final FrameDescriptor SHARED_EMPTY_FRAMEDESCRIPTOR = new FrameDescriptor();
 
     @Child private RegexBodyNode body;
 
@@ -61,6 +61,13 @@ public final class RegexRootNode extends RootNode {
 
     public RegexSource getSource() {
         return body.getSource();
+    }
+
+    public RegexBodyNode getBodyUnwrapped() {
+        if (body instanceof InstrumentableNode.WrapperNode) {
+            return (RegexBodyNode) ((InstrumentableNode.WrapperNode) body).getDelegateNode();
+        }
+        return body;
     }
 
     @Override
@@ -76,10 +83,7 @@ public final class RegexRootNode extends RootNode {
     @TruffleBoundary
     @Override
     public String toString() {
-        if (body instanceof InstrumentableNode.WrapperNode) {
-            return ((InstrumentableNode.WrapperNode) body).getDelegateNode().toString();
-        }
-        return body.toString();
+        return getBodyUnwrapped().toString();
     }
 
     /**

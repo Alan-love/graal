@@ -26,14 +26,13 @@ package com.oracle.truffle.tools.chromeinspector.types;
 
 import java.util.List;
 
-import com.oracle.truffle.tools.utils.json.JSONArray;
-import com.oracle.truffle.tools.utils.json.JSONObject;
-
 import com.oracle.truffle.api.debug.DebugStackTraceElement;
 import com.oracle.truffle.api.source.Source;
 import com.oracle.truffle.api.source.SourceSection;
 import com.oracle.truffle.tools.chromeinspector.InspectorExecutionContext;
 import com.oracle.truffle.tools.chromeinspector.ScriptsHandler;
+import org.graalvm.shadowed.org.json.JSONArray;
+import org.graalvm.shadowed.org.json.JSONObject;
 
 public final class StackTrace {
 
@@ -66,14 +65,12 @@ public final class StackTrace {
                 callFrame.put("functionName", frame.getName());
                 ScriptsHandler sch = context.acquireScriptsHandler();
                 try {
-                    int scriptId = sch.assureLoaded(source);
-                    if (scriptId != -1) {
-                        callFrame.put("scriptId", Integer.toString(scriptId));
-                        callFrame.put("url", sch.getScript(scriptId).getUrl());
-                        callFrame.put("lineNumber", sourceSection.getStartLine() - 1);
-                        callFrame.put("columnNumber", sourceSection.getStartColumn() - 1);
-                        callFrames.put(callFrame);
-                    }
+                    int scriptId = sch.assureLoaded(source).getId();
+                    callFrame.put("scriptId", Integer.toString(scriptId));
+                    callFrame.put("url", sch.getScript(scriptId).getUrl());
+                    callFrame.put("lineNumber", sourceSection.getStartLine() - 1);
+                    callFrame.put("columnNumber", sourceSection.getStartColumn() - 1);
+                    callFrames.put(callFrame);
                 } finally {
                     context.releaseScriptsHandler();
                 }

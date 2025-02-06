@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2016, 2020, Oracle and/or its affiliates.
+ * Copyright (c) 2016, 2023, Oracle and/or its affiliates.
  *
  * All rights reserved.
  *
@@ -29,25 +29,25 @@
  */
 package com.oracle.truffle.llvm.runtime.nodes.op;
 
-import com.oracle.truffle.api.CompilerDirectives;
 import com.oracle.truffle.api.dsl.Cached;
 import com.oracle.truffle.api.dsl.CreateCast;
 import com.oracle.truffle.api.dsl.NodeChild;
 import com.oracle.truffle.api.dsl.Specialization;
 import com.oracle.truffle.api.interop.UnsupportedMessageException;
-import com.oracle.truffle.api.library.CachedLibrary;
 import com.oracle.truffle.api.nodes.UnexpectedResultException;
 import com.oracle.truffle.api.profiles.ValueProfile;
-import com.oracle.truffle.llvm.runtime.nodes.op.arith.floating.LLVMArithmeticFactory;
 import com.oracle.truffle.llvm.runtime.ArithmeticOperation;
 import com.oracle.truffle.llvm.runtime.LLVMIVarBit;
+import com.oracle.truffle.llvm.runtime.floating.LLVM128BitFloat;
 import com.oracle.truffle.llvm.runtime.floating.LLVM80BitFloat;
+import com.oracle.truffle.llvm.runtime.floating.LLVMLongDoubleFloatingPoint;
+import com.oracle.truffle.llvm.runtime.floating.LLVMLongDoubleNode;
+import com.oracle.truffle.llvm.runtime.floating.LLVMLongDoubleNode.LongDoubleKinds;
 import com.oracle.truffle.llvm.runtime.interop.LLVMNegatedForeignObject;
-import com.oracle.truffle.llvm.runtime.library.internal.LLVMNativeLibrary;
-import com.oracle.truffle.llvm.runtime.nodes.api.LLVMArithmetic.LLVMArithmeticOpNode;
 import com.oracle.truffle.llvm.runtime.nodes.api.LLVMExpressionNode;
 import com.oracle.truffle.llvm.runtime.nodes.api.LLVMNode;
 import com.oracle.truffle.llvm.runtime.nodes.api.LLVMTypesGen;
+import com.oracle.truffle.llvm.runtime.nodes.memory.LLVMNativePointerSupport;
 import com.oracle.truffle.llvm.runtime.nodes.op.LLVMArithmeticNodeFactory.LLVMI64ArithmeticNodeGen;
 import com.oracle.truffle.llvm.runtime.nodes.op.LLVMArithmeticNodeFactory.LLVMI64SubNodeGen;
 import com.oracle.truffle.llvm.runtime.nodes.op.LLVMArithmeticNodeFactory.ManagedAndNodeGen;
@@ -67,7 +67,10 @@ public abstract class LLVMArithmeticNode extends LLVMExpressionNode {
 
     private abstract static class LLVMArithmeticOp {
 
-        abstract boolean doBoolean(boolean left, boolean right);
+        boolean doBoolean(boolean left, boolean right) {
+            int ret = doInt(left ? 1 : 0, right ? 1 : 0);
+            return (ret & 1) == 1;
+        }
 
         abstract byte doByte(byte left, byte right);
 
@@ -94,7 +97,9 @@ public abstract class LLVMArithmeticNode extends LLVMExpressionNode {
 
         abstract double doDouble(double left, double right);
 
-        abstract LLVMArithmeticOpNode createFP80Node();
+        abstract LLVMLongDoubleNode createFP80Node();
+
+        abstract LLVMLongDoubleNode createFP128Node();
     }
 
     abstract static class ManagedArithmeticNode extends LLVMNode {
@@ -233,24 +238,26 @@ public abstract class LLVMArithmeticNode extends LLVMExpressionNode {
             return l;
         }
 
-        @Specialization(limit = "3", guards = "lib.isPointer(ptr)", rewriteOn = UnsupportedMessageException.class)
+        @Specialization(guards = "isPointer.execute(ptr)", rewriteOn = UnsupportedMessageException.class)
         long doPointer(Object ptr,
-                        @CachedLibrary("ptr") LLVMNativeLibrary lib) throws UnsupportedMessageException {
-            return lib.asPointer(ptr);
+                        @SuppressWarnings("unused") @Cached LLVMNativePointerSupport.IsPointerNode isPointer,
+                        @Cached LLVMNativePointerSupport.AsPointerNode asPointer) throws UnsupportedMessageException {
+            return asPointer.execute(ptr);
         }
 
-        @Specialization(limit = "3", guards = "!lib.isPointer(ptr)")
+        @Specialization(guards = "!isPointer.execute(ptr)")
         Object doManaged(Object ptr,
-                        @SuppressWarnings("unused") @CachedLibrary("ptr") LLVMNativeLibrary lib) {
+                        @SuppressWarnings("unused") @Cached LLVMNativePointerSupport.IsPointerNode isPointer) {
             return ptr;
         }
 
-        @Specialization(limit = "5", replaces = {"doLong", "doPointer", "doManaged"})
+        @Specialization(replaces = {"doLong", "doPointer", "doManaged"})
         Object doGeneric(Object ptr,
-                        @CachedLibrary("ptr") LLVMNativeLibrary lib) {
-            if (lib.isPointer(ptr)) {
+                        @SuppressWarnings("unused") @Cached LLVMNativePointerSupport.IsPointerNode isPointer,
+                        @Cached LLVMNativePointerSupport.AsPointerNode asPointer) {
+            if (isPointer.execute(ptr)) {
                 try {
-                    return lib.asPointer(ptr);
+                    return asPointer.execute(ptr);
                 } catch (UnsupportedMessageException ex) {
                     // ignore
                 }
@@ -318,16 +325,16 @@ public abstract class LLVMArithmeticNode extends LLVMExpressionNode {
             return node.execute(left, right);
         }
 
-        @Specialization(limit = "3", guards = "!canDoManaged(left)")
+        @Specialization(guards = "!canDoManaged(left)")
         long doPointerRight(long left, LLVMPointer right,
-                        @CachedLibrary("right") LLVMNativeLibrary rightLib) {
-            return op.doLong(left, rightLib.toNativePointer(right).asNative());
+                        @Cached LLVMNativePointerSupport.ToNativePointerNode toNativePointerRight) {
+            return op.doLong(left, toNativePointerRight.execute(right).asNative());
         }
 
-        @Specialization(limit = "3", guards = "!canDoManaged(right)")
+        @Specialization(guards = "!canDoManaged(right)")
         long doPointerLeft(LLVMPointer left, long right,
-                        @CachedLibrary("left") LLVMNativeLibrary leftLib) {
-            return op.doLong(leftLib.toNativePointer(left).asNative(), right);
+                        @Cached LLVMNativePointerSupport.ToNativePointerNode toNativePointerLeft) {
+            return op.doLong(toNativePointerLeft.execute(left).asNative(), right);
         }
     }
 
@@ -337,11 +344,11 @@ public abstract class LLVMArithmeticNode extends LLVMExpressionNode {
             super(op);
         }
 
-        @Specialization(limit = "3")
+        @Specialization
         long doPointer(LLVMPointer left, LLVMPointer right,
-                        @CachedLibrary("left") LLVMNativeLibrary leftLib,
-                        @CachedLibrary("right") LLVMNativeLibrary rightLib) {
-            return op.doLong(leftLib.toNativePointer(left).asNative(), rightLib.toNativePointer(right).asNative());
+                        @Cached LLVMNativePointerSupport.ToNativePointerNode toNativePointerLeft,
+                        @Cached LLVMNativePointerSupport.ToNativePointerNode toNativePointerRight) {
+            return op.doLong(toNativePointerLeft.execute(left).asNative(), toNativePointerRight.execute(right).asNative());
         }
     }
 
@@ -357,12 +364,12 @@ public abstract class LLVMArithmeticNode extends LLVMExpressionNode {
             return left.getOffset() - right.getOffset();
         }
 
-        @Specialization(limit = "3", guards = "!sameObject.execute(left.getObject(), right.getObject())")
+        @Specialization(guards = "!sameObject.execute(left.getObject(), right.getObject())")
         long doNotSameObject(LLVMManagedPointer left, LLVMManagedPointer right,
                         @SuppressWarnings("unused") @Cached LLVMSameObjectNode sameObject,
-                        @CachedLibrary("left") LLVMNativeLibrary leftLib,
-                        @CachedLibrary("right") LLVMNativeLibrary rightLib) {
-            return leftLib.toNativePointer(left).asNative() - rightLib.toNativePointer(right).asNative();
+                        @Cached LLVMNativePointerSupport.ToNativePointerNode toNativePointerLeft,
+                        @Cached LLVMNativePointerSupport.ToNativePointerNode toNativePointerRight) {
+            return toNativePointerLeft.execute(left).asNative() - toNativePointerRight.execute(right).asNative();
         }
     }
 
@@ -420,14 +427,31 @@ public abstract class LLVMArithmeticNode extends LLVMExpressionNode {
             super(op);
         }
 
-        LLVMArithmeticOpNode createFP80Node() {
+        LLVMLongDoubleNode createFP80Node() {
             return fpOp().createFP80Node();
         }
 
         @Specialization
-        LLVM80BitFloat do80BitFloat(LLVM80BitFloat left, LLVM80BitFloat right,
-                        @Cached("createFP80Node()") LLVMArithmeticOpNode node) {
-            return (LLVM80BitFloat) node.execute(left, right);
+        LLVMLongDoubleFloatingPoint do80BitFloat(LLVM80BitFloat left, LLVM80BitFloat right,
+                        @Cached("createFP80Node()") LLVMLongDoubleNode node) {
+            return node.execute(left, right);
+        }
+    }
+
+    public abstract static class LLVMFP128ArithmeticNode extends LLVMFloatingArithmeticNode {
+
+        LLVMFP128ArithmeticNode(ArithmeticOperation op) {
+            super(op);
+        }
+
+        LLVMLongDoubleNode createFP128Node() {
+            return fpOp().createFP128Node();
+        }
+
+        @Specialization
+        LLVMLongDoubleFloatingPoint do128BitFloat(LLVM128BitFloat left, LLVM128BitFloat right,
+                        @Cached("createFP128Node()") LLVMLongDoubleNode node) {
+            return node.execute(left, right);
         }
     }
 
@@ -492,8 +516,18 @@ public abstract class LLVMArithmeticNode extends LLVMExpressionNode {
         }
 
         @Override
-        LLVMArithmeticOpNode createFP80Node() {
-            return LLVMArithmeticFactory.createAddNode();
+        LLVMLongDoubleNode createFP80Node() {
+            return LLVMLongDoubleNode.createAddNode(LongDoubleKinds.FP80);
+        }
+
+        @Override
+        LLVMLongDoubleNode createFP128Node() {
+            return LLVMLongDoubleNode.createAddNode(LongDoubleKinds.FP128);
+        }
+
+        @Override
+        public String toString() {
+            return "ADD";
         }
     };
 
@@ -578,8 +612,18 @@ public abstract class LLVMArithmeticNode extends LLVMExpressionNode {
         }
 
         @Override
-        LLVMArithmeticOpNode createFP80Node() {
-            return LLVMArithmeticFactory.createMulNode();
+        LLVMLongDoubleNode createFP80Node() {
+            return LLVMLongDoubleNode.createMulNode(LongDoubleKinds.FP80);
+        }
+
+        @Override
+        LLVMLongDoubleNode createFP128Node() {
+            return LLVMLongDoubleNode.createMulNode(LongDoubleKinds.FP128);
+        }
+
+        @Override
+        public String toString() {
+            return "MUL";
         }
     };
 
@@ -653,21 +697,22 @@ public abstract class LLVMArithmeticNode extends LLVMExpressionNode {
         }
 
         @Override
-        LLVMArithmeticOpNode createFP80Node() {
-            return LLVMArithmeticFactory.createSubNode();
+        LLVMLongDoubleNode createFP80Node() {
+            return LLVMLongDoubleNode.createSubNode(LongDoubleKinds.FP80);
+        }
+
+        @Override
+        LLVMLongDoubleNode createFP128Node() {
+            return LLVMLongDoubleNode.createSubNode(LongDoubleKinds.FP128);
+        }
+
+        @Override
+        public String toString() {
+            return "SUB";
         }
     };
 
     private static final LLVMFPArithmeticOp DIV = new LLVMFPArithmeticOp() {
-
-        @Override
-        boolean doBoolean(boolean left, boolean right) {
-            if (!right) {
-                CompilerDirectives.transferToInterpreter();
-                throw new ArithmeticException("Division by zero!");
-            }
-            return left;
-        }
 
         @Override
         byte doByte(byte left, byte right) {
@@ -705,21 +750,22 @@ public abstract class LLVMArithmeticNode extends LLVMExpressionNode {
         }
 
         @Override
-        LLVMArithmeticOpNode createFP80Node() {
-            return LLVMArithmeticFactory.createDivNode();
+        LLVMLongDoubleNode createFP80Node() {
+            return LLVMLongDoubleNode.createDivNode(LongDoubleKinds.FP80);
+        }
+
+        @Override
+        LLVMLongDoubleNode createFP128Node() {
+            return LLVMLongDoubleNode.createDivNode(LongDoubleKinds.FP128);
+        }
+
+        @Override
+        public String toString() {
+            return "DIV";
         }
     };
 
     private static final LLVMArithmeticOp UDIV = new LLVMArithmeticOp() {
-
-        @Override
-        boolean doBoolean(boolean left, boolean right) {
-            if (!right) {
-                CompilerDirectives.transferToInterpreter();
-                throw new ArithmeticException("Division by zero!");
-            }
-            return left;
-        }
 
         @Override
         byte doByte(byte left, byte right) {
@@ -745,18 +791,14 @@ public abstract class LLVMArithmeticNode extends LLVMExpressionNode {
         LLVMIVarBit doVarBit(LLVMIVarBit left, LLVMIVarBit right) {
             return left.unsignedDiv(right);
         }
+
+        @Override
+        public String toString() {
+            return "UDIV";
+        }
     };
 
     private static final LLVMFPArithmeticOp REM = new LLVMFPArithmeticOp() {
-
-        @Override
-        boolean doBoolean(boolean left, boolean right) {
-            if (!right) {
-                CompilerDirectives.transferToInterpreter();
-                throw new ArithmeticException("Division by zero!");
-            }
-            return false;
-        }
 
         @Override
         byte doByte(byte left, byte right) {
@@ -794,21 +836,22 @@ public abstract class LLVMArithmeticNode extends LLVMExpressionNode {
         }
 
         @Override
-        LLVMArithmeticOpNode createFP80Node() {
-            return LLVMArithmeticFactory.createRemNode();
+        LLVMLongDoubleNode createFP80Node() {
+            return LLVMLongDoubleNode.createRemNode(LongDoubleKinds.FP80);
+        }
+
+        @Override
+        LLVMLongDoubleNode createFP128Node() {
+            return LLVMLongDoubleNode.createRemNode(LongDoubleKinds.FP128);
+        }
+
+        @Override
+        public String toString() {
+            return "REM";
         }
     };
 
     private static final LLVMArithmeticOp UREM = new LLVMArithmeticOp() {
-
-        @Override
-        boolean doBoolean(boolean left, boolean right) {
-            if (!right) {
-                CompilerDirectives.transferToInterpreter();
-                throw new ArithmeticException("Division by zero!");
-            }
-            return left;
-        }
 
         @Override
         byte doByte(byte left, byte right) {
@@ -833,6 +876,11 @@ public abstract class LLVMArithmeticNode extends LLVMExpressionNode {
         @Override
         LLVMIVarBit doVarBit(LLVMIVarBit left, LLVMIVarBit right) {
             return left.unsignedRem(right);
+        }
+
+        @Override
+        public String toString() {
+            return "UREM";
         }
     };
 
@@ -911,6 +959,11 @@ public abstract class LLVMArithmeticNode extends LLVMExpressionNode {
         LLVMIVarBit doVarBit(LLVMIVarBit left, LLVMIVarBit right) {
             return left.and(right);
         }
+
+        @Override
+        public String toString() {
+            return "ADD";
+        }
     };
 
     private static final LLVMArithmeticOp OR = new LLVMArithmeticOp() {
@@ -943,6 +996,11 @@ public abstract class LLVMArithmeticNode extends LLVMExpressionNode {
         @Override
         LLVMIVarBit doVarBit(LLVMIVarBit left, LLVMIVarBit right) {
             return left.or(right);
+        }
+
+        @Override
+        public String toString() {
+            return "OR";
         }
     };
 
@@ -1003,6 +1061,11 @@ public abstract class LLVMArithmeticNode extends LLVMExpressionNode {
         LLVMIVarBit doVarBit(LLVMIVarBit left, LLVMIVarBit right) {
             return left.xor(right);
         }
+
+        @Override
+        public String toString() {
+            return "XOR";
+        }
     };
 
     private static final LLVMArithmeticOp SHL = new LLVMArithmeticOp() {
@@ -1035,6 +1098,11 @@ public abstract class LLVMArithmeticNode extends LLVMExpressionNode {
         @Override
         LLVMIVarBit doVarBit(LLVMIVarBit left, LLVMIVarBit right) {
             return left.leftShift(right);
+        }
+
+        @Override
+        public String toString() {
+            return "SHL";
         }
     };
 
@@ -1069,6 +1137,11 @@ public abstract class LLVMArithmeticNode extends LLVMExpressionNode {
         LLVMIVarBit doVarBit(LLVMIVarBit left, LLVMIVarBit right) {
             return left.logicalRightShift(right);
         }
+
+        @Override
+        public String toString() {
+            return "LSHL";
+        }
     };
 
     private static final LLVMArithmeticOp ASHR = new LLVMArithmeticOp() {
@@ -1101,6 +1174,11 @@ public abstract class LLVMArithmeticNode extends LLVMExpressionNode {
         @Override
         LLVMIVarBit doVarBit(LLVMIVarBit left, LLVMIVarBit right) {
             return left.arithmeticRightShift(right);
+        }
+
+        @Override
+        public String toString() {
+            return "ASHR";
         }
     };
 }

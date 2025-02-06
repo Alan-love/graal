@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2019, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -82,7 +82,7 @@ public class ReflectiveExportExample {
             if (message == MESSAGE) {
                 return "reflectiveExport";
             } else {
-                // TODO how to invoke the super implementation?
+                // TODO GR-38632 how to invoke the super implementation?
                 throw new AbstractMethodError();
             }
         }
@@ -99,7 +99,7 @@ public class ReflectiveExportExample {
         try {
             assertEquals("message1", library.message1(value));
         } catch (AbstractMethodError e) {
-            // TODO currently throws abstract method error but should return default value
+            // TODO GR-38632 currently throws abstract method error but should return default value
             // "message1".
         }
     }

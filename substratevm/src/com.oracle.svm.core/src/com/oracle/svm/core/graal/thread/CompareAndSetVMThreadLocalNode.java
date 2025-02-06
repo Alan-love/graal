@@ -24,26 +24,28 @@
  */
 package com.oracle.svm.core.graal.thread;
 
-import static org.graalvm.compiler.nodeinfo.NodeCycles.CYCLES_8;
+import static jdk.graal.compiler.nodeinfo.NodeCycles.CYCLES_8;
 
-import org.graalvm.compiler.core.common.memory.MemoryOrderMode;
-import org.graalvm.compiler.core.common.type.StampFactory;
-import org.graalvm.compiler.graph.NodeClass;
-import org.graalvm.compiler.nodeinfo.NodeInfo;
-import org.graalvm.compiler.nodeinfo.NodeSize;
-import org.graalvm.compiler.nodes.AbstractStateSplit;
-import org.graalvm.compiler.nodes.ConstantNode;
-import org.graalvm.compiler.nodes.ValueNode;
-import org.graalvm.compiler.nodes.java.UnsafeCompareAndSwapNode;
-import org.graalvm.compiler.nodes.spi.Lowerable;
-import org.graalvm.compiler.nodes.spi.LoweringTool;
+import jdk.graal.compiler.core.common.memory.MemoryOrderMode;
+import jdk.graal.compiler.core.common.type.StampFactory;
+import jdk.graal.compiler.graph.NodeClass;
+import jdk.graal.compiler.nodeinfo.NodeInfo;
+import jdk.graal.compiler.nodeinfo.NodeSize;
+import jdk.graal.compiler.nodes.AbstractStateSplit;
+import jdk.graal.compiler.nodes.ConstantNode;
+import jdk.graal.compiler.nodes.ValueNode;
+import jdk.graal.compiler.nodes.java.UnsafeCompareAndSwapNode;
+import jdk.graal.compiler.nodes.memory.SingleMemoryKill;
+import jdk.graal.compiler.nodes.spi.Lowerable;
+import jdk.graal.compiler.nodes.spi.LoweringTool;
+import org.graalvm.word.LocationIdentity;
 
 import com.oracle.svm.core.threadlocal.VMThreadLocalInfo;
 
 import jdk.vm.ci.meta.JavaKind;
 
 @NodeInfo(cycles = CYCLES_8, size = NodeSize.SIZE_8)
-public class CompareAndSetVMThreadLocalNode extends AbstractStateSplit implements Lowerable {
+public class CompareAndSetVMThreadLocalNode extends AbstractStateSplit implements VMThreadLocalAccess, Lowerable, SingleMemoryKill {
     public static final NodeClass<CompareAndSetVMThreadLocalNode> TYPE = NodeClass.create(CompareAndSetVMThreadLocalNode.class);
 
     private final VMThreadLocalInfo threadLocalInfo;
@@ -57,6 +59,15 @@ public class CompareAndSetVMThreadLocalNode extends AbstractStateSplit implement
         this.holder = holder;
         this.expect = expect;
         this.update = update;
+    }
+
+    public ValueNode getUpdate() {
+        return update;
+    }
+
+    @Override
+    public LocationIdentity getKilledLocationIdentity() {
+        return LocationIdentity.any();
     }
 
     @Override

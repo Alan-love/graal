@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017, 2021, Oracle and/or its affiliates.
+ * Copyright (c) 2017, 2024, Oracle and/or its affiliates.
  *
  * All rights reserved.
  *
@@ -30,7 +30,6 @@
 package com.oracle.truffle.llvm.runtime;
 
 import com.oracle.truffle.api.CallTarget;
-import com.oracle.truffle.api.TruffleFile;
 import com.oracle.truffle.api.interop.ArityException;
 import com.oracle.truffle.api.interop.UnsupportedMessageException;
 import com.oracle.truffle.api.interop.UnsupportedTypeException;
@@ -48,7 +47,8 @@ public abstract class NativeContextExtension implements ContextExtension {
 
         private static final long serialVersionUID = 1L;
 
-        private final Type type;
+        // transient to shut up JDK19 warnings (this should never be serialized anyway)
+        private final transient Type type;
 
         public UnsupportedNativeTypeException(Type type) {
             super("unsupported type " + type + " in native interop");
@@ -86,7 +86,7 @@ public abstract class NativeContextExtension implements ContextExtension {
 
     public abstract NativePointerIntoLibrary getNativeHandle(String name);
 
-    public abstract CallTarget createNativeWrapperFactory(LLVMFunctionCode code);
+    public abstract CallTarget createNativeWrapperFactory(LLVMFunctionCode code, String backend);
 
     public abstract void addLibraryHandles(Object library);
 
@@ -105,24 +105,65 @@ public abstract class NativeContextExtension implements ContextExtension {
 
     public abstract WellKnownNativeFunctionNode getWellKnownNativeFunction(String name, String signature);
 
+    public static final class WellKnownNativeFunctionAndSignature {
+        private final Object signature;
+        private final Object function;
+        private final Object boundSignature;
+
+        public WellKnownNativeFunctionAndSignature(Object signature, Object function, Object boundSignature) {
+            this.signature = signature;
+            this.function = function;
+            this.boundSignature = boundSignature;
+        }
+
+        public Object getSignature() {
+            return signature;
+        }
+
+        public Object getFunction() {
+            return function;
+        }
+
+        public Object getBoundSignature() {
+            return boundSignature;
+        }
+    }
+
+    public abstract WellKnownNativeFunctionAndSignature getWellKnownNativeFunctionAndSignature(String name, String signature);
+
     public abstract Object getNativeFunction(String name, String signature);
 
     public abstract Source getNativeSignatureSourceSkipStackArg(FunctionType type) throws UnsupportedNativeTypeException;
+
+    public abstract String getNativeSignature(FunctionType type);
+
+    public abstract Object createSignature(Source signatureSource);
 
     public abstract Object bindSignature(LLVMFunctionCode function, Source signatureSource);
 
     public abstract Object bindSignature(long fnPtr, Source signatureSource);
 
-    /**
-     * Allow subclasses to locate internal libraries.
-     */
-    protected TruffleFile locateInternalLibrary(LLVMContext context, String lib, Object reason) {
-        return LLVMContext.InternalLibraryLocator.INSTANCE.locateLibrary(context, lib, reason);
+    public static String getNativeLibrary(String libname) {
+        return getNativeLibraryPrefix() + libname + '.' + getNativeLibrarySuffix();
+    }
+
+    public static String getNativeLibraryVersioned(String libname, int version) {
+        return getNativeLibraryPrefix() + libname + '.' + getNativeLibrarySuffixVersioned(version);
+    }
+
+    public static String getNativeLibraryPrefix() {
+        if (System.getProperty("os.name").toLowerCase().contains("windows")) {
+            return "";
+        } else {
+            return "lib";
+        }
     }
 
     public static String getNativeLibrarySuffix() {
         if (System.getProperty("os.name").toLowerCase().contains("mac")) {
             return "dylib";
+        } else if (System.getProperty("os.name").toLowerCase().contains("windows")) {
+            return "dll";
         } else {
             return "so";
         }
@@ -131,6 +172,9 @@ public abstract class NativeContextExtension implements ContextExtension {
     public static String getNativeLibrarySuffixVersioned(int version) {
         if (System.getProperty("os.name").toLowerCase().contains("mac")) {
             return version + ".dylib";
+        } else if (System.getProperty("os.name").toLowerCase().contains("windows")) {
+            // no version ATM
+            return "dll";
         } else {
             return "so." + version;
         }

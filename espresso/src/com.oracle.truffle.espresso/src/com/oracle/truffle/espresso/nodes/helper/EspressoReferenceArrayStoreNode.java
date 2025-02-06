@@ -23,39 +23,39 @@
 
 package com.oracle.truffle.espresso.nodes.helper;
 
+import static com.oracle.truffle.espresso.vm.InterpreterToVM.outOfBoundsMessage;
+
 import com.oracle.truffle.api.CompilerDirectives;
 import com.oracle.truffle.api.CompilerDirectives.CompilationFinal;
-import com.oracle.truffle.api.nodes.Node;
+import com.oracle.truffle.espresso.EspressoLanguage;
 import com.oracle.truffle.espresso.impl.ArrayKlass;
 import com.oracle.truffle.espresso.meta.Meta;
-import com.oracle.truffle.espresso.runtime.EspressoContext;
-import com.oracle.truffle.espresso.runtime.StaticObject;
+import com.oracle.truffle.espresso.nodes.EspressoNode;
+import com.oracle.truffle.espresso.nodes.bytecodes.InstanceOf;
+import com.oracle.truffle.espresso.nodes.bytecodes.InstanceOfFactory;
+import com.oracle.truffle.espresso.runtime.staticobject.StaticObject;
 
-public class EspressoReferenceArrayStoreNode extends Node {
-    @Child TypeCheckNode typeCheck;
+public final class EspressoReferenceArrayStoreNode extends EspressoNode {
+
+    @Child InstanceOf.Dynamic instanceOfDynamic;
     @CompilationFinal boolean noOutOfBoundEx = true;
     @CompilationFinal boolean noArrayStoreEx = true;
 
-    public EspressoReferenceArrayStoreNode(EspressoContext context) {
-        this.typeCheck = TypeCheckNodeGen.create(context);
+    public EspressoReferenceArrayStoreNode() {
+        this.instanceOfDynamic = InstanceOfFactory.DynamicNodeGen.create();
     }
 
-    public void arrayStore(StaticObject value, int index, StaticObject array) {
-        assert !array.isForeignObject();
-        assert array.isArray();
-        if (index >= 0 && index < array.length()) {
-            if (StaticObject.isNull(value) || typeCheck.executeTypeCheck(((ArrayKlass) array.getKlass()).getComponentType(), value.getKlass())) {
-                array.putObjectUnsafe(value, index);
-            } else {
-                enterArrayStoreEx();
-                Meta meta = typeCheck.getMeta();
-                throw meta.throwException(meta.java_lang_ArrayStoreException);
-            }
-        } else {
+    public void arrayStore(EspressoLanguage language, Meta meta, StaticObject value, int index, StaticObject array) {
+        int length = array.length(language);
+        if (Integer.compareUnsigned(index, length) >= 0) {
             enterOutOfBound();
-            Meta meta = typeCheck.getMeta();
-            throw meta.throwException(meta.java_lang_ArrayIndexOutOfBoundsException);
+            throw meta.throwExceptionWithMessage(meta.java_lang_ArrayIndexOutOfBoundsException, outOfBoundsMessage(index, length));
         }
+        if (!StaticObject.isNull(value) && !instanceOfDynamic.execute(value.getKlass(), ((ArrayKlass) array.getKlass()).getComponentType())) {
+            enterArrayStoreEx();
+            throw meta.throwException(meta.java_lang_ArrayStoreException);
+        }
+        (array.<StaticObject[]> unwrap(language))[index] = value;
     }
 
     private void enterOutOfBound() {

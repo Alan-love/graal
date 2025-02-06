@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2017, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -58,8 +58,9 @@
 
 #define __thread __declspec(thread)
 
-#else
+#else // !_WIN32
 
+#include <stdint.h>
 #include <alloca.h>
 
 #endif
@@ -69,7 +70,7 @@ struct __TruffleContextInternal {
     JavaVM *javaVM;
     jobject LibFFIContext;
 
-#if defined(ENABLE_ISOLATED_NAMESPACE)    
+#if defined(ENABLE_ISOLATED_NAMESPACE)
     jfieldID LibFFIContext_isolatedNamespaceId;
 #endif
 
@@ -101,10 +102,15 @@ struct __TruffleContextInternal {
     jfieldID RetPatches_patches;
     jfieldID RetPatches_objects;
 
+    jfieldID NFIState_nfiErrnoAddress;
+    jfieldID NFIState_hasPendingException;
+
+    jclass NativeArgumentBuffer_Pointer;
+    jfieldID NativeArgumentBuffer_Pointer_pointer;
+
     jclass Object;
     jclass String;
     jclass UnsatisfiedLinkError;
-
 
     void *__libc_errno_location;
 #if !defined(_WIN32)
@@ -116,12 +122,15 @@ struct __TruffleEnvInternal {
     const struct __TruffleNativeAPI *functions;
     struct __TruffleContextInternal *context;
     JNIEnv *jniEnv;
+    jobject nfiState;
+    int *nfiErrnoAddress;
 };
 
 extern const struct __TruffleNativeAPI truffleNativeAPI;
 extern const struct __TruffleThreadAPI truffleThreadAPI;
 
-extern __thread int errnoMirror;
+// contains the "current" env from the most recent downcall, for faster lookup
+extern __thread struct __TruffleEnvInternal *cachedTruffleEnv;
 
 // keep this in sync with the code in com.oracle.truffle.nfi.NativeArgumentBuffer$TypeTag
 enum TypeTag {
@@ -141,8 +150,7 @@ enum TypeTag {
 };
 
 #define DECODE_OFFSET(encoded) (((unsigned int) (encoded)) >> 4)
-#define DECODE_TAG(encoded) ((enum TypeTag) ((encoded) & 0x0F))
-
+#define DECODE_TAG(encoded) ((enum TypeTag)((encoded) & 0x0F))
 
 void initialize_intrinsics(struct __TruffleContextInternal *);
 void *check_intrinsify(struct __TruffleContextInternal *, void *);

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -40,8 +40,12 @@
  */
 package com.oracle.truffle.api.library;
 
+import com.oracle.truffle.api.CompilerDirectives;
+import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
 import com.oracle.truffle.api.dsl.GeneratedBy;
 import com.oracle.truffle.api.library.LibraryFactory.ResolvedDispatch;
+import com.oracle.truffle.api.nodes.Node;
+import com.oracle.truffle.api.nodes.NodeUtil;
 import com.oracle.truffle.api.utilities.FinalBitSet;
 
 /**
@@ -56,8 +60,10 @@ public abstract class LibraryExport<T extends Library> {
     static final String GENERATED_CLASS_SUFFIX = "Gen";
 
     private final Class<?> receiverClass;
-    private final Class<? extends T> library;
+    private final Class<T> library;
     private final boolean defaultExport;
+    private final boolean aot;
+    final int aotPriority;
 
     Class<?> registerClass;
 
@@ -67,9 +73,21 @@ public abstract class LibraryExport<T extends Library> {
      * @since 19.0
      */
     protected LibraryExport(Class<? extends T> library, Class<?> receiverClass, boolean defaultExport) {
-        this.library = library;
+        this(library, receiverClass, defaultExport, false, 0);
+    }
+
+    /**
+     * Constructor for generated code. Do not call manually.
+     *
+     * @since 21.2
+     */
+    @SuppressWarnings("unchecked")
+    protected LibraryExport(Class<? extends T> library, Class<?> receiverClass, boolean defaultExport, boolean aot, int aotPriority) {
+        this.library = (Class<T>) library;
         this.receiverClass = receiverClass;
         this.defaultExport = defaultExport;
+        this.aot = aot;
+        this.aotPriority = aotPriority;
     }
 
     /**
@@ -86,6 +104,10 @@ public abstract class LibraryExport<T extends Library> {
      */
     protected abstract T createCached(Object receiver);
 
+    final boolean isAOT() {
+        return aot;
+    }
+
     final boolean isDefaultExport() {
         return defaultExport;
     }
@@ -94,8 +116,22 @@ public abstract class LibraryExport<T extends Library> {
         return receiverClass;
     }
 
-    final Class<? extends T> getLibrary() {
+    final Class<T> getLibrary() {
         return library;
+    }
+
+    /**
+     * Internal method for generated code only.
+     *
+     * @since 23.1
+     */
+    @TruffleBoundary
+    protected static boolean assertAdopted(Node node) {
+        try {
+            return NodeUtil.assertAdopted(node);
+        } catch (AssertionError e) {
+            throw CompilerDirectives.shouldNotReachHere("Invalid library usage. Cached library must be adopted by a RootNode before it is executed.", e);
+        }
     }
 
     /**

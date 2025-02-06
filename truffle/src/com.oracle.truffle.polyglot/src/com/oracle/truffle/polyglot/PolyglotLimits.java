@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2019, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -43,18 +43,11 @@ package com.oracle.truffle.polyglot;
 import java.util.function.Consumer;
 import java.util.function.Predicate;
 
-import org.graalvm.polyglot.ResourceLimitEvent;
-import org.graalvm.polyglot.ResourceLimits;
-import org.graalvm.polyglot.Source;
-
 import com.oracle.truffle.api.Assumption;
 import com.oracle.truffle.api.CompilerDirectives;
 import com.oracle.truffle.api.CompilerDirectives.CompilationFinal;
 import com.oracle.truffle.api.Truffle;
-import com.oracle.truffle.api.frame.FrameDescriptor;
-import com.oracle.truffle.api.frame.FrameSlot;
-import com.oracle.truffle.api.frame.FrameSlotKind;
-import com.oracle.truffle.api.frame.FrameSlotTypeException;
+import com.oracle.truffle.api.TruffleSafepoint;
 import com.oracle.truffle.api.frame.VirtualFrame;
 import com.oracle.truffle.api.instrumentation.EventBinding;
 import com.oracle.truffle.api.instrumentation.EventContext;
@@ -64,7 +57,6 @@ import com.oracle.truffle.api.instrumentation.Instrumenter;
 import com.oracle.truffle.api.instrumentation.SourceSectionFilter;
 import com.oracle.truffle.api.instrumentation.SourceSectionFilter.SourcePredicate;
 import com.oracle.truffle.api.instrumentation.StandardTags.StatementTag;
-import com.oracle.truffle.api.profiles.ConditionProfile;
 
 /**
  * Limits objects that backs the {@link ResourceLimits} API object.
@@ -72,10 +64,10 @@ import com.oracle.truffle.api.profiles.ConditionProfile;
 final class PolyglotLimits {
 
     final long statementLimit;
-    final Predicate<Source> statementLimitSourcePredicate;
-    final Consumer<ResourceLimitEvent> onEvent;
+    final Predicate<Object> statementLimitSourcePredicate;
+    final Consumer<Object> onEvent;
 
-    PolyglotLimits(long statementLimit, Predicate<Source> statementLimitSourcePredicate, Consumer<ResourceLimitEvent> onEvent) {
+    PolyglotLimits(long statementLimit, Predicate<Object> statementLimitSourcePredicate, Consumer<Object> onEvent) {
         this.statementLimit = statementLimit;
         this.statementLimitSourcePredicate = statementLimitSourcePredicate;
         this.onEvent = onEvent;
@@ -100,45 +92,17 @@ final class PolyglotLimits {
         final EngineLimits limits;
         final EventContext eventContext;
         final PolyglotEngineImpl engine;
-        final FrameSlot readContext;
-        final ConditionProfile needsLookup = ConditionProfile.create();
-        final FrameDescriptor descriptor;
         @CompilationFinal private boolean seenInnerContext;
 
         StatementIncrementNode(EventContext context, EngineLimits limits) {
             this.limits = limits;
             this.eventContext = context;
             this.engine = limits.engine;
-            if (!engine.singleThreadPerContext.isValid() || !engine.singleContext.isValid()) {
-                descriptor = context.getInstrumentedNode().getRootNode().getFrameDescriptor();
-                readContext = descriptor.findOrAddFrameSlot(CACHED_CONTEXT, FrameSlotKind.Object);
-            } else {
-                readContext = null;
-                descriptor = null;
-            }
         }
 
         @Override
         protected void onEnter(VirtualFrame frame) {
-            PolyglotContextImpl currentContext;
-            if (readContext == null || frame.getFrameDescriptor() != descriptor) {
-                currentContext = getLimitContext();
-            } else {
-                try {
-                    Object readValue = frame.getObject(readContext);
-                    if (needsLookup.profile(readValue == descriptor.getDefaultValue())) {
-                        currentContext = getLimitContext();
-                        frame.setObject(readContext, currentContext);
-                    } else {
-                        currentContext = (PolyglotContextImpl) readValue;
-                    }
-                } catch (FrameSlotTypeException e) {
-                    CompilerDirectives.transferToInterpreterAndInvalidate();
-                    currentContext = getLimitContext();
-                    frame.setObject(readContext, currentContext);
-                }
-            }
-
+            PolyglotContextImpl currentContext = getLimitContext();
             long count;
             if (engine.singleThreadPerContext.isValid()) {
                 count = --currentContext.statementCounter;
@@ -152,7 +116,7 @@ final class PolyglotLimits {
         }
 
         private PolyglotContextImpl getLimitContext() {
-            PolyglotContextImpl context = PolyglotContextImpl.currentEntered(engine);
+            PolyglotContextImpl context = PolyglotFastThreadLocals.getContextWithEngine(engine);
             if (engine.noInnerContexts.isValid() || context.parent == null) {
                 // fast path for no inner contexts
                 return context;
@@ -184,17 +148,12 @@ final class PolyglotLimits {
                 }
             }
             if (limitReached) {
-                String message = String.format("Statement count limit of %s exceeded. Statements executed %s.",
-                                limit, actualCount);
-                boolean invalidated = context.invalidate(true, message);
-                if (invalidated) {
-                    context.close(context.creatorApi, true);
-                    RuntimeException e = limits.notifyEvent(context);
-                    if (e != null) {
-                        throw e;
-                    }
-                    throw context.createCancelException(eventContext.getInstrumentedNode());
+                context.cancel(true, String.format("Statement count limit of %s exceeded. Statements executed %s.", limit, actualCount));
+                RuntimeException e = limits.notifyEvent(context);
+                if (e != null) {
+                    throw e;
                 }
+                TruffleSafepoint.pollHere(eventContext.getInstrumentedNode());
             }
 
         }
@@ -206,8 +165,8 @@ final class PolyglotLimits {
      */
     static final class EngineLimits {
 
-        private static final Predicate<Source> NO_PREDICATE = new Predicate<Source>() {
-            public boolean test(Source t) {
+        private static final Predicate<Object> NO_PREDICATE = new Predicate<>() {
+            public boolean test(Object t) {
                 return true;
             }
         };
@@ -215,7 +174,7 @@ final class PolyglotLimits {
         final PolyglotEngineImpl engine;
         @CompilationFinal long statementLimit = -1;
         @CompilationFinal Assumption sameStatementLimit;
-        @CompilationFinal Predicate<Source> statementLimitSourcePredicate;
+        @CompilationFinal Predicate<Object> statementLimitSourcePredicate;
         EventBinding<?> statementLimitBinding;
 
         EngineLimits(PolyglotEngineImpl engine) {
@@ -224,7 +183,7 @@ final class PolyglotLimits {
 
         void validate(PolyglotLimits limits) {
             if (limits != null && limits.statementLimit != 0) {
-                Predicate<Source> newPredicate = limits.statementLimitSourcePredicate;
+                Predicate<Object> newPredicate = limits.statementLimitSourcePredicate;
                 if (newPredicate == null) {
                     newPredicate = NO_PREDICATE;
                 }
@@ -240,7 +199,7 @@ final class PolyglotLimits {
             assert Thread.holdsLock(engine.lock);
 
             if (limits.statementLimit != 0) {
-                Predicate<Source> newPredicate = limits.statementLimitSourcePredicate;
+                Predicate<Object> newPredicate = limits.statementLimitSourcePredicate;
                 if (newPredicate == null) {
                     newPredicate = NO_PREDICATE;
                 }
@@ -266,9 +225,9 @@ final class PolyglotLimits {
                             @Override
                             public boolean test(com.oracle.truffle.api.source.Source s) {
                                 try {
-                                    return statementLimitSourcePredicate.test(engine.getImpl().getOrCreatePolyglotSource(s));
+                                    return statementLimitSourcePredicate.test(PolyglotImpl.getOrCreatePolyglotSource(engine.getImpl(), s));
                                 } catch (Throwable e) {
-                                    throw PolyglotImpl.hostToGuestException(context, e);
+                                    throw context.engine.host.toHostException(context.getHostContextImpl(), e);
                                 }
                             }
                         });
@@ -293,14 +252,15 @@ final class PolyglotLimits {
             if (limits == null) {
                 return null;
             }
-            Consumer<ResourceLimitEvent> onEvent = limits.onEvent;
+            Consumer<Object> onEvent = limits.onEvent;
             if (onEvent == null) {
                 return null;
             }
+            Object event = engine.getImpl().getAPIAccess().newResourceLimitsEvent(context.getContextAPI());
             try {
-                onEvent.accept(engine.getImpl().getAPIAccess().newResourceLimitsEvent(context.creatorApi));
+                onEvent.accept(event);
             } catch (Throwable t) {
-                return PolyglotImpl.hostToGuestException(context, t);
+                throw context.engine.host.toHostException(context.getHostContextImpl(), t);
             }
             return null;
         }

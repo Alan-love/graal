@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012, 2017, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2012, 2023, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,17 +24,16 @@
  */
 package com.oracle.svm.core.graal.meta;
 
-//Checkstyle: allow reflection
-
-import static com.oracle.svm.core.util.VMError.shouldNotReachHere;
+import static com.oracle.svm.core.util.VMError.shouldNotReachHereAtRuntime;
 
 import java.lang.reflect.Array;
+import java.util.function.ObjIntConsumer;
 
 import com.oracle.svm.core.meta.ObjectConstantEquality;
 import com.oracle.svm.core.meta.SubstrateObjectConstant;
-import com.oracle.svm.core.snippets.KnownIntrinsics;
 import com.oracle.svm.core.util.VMError;
 
+import jdk.graal.compiler.nodes.spi.IdentityHashCodeProvider;
 import jdk.vm.ci.meta.Constant;
 import jdk.vm.ci.meta.ConstantReflectionProvider;
 import jdk.vm.ci.meta.JavaConstant;
@@ -42,7 +41,7 @@ import jdk.vm.ci.meta.JavaKind;
 import jdk.vm.ci.meta.MethodHandleAccessProvider;
 import jdk.vm.ci.meta.ResolvedJavaType;
 
-public abstract class SharedConstantReflectionProvider implements ConstantReflectionProvider {
+public abstract class SharedConstantReflectionProvider implements ConstantReflectionProvider, IdentityHashCodeProvider {
 
     @Override
     public Boolean constantEquals(Constant x, Constant y) {
@@ -69,26 +68,51 @@ public abstract class SharedConstantReflectionProvider implements ConstantReflec
             return null;
         }
 
-        Object a = KnownIntrinsics.convertUnknownValue(SubstrateObjectConstant.asObject(array), Object.class);
+        Object a = SubstrateObjectConstant.asObject(array);
 
-        if (index < 0 || index >= Array.getLength(a)) {
+        if (!a.getClass().isArray() || index < 0 || index >= Array.getLength(a)) {
             return null;
         }
 
         if (a instanceof Object[]) {
             Object element = ((Object[]) a)[index];
-            return SubstrateObjectConstant.forObject(element);
+            return forObject(element);
         } else {
             return JavaConstant.forBoxedPrimitive(Array.get(a, index));
         }
     }
 
-    @Override
-    public JavaConstant boxPrimitive(JavaConstant source) {
-        if (!source.getJavaKind().isPrimitive()) {
-            return null;
+    public void forEachArrayElement(JavaConstant array, ObjIntConsumer<JavaConstant> consumer) {
+        if (array.getJavaKind() != JavaKind.Object || array.isNull()) {
+            return;
         }
-        return SubstrateObjectConstant.forObject(source.asBoxedPrimitive());
+
+        Object obj = SubstrateObjectConstant.asObject(array);
+
+        if (!obj.getClass().isArray()) {
+            return;
+        }
+
+        if (obj instanceof Object[] a) {
+            for (int index = 0; index < a.length; index++) {
+                consumer.accept((forObject(a[index])), index);
+            }
+        } else {
+            for (int index = 0; index < Array.getLength(obj); index++) {
+                Object element = Array.get(obj, index);
+                consumer.accept(JavaConstant.forBoxedPrimitive((element)), index);
+            }
+        }
+    }
+
+    @Override
+    public final JavaConstant boxPrimitive(JavaConstant source) {
+        /*
+         * This method is likely not going to do what you want: sub-integer constants in Graal IR
+         * are usually represented as constants with JavaKind.Integer, which means this method would
+         * give you an Integer box instead of a Byte, Short, ... box.
+         */
+        throw VMError.intentionallyUnimplemented();
     }
 
     @Override
@@ -96,7 +120,7 @@ public abstract class SharedConstantReflectionProvider implements ConstantReflec
         if (!source.getJavaKind().isObject()) {
             return null;
         }
-        return JavaConstant.forBoxedPrimitive(KnownIntrinsics.convertUnknownValue(SubstrateObjectConstant.asObject(source), Object.class));
+        return JavaConstant.forBoxedPrimitive(SubstrateObjectConstant.asObject(source));
     }
 
     @Override
@@ -104,9 +128,13 @@ public abstract class SharedConstantReflectionProvider implements ConstantReflec
         return SubstrateObjectConstant.forObject(value);
     }
 
+    protected JavaConstant forObject(Object object) {
+        return SubstrateObjectConstant.forObject(object);
+    }
+
     @Override
-    public final MethodHandleAccessProvider getMethodHandleAccess() {
-        throw shouldNotReachHere();
+    public MethodHandleAccessProvider getMethodHandleAccess() {
+        throw shouldNotReachHereAtRuntime(); // ExcludeFromJacocoGeneratedReport
     }
 
     @Override
@@ -118,7 +146,5 @@ public abstract class SharedConstantReflectionProvider implements ConstantReflec
         return asJavaClass(type);
     }
 
-    public int getImageHeapOffset(@SuppressWarnings("unused") JavaConstant constant) {
-        throw VMError.shouldNotReachHere("Can only be used during JIT compilation at run time: " + getClass().getName());
-    }
+    public abstract int getImageHeapOffset(JavaConstant constant);
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2013, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -52,21 +52,26 @@ import java.net.URL;
 import java.net.URLConnection;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.FileSystemNotFoundException;
+import java.nio.file.NoSuchFileException;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.Arrays;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 
 import org.graalvm.polyglot.Context;
 import org.graalvm.polyglot.Engine;
+import org.graalvm.polyglot.Instrument;
 import org.graalvm.polyglot.Language;
 import org.graalvm.polyglot.io.ByteSequence;
 import org.graalvm.polyglot.io.FileSystem;
 
 import com.oracle.truffle.api.CompilerAsserts;
 import com.oracle.truffle.api.TruffleFile;
+import com.oracle.truffle.api.TruffleLanguage;
+import com.oracle.truffle.api.TruffleLanguage.ParsingRequest;
 import com.oracle.truffle.api.impl.Accessor.EngineSupport;
 import com.oracle.truffle.api.nodes.LanguageInfo;
 
@@ -80,16 +85,16 @@ import com.oracle.truffle.api.nodes.LanguageInfo;
  * the file. File content is <em>read eagerly</em> and may be optionally <em>cached</em>. Sample
  * usage: <br>
  *
- * {@link SourceSnippets#fromFile}
+ * {@snippet file = "com/oracle/truffle/api/source/Source.java" region = "SourceSnippets#fromFile"}
  *
  * The starting point is {@link Source#newBuilder(String, TruffleFile)} method.
  *
- * <h3>Read from an URL</h3>
+ * <h3>Read from a URL</h3>
  *
  * One can read remote or in JAR resources using the {@link Source#newBuilder(String, java.net.URL)}
  * factory: <br>
  *
- * {@link SourceSnippets#fromURL}
+ * {@snippet file = "com/oracle/truffle/api/source/Source.java" region = "SourceSnippets#fromURL"}
  *
  * Each URL source is represented as a canonical object, indexed by the URL. Contents are <em>read
  * eagerly</em> once the {@link SourceBuilder#build()} method is called.
@@ -99,14 +104,16 @@ import com.oracle.truffle.api.nodes.LanguageInfo;
  * An anonymous immutable code snippet can be created from a string via the
  * {@link Source#newBuilder(String, CharSequence, String) } factory method: <br>
  *
- * {@link SourceSnippets#fromAString}
+ * {@snippet file = "com/oracle/truffle/api/source/Source.java" region =
+ * "SourceSnippets#fromAString"}
  *
  * <h3>Reading from a stream</h3>
  *
  * If one has a {@link Reader} one can convert its content into a {@link Source} via
  * {@link Source#newBuilder(String, java.io.Reader, String)} method: <br>
  *
- * {@link SourceSnippets#fromReader}
+ * {@snippet file = "com/oracle/truffle/api/source/Source.java" region =
+ * "SourceSnippets#fromReader"}
  *
  * the content is <em>read eagerly</em> once the {@link SourceBuilder#build()} method is called.
  *
@@ -114,6 +121,8 @@ import com.oracle.truffle.api.nodes.LanguageInfo;
  *
  * Sources can be created from bytes. Please note that all character related methods will throw an
  * {@link UnsupportedOperationException} if that is the case.
+ *
+ * {@snippet file = "com/oracle/truffle/api/source/Source.java" region = "SourceSnippets#fromBytes"}
  *
  * <h2>Attributes</h2>
  *
@@ -152,7 +161,7 @@ public abstract class Source {
     private static final CharSequence CONTENT_UNSET = new String();
     private static final byte[] CONTENT_EMPTY = new byte[0];
 
-    private static final Source EMPTY = new SourceImpl.ImmutableKey(null, null, null, null, null, null, null, false, false, false, null).toSourceNotInterned();
+    private static final Source EMPTY = new SourceImpl.ImmutableKey(null, null, null, null, null, null, null, false, false, false, null, false, Map.of()).toSourceNotInterned();
     private static final String NO_FASTPATH_SUBSOURCE_CREATION_MESSAGE = "do not create sub sources from compiled code";
     private static final String URI_SCHEME = "truffle";
     private static final int MAX_BUFFER_SIZE = Integer.MAX_VALUE - 8;
@@ -172,7 +181,7 @@ public abstract class Source {
      * If no one is referencing the polyglot source anymore we can assume that no one relies on the
      * identity of the original polyglot source. So we can just as well free it.
      */
-    volatile WeakReference<org.graalvm.polyglot.Source> cachedPolyglotSource;
+    volatile WeakReference<Object> cachedPolyglotSource;
 
     abstract Object getSourceId();
 
@@ -408,10 +417,10 @@ public abstract class Source {
      * MIME type by default. If the MIME type is <code>null</code> then the
      * {@link Language#getDefaultMimeType() default MIME type} of the language will be used to
      * interpret the source. If set explicitly then the language needs to
-     * {@link Language#getMimeTypes() support} the MIME type in order to {@link Context#eval(Source)
-     * evaluate} the source. If not <code>null</code> the MIME type is already verified containing
-     * no spaces and a '/' between group and sub-group. An example for a valid MIME type is:
-     * <code>text/javascript</code>.
+     * {@link Language#getMimeTypes() support} the MIME type in order to
+     * {@link Context#eval(org.graalvm.polyglot.Source)} evaluate} the source. If not
+     * <code>null</code> the MIME type is already verified containing no spaces and a '/' between
+     * group and sub-group. An example for a valid MIME type is: <code>text/javascript</code>.
      * <p>
      * The MIME type can be guessed by the system based on {@link #findMimeType(TruffleFile) files}
      * or {@link #findMimeType(URL) urls}
@@ -515,6 +524,8 @@ public abstract class Source {
     public final int getLineStartOffset(int lineNumber) throws IllegalArgumentException {
         return getTextMap().lineStartOffset(lineNumber);
     }
+
+    abstract Map<String, String> getOptions();
 
     /**
      * The number of characters (not counting a possible terminating newline) in a (1-based)
@@ -650,7 +661,7 @@ public abstract class Source {
      * @return newly created object representing the specified region
      * @throws UnsupportedOperationException if this source cannot contain {@link #hasCharacters()
      *             characters}.
-     * @throws IllegalArgumentException if charIndex < 0 or length < 0; in case assertions are
+     * @throws IllegalArgumentException if charIndex &lt; 0 or length &lt; 0; in case assertions are
      *             enabled also if the given bounds are out of the source bounds.
      * @since 0.17
      */
@@ -727,7 +738,7 @@ public abstract class Source {
     public String toString() {
         return "Source [language=" + getLanguage() + ", name=" + getName() + ", path=" + getPath() + ", internal=" + isInternal() + ", cached=" + isCached() +
                         ", interactive=" + isInteractive() + ", hasBytes=" + hasBytes() + ", hasCharacters=" + hasCharacters() + ", URL=" + getURL() + ", URI=" + getURI() +
-                        ", mimeType=" + getMimeType() + "]";
+                        ", mimeType=" + getMimeType() + ", options=" + getOptions() + "]";
     }
 
     private static boolean assertValid(SourceSection section) {
@@ -787,7 +798,8 @@ public abstract class Source {
      * Use this method for sources that do originate from a literal. For file or URL sources use the
      * appropriate builder constructor and {@link SourceBuilder#content(CharSequence)}.
      * <p>
-     * Example usage: {@link SourceSnippets#fromAString}
+     * Example usage: {@snippet file = "com/oracle/truffle/api/source/Source.java" region =
+     * "SourceSnippets#fromAString"}
      *
      * @param language the language id, must not be <code>null</code>
      * @param characters the character sequence or string, must not be <code>null</code>
@@ -806,7 +818,8 @@ public abstract class Source {
      * Use this method for sources that do originate from a literal. For file or URL sources use the
      * appropriate builder constructor and {@link SourceBuilder#content(ByteSequence)}.
      * <p>
-     * Example usage: {@link SourceSnippets#fromBytes}
+     * Example usage: {@snippet file = "com/oracle/truffle/api/source/Source.java" region =
+     * "SourceSnippets#fromBytes"}
      *
      * @param language the language id, must not be <code>null</code>
      * @param bytes the byte sequence or string, must not be <code>null</code>
@@ -826,7 +839,8 @@ public abstract class Source {
      * {@link SourceBuilder#mimeType(String) MIME type}. A language may be detected from an existing
      * file using {@link #findLanguage(TruffleFile)}.
      * <p>
-     * Example usage: {@link SourceSnippets#fromFile}
+     * Example usage: {@snippet file = "com/oracle/truffle/api/source/Source.java" region =
+     * "SourceSnippets#fromFile"}
      *
      * @param language the language id, must not be <code>null</code>
      * @param file the file to use and load, must not be <code>null</code>
@@ -851,7 +865,8 @@ public abstract class Source {
      * {@link SourceBuilder#mimeType(String) MIME type}. A language may be detected from an existing
      * file using {@link #findLanguage(URL)}.
      * <p>
-     * Example usage: {@link SourceSnippets#fromURL}
+     * Example usage: {@snippet file = "com/oracle/truffle/api/source/Source.java" region =
+     * "SourceSnippets#fromURL"}
      *
      * @param language the language id, must not be <code>null</code>
      * @param url the URL to use and load, must not be <code>null</code>
@@ -867,7 +882,8 @@ public abstract class Source {
      * Use this method for sources that do originate from a literal. For file or URL sources use the
      * appropriate builder constructor and {@link SourceBuilder#content(CharSequence)}.
      * <p>
-     * Example usage: {@link SourceSnippets#fromReader}
+     * Example usage: {@snippet file = "com/oracle/truffle/api/source/Source.java" region =
+     * "SourceSnippets#fromReader"}
      *
      * @since 19.0
      */
@@ -940,6 +956,7 @@ public abstract class Source {
      * @see #findLanguage(TruffleFile)
      * @since 19.0
      */
+    @SuppressWarnings("unused")
     public static String findMimeType(TruffleFile file) throws IOException {
         return file.detectMimeType();
     }
@@ -975,10 +992,10 @@ public abstract class Source {
         return new IllegalArgumentException("Invalid MIME type provided. MIME types consist of a type and a subtype separated by '/'.");
     }
 
-    private static final boolean ALLOW_IO = SourceAccessor.ACCESSOR.engineSupport().isIOAllowed();
+    private static final boolean ALLOW_IO = SourceAccessor.ACCESSOR.engineSupport().isIOSupported();
 
     static Source buildSource(String language, Object origin, String name, String path, boolean canonicalizePath, String mimeType, Object content, URL url, URI uri, Charset encoding,
-                    boolean internal, boolean interactive, boolean cached, Object fileSystemContext) throws IOException {
+                    boolean internal, boolean interactive, boolean cached, Object fileSystemContext, boolean embedderSource, Map<String, String> options) throws IOException {
         String useName = name;
         URI useUri = uri;
         Object useContent = content;
@@ -993,8 +1010,11 @@ public abstract class Source {
         if (useOrigin instanceof File) {
             final File file = (File) useOrigin;
             assert useFileSystemContext != null : "file system context must be provided by polyglot embedding API";
-            TruffleFile truffleFile = SourceAccessor.getTruffleFile(file.toPath().toString(), useFileSystemContext);
-            useOrigin = truffleFile;
+            try {
+                useOrigin = SourceAccessor.getTruffleFile(file.toPath().toString(), useFileSystemContext);
+            } catch (UnsupportedOperationException | IllegalArgumentException e) {
+                throw new AssertionError("Inconsistent path", e);
+            }
         }
 
         if (useOrigin == CONTENT_UNSET) {
@@ -1008,7 +1028,7 @@ public abstract class Source {
                 }
             } else {
                 // Canonicalize the file if it exists
-                useTruffleFile = useTruffleFile.exists() ? useTruffleFile.getCanonicalFile() : useTruffleFile;
+                useTruffleFile = getCanonicalFileIfItExists(useTruffleFile);
             }
             useFileSystemContext = SourceAccessor.LANGUAGE.getFileSystemContext(useTruffleFile);
             useName = useName == null ? useTruffleFile.getName() : useName;
@@ -1037,20 +1057,11 @@ public abstract class Source {
             useUri = useUri == null ? tmpUri : useUri;
             usePath = usePath == null ? useUrl.getPath() : usePath;
             useFileSystemContext = useFileSystemContext == null ? SourceAccessor.ACCESSOR.engineSupport().getCurrentFileSystemContext() : useFileSystemContext;
+            assert useTruffleFile == null;
             try {
                 useTruffleFile = SourceAccessor.getTruffleFile(tmpUri, useFileSystemContext);
-                useTruffleFile = useTruffleFile.exists() ? useTruffleFile.getCanonicalFile() : useTruffleFile;
-                if (useContent == CONTENT_UNSET) {
-                    if (isCharacterBased(useFileSystemContext, language, useMimeType)) {
-                        String fileMimeType = useMimeType == null ? SourceAccessor.detectMimeType(useTruffleFile, getValidMimeTypes(useFileSystemContext, language)) : useMimeType;
-                        useEncoding = useEncoding == null ? findEncoding(useTruffleFile, fileMimeType) : useEncoding;
-                        useContent = read(useTruffleFile, useEncoding);
-                    } else {
-                        useContent = ByteSequence.create(useTruffleFile.readAllBytes());
-                    }
-                }
-            } catch (FileSystemNotFoundException fsnf) {
-                if (ALLOW_IO && SourceAccessor.hasAllAccess(useFileSystemContext)) {
+            } catch (IllegalArgumentException | UnsupportedOperationException e) {
+                if (ALLOW_IO && SourceAccessor.isSocketIOAllowed(useFileSystemContext)) {
                     // Not a recognized by FileSystem, fall back to URLConnection only for allowed
                     // IO without a custom FileSystem
                     URLConnection connection = useUrl.openConnection();
@@ -1066,6 +1077,18 @@ public abstract class Source {
                     throw new SecurityException("Reading of URL " + useUrl + " is not allowed.");
                 }
             }
+            if (useTruffleFile != null) {
+                useTruffleFile = getCanonicalFileIfItExists(useTruffleFile);
+                if (useContent == CONTENT_UNSET) {
+                    if (isCharacterBased(useFileSystemContext, language, useMimeType)) {
+                        String fileMimeType = useMimeType == null ? SourceAccessor.detectMimeType(useTruffleFile, getValidMimeTypes(useFileSystemContext, language)) : useMimeType;
+                        useEncoding = useEncoding == null ? findEncoding(useTruffleFile, fileMimeType) : useEncoding;
+                        useContent = read(useTruffleFile, useEncoding);
+                    } else {
+                        useContent = ByteSequence.create(useTruffleFile.readAllBytes());
+                    }
+                }
+            }
         } else if (useOrigin instanceof Reader) {
             final Reader r = (Reader) useOrigin;
             useContent = useContent == CONTENT_UNSET ? read(r) : useContent;
@@ -1079,29 +1102,50 @@ public abstract class Source {
             useName = "Unnamed";
         }
 
+        Map<String, String> useOptions;
+        if (options != null) {
+            useOptions = options;
+        } else {
+            useOptions = Map.of();
+        }
+
         useContent = enforceInterfaceContracts(useContent);
-        SourceImpl.Key key = null;
         String relativePathInLanguageHome = null;
         if (useTruffleFile != null) {
-            // The relativePathInLanguageHome has to be calculated also for Sources created in the
-            // image execution time. They have to have the same hash code as sources created during
-            // the context pre-initialization.
-            relativePathInLanguageHome = SourceAccessor.ACCESSOR.engineSupport().getRelativePathInLanguageHome(useTruffleFile);
+            /*
+             * The relativePathInLanguageHome has to be calculated also for Sources created in the
+             * image execution time. They have to have the same hash code as sources created during
+             * the context pre-initialization.
+             */
+            relativePathInLanguageHome = SourceAccessor.ACCESSOR.engineSupport().getRelativePathInResourceRoot(useTruffleFile);
             if (relativePathInLanguageHome != null) {
                 Object fsEngineObject = SourceAccessor.ACCESSOR.languageSupport().getFileSystemEngineObject(SourceAccessor.ACCESSOR.languageSupport().getFileSystemContext(useTruffleFile));
                 if (SourceAccessor.ACCESSOR.engineSupport().inContextPreInitialization(fsEngineObject)) {
-                    key = new SourceImpl.ReinitializableKey(useTruffleFile, useContent, useMimeType, language,
+                    SourceImpl.Key key = new SourceImpl.ReinitializableKey(useTruffleFile, useContent, useMimeType, language,
                                     useUrl, useUri, useName, usePath, internal, interactive, cached,
-                                    relativePathInLanguageHome);
+                                    relativePathInLanguageHome, embedderSource, useOptions);
+                    Source source = SOURCES.intern(key);
+                    SourceAccessor.onSourceCreated(source);
+                    return source;
                 }
             }
         }
-        if (key == null) {
-            key = new SourceImpl.ImmutableKey(useContent, useMimeType, language, useUrl, useUri, useName, usePath, internal, interactive, cached, relativePathInLanguageHome);
+
+        SourceImpl.Key key = new SourceImpl.ImmutableKey(useContent, useMimeType, language, useUrl, useUri, useName, usePath, internal, interactive, cached, relativePathInLanguageHome,
+                        embedderSource, useOptions);
+        return SOURCES.intern(key);
+    }
+
+    private static TruffleFile getCanonicalFileIfItExists(TruffleFile file) throws IOException {
+        if (file.exists()) {
+            try {
+                return file.getCanonicalFile();
+            } catch (NoSuchFileException ex) {
+                // The file may have been deleted between exists() and getCanonicalFile().
+                // We handle this race condition as if the file did not exist.
+            }
         }
-        Source source = SOURCES.intern(key);
-        SourceAccessor.onSourceCreated(source);
-        return source;
+        return file;
     }
 
     static byte[] readBytes(URLConnection connection) throws IOException {
@@ -1244,11 +1288,11 @@ public abstract class Source {
             if (firstGuess != null) {
                 return firstGuess;
             }
-        } catch (URISyntaxException | IllegalArgumentException | FileSystemNotFoundException ex) {
+        } catch (URISyntaxException | IllegalArgumentException | UnsupportedOperationException ex) {
             // swallow and go on
         }
 
-        if (!ALLOW_IO || !SourceAccessor.hasAllAccess(fileSystemContext)) {
+        if (!ALLOW_IO || !SourceAccessor.isSocketIOAllowed(fileSystemContext)) {
             throw new SecurityException("Reading of URL " + url + " is not allowed.");
         }
 
@@ -1302,23 +1346,28 @@ public abstract class Source {
      *
      * To load a source from disk one can use:
      * <p>
-     * {@link SourceSnippets#fromFile}
+     * {@snippet file = "com/oracle/truffle/api/source/Source.java" region =
+     * "SourceSnippets#fromFile"}
      * <p>
      * To load source from a {@link URL} one can use:
      * <p>
-     * {@link SourceSnippets#fromURL}
+     * {@snippet file = "com/oracle/truffle/api/source/Source.java" region =
+     * "SourceSnippets#fromURL"}
      * <p>
      * To create a source representing characters:
      * <p>
-     * {@link SourceSnippets#fromAString}
+     * {@snippet file = "com/oracle/truffle/api/source/Source.java" region =
+     * "SourceSnippets#fromAString"}
      * <p>
      * or read a source from a {@link Reader}:
      * <p>
-     * {@link SourceSnippets#fromReader}
+     * {@snippet file = "com/oracle/truffle/api/source/Source.java" region =
+     * "SourceSnippets#fromReader"}
      * <p>
      * To create a source representing bytes:
      * <p>
-     * {@link SourceSnippets#fromBytes}
+     * {@snippet file = "com/oracle/truffle/api/source/Source.java" region =
+     * "SourceSnippets#fromBytes"}
      *
      * Once your builder is configured, call {@link #build()} to perform the loading and
      * construction of new {@link Source}.
@@ -1341,6 +1390,8 @@ public abstract class Source {
         private boolean cached = true;
         private Charset fileEncoding;
         private Object fileSystemContext;
+        private boolean embedderSource;
+        private Map<String, String> options;
 
         SourceBuilder(String language, Object origin) {
             Objects.requireNonNull(language);
@@ -1369,7 +1420,8 @@ public abstract class Source {
          * {@link Source#hasCharacters()} will be <code>false</code> then. The given characters must
          * not mutate after they were accessed for the first time. Example:
          *
-         * {@link SourceSnippets#fromURLWithOwnContent}
+         * {@snippet file = "com/oracle/truffle/api/source/Source.java" region =
+         * "SourceSnippets#fromURLWithOwnContent"}
          *
          * @param characters the code to be available via {@link Source#getCharacters()}, or
          *            {@link #CONTENT_NONE}
@@ -1388,7 +1440,8 @@ public abstract class Source {
          * completely different one. The given bytes must not mutate after they were accessed for
          * the first time. Example:
          *
-         * {@link SourceSnippets#fromURLWithOwnContent}
+         * {@snippet file = "com/oracle/truffle/api/source/Source.java" region =
+         * "SourceSnippets#fromURLWithOwnContent"}
          *
          * @param bytes the code to be available via {@link Source#getBytes()}
          * @return instance of this builder - which's {@link #build()} method no longer throws an
@@ -1414,13 +1467,13 @@ public abstract class Source {
          * The MIME type can be guessed by the system based on {@link #findMimeType(TruffleFile)
          * files} or {@link #findMimeType(URL) urls}.
          *
+         * @param mimeType the new mime type to be assigned, or <code>null</code> if default MIME
+         *            type should be used.
+         * @return instance of <code>this</code> builder ready to {@link #build() create new source}
          * @see LanguageInfo#getDefaultMimeType()
          * @see LanguageInfo#getMimeTypes()
          * @see Source#findMimeType(TruffleFile)
          * @see Source#findMimeType(URL)
-         * @param mimeType the new mime type to be assigned, or <code>null</code> if default MIME
-         *            type should be used.
-         * @return instance of <code>this</code> builder ready to {@link #build() create new source}
          * @since 19.0
          */
         public SourceBuilder mimeType(@SuppressWarnings("hiding") String mimeType) {
@@ -1523,9 +1576,65 @@ public abstract class Source {
             return this;
         }
 
+        /**
+         * Sets a source option key and value for the built source. Source options allow you to
+         * attach language- or instrument-specific configuration to a source. These options are
+         * parsed and validated only when source is parsed by a language, rather than when the
+         * source is created.
+         * <p>
+         * If the source is validated, all source options will be validated. Therefore, each
+         * language or instrument associated with a source option must be installed.
+         * <p>
+         * The available source option keys can be found in the respective language or instrument
+         * documentation, or at runtime via {@link Language#getSourceOptions()} or
+         * {@link Instrument#getSourceOptions()}.
+         *
+         * @param key the option key (must not be null)
+         * @param value the option value (must not be null)
+         * @see ParsingRequest#getOptionValues()
+         * @see TruffleLanguage#getSourceOptionDescriptors()
+         * @see TruffleLanguage.Env#getOptions(Source)
+         *
+         * @since 25.0
+         */
+        public SourceBuilder option(String key, String value) {
+            Objects.requireNonNull(key);
+            Objects.requireNonNull(value);
+            if (this.options == null) {
+                this.options = new HashMap<>();
+            }
+            this.options.put(key, value);
+            return this;
+        }
+
+        /**
+         * Shortcut for setting multiple {@link #option(String, String) options} using a map. All
+         * values of the provided map must be non-null.
+         *
+         * @since 25.0
+         */
+        public SourceBuilder options(@SuppressWarnings("hiding") Map<String, String> options) {
+            for (var entry : options.entrySet()) {
+                option(entry.getKey(), entry.getValue());
+            }
+            return this;
+        }
+
         SourceBuilder fileSystemContext(Object context) {
             this.fileSystemContext = context;
             return this;
+        }
+
+        void embedderSource(boolean b) {
+            this.embedderSource = b;
+        }
+
+        void url(@SuppressWarnings("hiding") URL url) {
+            this.url = url;
+        }
+
+        void path(@SuppressWarnings("hiding") String path) {
+            this.path = path;
         }
 
         /**
@@ -1540,7 +1649,7 @@ public abstract class Source {
         public Source build() throws IOException {
             assert this.language != null;
             Source source = buildSource(this.language, this.origin, this.name, this.path, this.canonicalizePath, this.mimeType, this.content, this.url, this.uri, this.fileEncoding, this.internal,
-                            this.interactive, this.cached, fileSystemContext);
+                            this.interactive, this.cached, fileSystemContext, this.embedderSource, this.options);
 
             // make sure origin is not consumed again if builder is used twice
             if (source.hasBytes()) {
@@ -1556,7 +1665,6 @@ public abstract class Source {
 
             return source;
         }
-
     }
 
     private static Object getSourceContent(Source source) {
@@ -1699,6 +1807,16 @@ public abstract class Source {
             return (LiteralBuilder) super.encoding(encoding);
         }
 
+        @Override
+        public LiteralBuilder option(String key, String value) {
+            return (LiteralBuilder) super.option(key, value);
+        }
+
+        @Override
+        public LiteralBuilder options(Map<String, String> options) {
+            return (LiteralBuilder) super.options(options);
+        }
+
         /**
          * Uses configuration of this builder to create new {@link Source} object.
          *
@@ -1722,9 +1840,9 @@ public abstract class Source {
 
     /**
      * Resets cached sources after native image generation.
-     *
+     * <p>
      * NOTE: this method is called reflectively by downstream projects
-     * {@code com.oracle.svm.truffle.TruffleFeature}.
+     * {@code com.oracle.svm.truffle.TruffleBaseFeature}.
      */
     @SuppressWarnings("unused")
     private static void resetNativeImageState() {
@@ -1737,11 +1855,11 @@ public abstract class Source {
     }
 }
 
-// @formatter:off
+// @formatter:off // @replace regex='.*' replacement=''
 // Checkstyle: stop
 class SourceSnippets {
     public static Source fromFile(TruffleFile file) throws IOException {
-        // BEGIN: SourceSnippets#fromFile
+        // @start region="SourceSnippets#fromFile"
         assert file.getName().endsWith(".java") :
             "Imagine 'c:\\sources\\Example.java' file";
 
@@ -1751,34 +1869,24 @@ class SourceSnippets {
         assert file.getName().equals(source.getName());
         assert file.getPath().equals(source.getPath());
         assert file.toUri().equals(source.getURI());
-        // END: SourceSnippets#fromFile
-        return source;
-    }
-
-    public static Source likeFileName(TruffleFile file) throws IOException {
-        // BEGIN: SourceSnippets#likeFileName
-        String language = Source.findLanguage(file);
-        Source source = Source.newBuilder(language, file.getCanonicalFile()).
-            name(file.getPath()).
-            build();
-        // END: SourceSnippets#likeFileName
+        // @end region="SourceSnippets#fromFile"
         return source;
     }
 
     public static Source fromURL(Class<?> relativeClass) throws IOException, URISyntaxException {
-        // BEGIN: SourceSnippets#fromURL
+        // @start region="SourceSnippets#fromURL"
         URL resource = relativeClass.getResource("sample.js");
         Source source = Source.newBuilder("js", resource)
                         .build();
         assert resource.toExternalForm().equals(source.getPath());
         assert "sample.js".equals(source.getName());
         assert resource.toURI().equals(source.getURI());
-        // END: SourceSnippets#fromURL
+        // @end region="SourceSnippets#fromURL"
         return source;
     }
 
     public static Source fromURLWithOwnContent(Class<?> relativeClass) {
-        // BEGIN: SourceSnippets#fromURLWithOwnContent
+        // @start region="SourceSnippets#fromURLWithOwnContent"
         URL resource = relativeClass.getResource("sample.js");
         Source source = Source.newBuilder("js", resource)
             .content("{}")
@@ -1787,42 +1895,42 @@ class SourceSnippets {
         assert "sample.js".equals(source.getName());
         assert resource.toExternalForm().equals(source.getURI().toString());
         assert "{}".equals(source.getCharacters());
-        // END: SourceSnippets#fromURLWithOwnContent
+        // @end region="SourceSnippets#fromURLWithOwnContent"
         return source;
     }
 
     public static Source fromReader(Class<?> relativeClass) throws IOException {
-        // BEGIN: SourceSnippets#fromReader
+        // @start region="SourceSnippets#fromReader"
         Reader stream = new InputStreamReader(
                         relativeClass.getResourceAsStream("sample.js")
         );
         Source source = Source.newBuilder("js", stream, "sample.js")
             .build();
         assert "sample.js".equals(source.getName());
-        // END: SourceSnippets#fromReader
+        // @end region="SourceSnippets#fromReader"
         return source;
     }
 
     public static Source fromAString() {
-        // BEGIN: SourceSnippets#fromAString
+        // @start region="SourceSnippets#fromAString"
         Source source = Source.newBuilder("js", "function() {\n"
                         + "  return 'Hi';\n"
                         + "}\n", "hi.js").build();
         assert "hi.js".equals(source.getName());
-        // END: SourceSnippets#fromAString
+        // @end region="SourceSnippets#fromAString"
         return source;
     }
 
     public static Source fromBytes() {
-        // BEGIN: SourceSnippets#fromBytes
+        // @start region="SourceSnippets#fromBytes"
         byte[] bytes = new byte[] {/* Binary */};
         Source source = Source.newBuilder("llvm",
                         ByteSequence.create(bytes),
                         "<literal>").build();
-        // END: SourceSnippets#fromBytes
+        // @end region="SourceSnippets#fromBytes"
         return source;
     }
 
     public static boolean loaded = true;
 }
-// @formatter:on
+// @formatter:on // @replace regex='.*' replacement=''

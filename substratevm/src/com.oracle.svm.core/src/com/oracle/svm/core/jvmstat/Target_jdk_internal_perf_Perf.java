@@ -31,12 +31,12 @@ import org.graalvm.nativeimage.ImageSingletons;
 import com.oracle.svm.core.annotate.Substitute;
 import com.oracle.svm.core.annotate.TargetClass;
 
-@TargetClass(classNameProvider = Package_jdk_internal_perf.class, className = "Perf")
+@TargetClass(className = "jdk.internal.perf.Perf")
 @SuppressWarnings({"unused", "static-method"})
 public final class Target_jdk_internal_perf_Perf {
     @Substitute
-    public ByteBuffer attach(String user, int lvmid, int mode) {
-        return ImageSingletons.lookup(PerfDataSupport.class).attach(user, lvmid, mode);
+    public ByteBuffer attach(int lvmid) {
+        return ImageSingletons.lookup(PerfDataSupport.class).attach(lvmid);
     }
 
     @Substitute

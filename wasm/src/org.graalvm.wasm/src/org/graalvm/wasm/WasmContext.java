@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2019, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -40,14 +40,19 @@
  */
 package org.graalvm.wasm;
 
-import com.oracle.truffle.api.TruffleLanguage.Env;
+import java.util.LinkedHashMap;
+import java.util.Map;
+
 import org.graalvm.wasm.exception.Failure;
 import org.graalvm.wasm.exception.WasmException;
+import org.graalvm.wasm.parser.bytecode.BytecodeParser;
 import org.graalvm.wasm.predefined.BuiltinModule;
 import org.graalvm.wasm.predefined.wasi.fd.FdManager;
 
-import java.util.LinkedHashMap;
-import java.util.Map;
+import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
+import com.oracle.truffle.api.TruffleLanguage.ContextReference;
+import com.oracle.truffle.api.TruffleLanguage.Env;
+import com.oracle.truffle.api.nodes.Node;
 
 public final class WasmContext {
     private final Env env;
@@ -57,23 +62,33 @@ public final class WasmContext {
     private final TableRegistry tableRegistry;
     private final Linker linker;
     private final Map<String, WasmInstance> moduleInstances;
-    private int moduleNameCount;
+    private WasmInstance mainModuleInstance;
     private final FdManager filesManager;
+    private final WasmContextOptions contextOptions;
 
-    public static WasmContext getCurrent() {
-        return WasmLanguage.getCurrentContext();
-    }
+    /**
+     * Optional grow callback to notify the embedder.
+     */
+    private Object memGrowCallback;
+    /**
+     * JS callback to implement part of memory.atomic.notify.
+     */
+    private Object memNotifyCallback;
+    /**
+     * JS callback to implement part of memory.atomic.waitN.
+     */
+    private Object memWaitCallback;
 
     public WasmContext(Env env, WasmLanguage language) {
         this.env = env;
         this.language = language;
+        this.contextOptions = WasmContextOptions.fromOptionValues(env.getOptions());
         this.globals = new GlobalRegistry();
         this.tableRegistry = new TableRegistry();
         this.memoryRegistry = new MemoryRegistry();
         this.moduleInstances = new LinkedHashMap<>();
         this.linker = new Linker();
-        this.moduleNameCount = 0;
-        filesManager = new FdManager(env);
+        this.filesManager = new FdManager(env);
         instantiateBuiltinInstances();
     }
 
@@ -103,7 +118,7 @@ public final class WasmContext {
 
     @SuppressWarnings("unused")
     public Object getScope() {
-        return new WasmScope(moduleInstances);
+        return new WasmScope(this);
     }
 
     public FdManager fdManager() {
@@ -117,11 +132,33 @@ public final class WasmContext {
         return moduleInstances;
     }
 
+    @TruffleBoundary
+    public WasmInstance lookupModuleInstance(WasmModule module) {
+        WasmInstance instance = moduleInstances.get(module.name());
+        assert instance == null || instance.module() == module;
+        return instance;
+    }
+
+    @TruffleBoundary
+    public WasmInstance lookupModuleInstance(String name) {
+        return moduleInstances.get(name);
+    }
+
+    /**
+     * Returns the first module evaluated in this context (not including built-in modules).
+     */
+    public WasmInstance lookupMainModule() {
+        return mainModuleInstance;
+    }
+
     public void register(WasmInstance instance) {
         if (moduleInstances.containsKey(instance.name())) {
             throw WasmException.create(Failure.UNSPECIFIED_INTERNAL, "Context already contains an instance named '" + instance.name() + "'.");
         }
         moduleInstances.put(instance.name(), instance);
+        if (mainModuleInstance == null && !instance.isBuiltin()) {
+            mainModuleInstance = instance;
+        }
     }
 
     private void instantiateBuiltinInstances() {
@@ -142,28 +179,30 @@ public final class WasmContext {
         }
     }
 
-    private String freshModuleName() {
-        return "module-" + moduleNameCount++;
-    }
-
     public WasmModule readModule(byte[] data, ModuleLimits moduleLimits) {
-        return readModule(freshModuleName(), data, moduleLimits);
+        return readModule("Unnamed", data, moduleLimits);
     }
 
     public WasmModule readModule(String moduleName, byte[] data, ModuleLimits moduleLimits) {
-        final WasmModule module = new WasmModule(moduleName, data, moduleLimits);
-        final BinaryParser reader = new BinaryParser(language, module);
+        final WasmModule module = WasmModule.create(moduleName, moduleLimits);
+        final BinaryParser reader = new BinaryParser(module, this, data);
         reader.readModule();
         return module;
     }
 
+    @TruffleBoundary
     public WasmInstance readInstance(WasmModule module) {
         if (moduleInstances.containsKey(module.name())) {
             throw WasmException.create(Failure.UNSPECIFIED_INVALID, null, "Module " + module.name() + " is already instantiated in this context.");
         }
-        final WasmInstance instance = new WasmInstance(module);
-        final BinaryParser reader = new BinaryParser(language, module);
-        reader.readInstance(this, instance);
+        // Reread code sections if module is instantiated multiple times
+        if (!module.hasCodeEntries()) {
+            BytecodeParser.readCodeEntries(module);
+        }
+        final WasmInstantiator translator = new WasmInstantiator(language);
+        final WasmInstance instance = translator.createInstance(this, module, environment().getContext());
+        // Remove code entries from module to reduce memory footprint at runtime
+        module.setCodeEntries(null);
         this.register(instance);
         return instance;
     }
@@ -172,15 +211,51 @@ public final class WasmContext {
         // Note: this is not a complete and correct instantiation as defined in
         // https://webassembly.github.io/spec/core/exec/modules.html#instantiation
         // For testing only.
-        final BinaryParser reader = new BinaryParser(language, instance.module());
-        reader.resetGlobalState(this, instance);
+        BytecodeParser.resetGlobalState(this, instance.module(), instance);
         if (reinitMemory) {
-            reader.resetMemoryState(this, instance);
-            reader.resetTableState(this, instance);
-            final WasmFunction startFunction = instance.symbolTable().startFunction();
-            if (startFunction != null) {
-                instance.target(startFunction.index()).call();
-            }
+            BytecodeParser.resetMemoryState(this, instance.module(), instance);
+            BytecodeParser.resetTableState(this, instance.module(), instance);
+            Linker.runStartFunction(instance);
         }
+    }
+
+    public WasmContextOptions getContextOptions() {
+        return this.contextOptions;
+    }
+
+    private static final ContextReference<WasmContext> REFERENCE = ContextReference.create(WasmLanguage.class);
+
+    public static WasmContext get(Node node) {
+        return REFERENCE.get(node);
+    }
+
+    public void setMemGrowCallback(Object callback) {
+        this.memGrowCallback = callback;
+    }
+
+    public Object getMemGrowCallback() {
+        return memGrowCallback;
+    }
+
+    public void setMemNotifyCallback(Object callback) {
+        this.memNotifyCallback = callback;
+    }
+
+    public Object getMemNotifyCallback() {
+        return memNotifyCallback;
+    }
+
+    public void setMemWaitCallback(Object callback) {
+        this.memWaitCallback = callback;
+    }
+
+    public Object getMemWaitCallback() {
+        return memWaitCallback;
+    }
+
+    public void inheritCallbacksFromParentContext(WasmContext parent) {
+        setMemGrowCallback(parent.getMemGrowCallback());
+        setMemNotifyCallback(parent.getMemNotifyCallback());
+        setMemWaitCallback(parent.getMemWaitCallback());
     }
 }

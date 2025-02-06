@@ -233,13 +233,27 @@ JNIEXPORT jobject JNICALL JVM_DoPrivileged(JNIEnv *env, jclass cls, jobject acti
             return (*env)->CallObjectMethod(env, action, run);
         }
     }
+
+    /* Some error occurred - clear pending exception and try to report the error. */
+    (*env)->ExceptionClear(env);
+
     errorClass = (*env)->FindClass(env, "java/lang/InternalError");
     if (errorClass != NULL && !(*env)->ExceptionCheck(env)) {
         (*env)->ThrowNew(env, errorClass, "Could not invoke PrivilegedAction");
     } else {
+        (*env)->ExceptionClear(env);
         (*env)->FatalError(env, "PrivilegedAction could not be invoked and the error could not be reported");
     }
     return NULL;
+}
+
+JNIEXPORT jstring JNICALL JVM_GetTemporaryDirectory(JNIEnv *env) {
+    // see os_windows.cpp line 1367
+    static char path_buf[MAX_PATH];
+    if (GetTempPath(MAX_PATH, path_buf) <= 0) {
+        path_buf[0] = '\0';
+    }
+    return (*env)->NewStringUTF(env, path_buf);
 }
 
 jboolean VerifyFixClassname(char *utf_name) {
@@ -330,3 +344,14 @@ JNIEXPORT void * JNICALL JVM_RegisterSignal(jint sig, void *handler) {
       return oldHandler;
   }
 }
+
+#ifdef JNI_VERSION_24
+
+JNIEXPORT jboolean JNICALL JVM_IsStaticallyLinked(void) {
+    // This is a workaround based on the fact that currently the only user of interest is libawt,
+    // which is always known to be dynamically linked. This assumption can break with every JDK update.
+    // A more thorough solution is to move this method into the libjvm shim library (GR-58067).
+    return JNI_FALSE;
+}
+
+#endif

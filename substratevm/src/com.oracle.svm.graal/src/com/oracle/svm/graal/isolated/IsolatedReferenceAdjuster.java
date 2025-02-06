@@ -24,24 +24,25 @@
  */
 package com.oracle.svm.graal.isolated;
 
+import jdk.graal.compiler.word.Word;
 import org.graalvm.nativeimage.ObjectHandle;
-import org.graalvm.nativeimage.UnmanagedMemory;
 import org.graalvm.nativeimage.c.struct.SizeOf;
 import org.graalvm.word.Pointer;
 import org.graalvm.word.PointerBase;
-import org.graalvm.word.WordFactory;
 
-import com.oracle.svm.core.annotate.Uninterruptible;
+import com.oracle.svm.core.Uninterruptible;
 import com.oracle.svm.core.c.NonmovableArray;
 import com.oracle.svm.core.c.NonmovableArrays;
 import com.oracle.svm.core.c.NonmovableObjectArray;
 import com.oracle.svm.core.code.ReferenceAdjuster;
 import com.oracle.svm.core.config.ConfigurationValues;
 import com.oracle.svm.core.handles.ThreadLocalHandles;
+import com.oracle.svm.core.memory.NativeMemory;
 import com.oracle.svm.core.meta.DirectSubstrateObjectConstant;
-import com.oracle.svm.core.meta.SubstrateObjectConstant;
-import com.oracle.svm.core.snippets.KnownIntrinsics;
+import com.oracle.svm.core.nmt.NmtCategory;
 import com.oracle.svm.core.util.VMError;
+
+import jdk.vm.ci.meta.JavaConstant;
 
 /**
  * Reference adjuster for {@linkplain ClientHandle handles} from an {@link IsolatedObjectConstant},
@@ -55,12 +56,12 @@ final class IsolatedReferenceAdjuster implements ReferenceAdjuster {
 
     @Override
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    public <T> void setConstantTargetInArray(NonmovableObjectArray<T> array, int index, SubstrateObjectConstant constant) {
+    public <T> void setConstantTargetInArray(NonmovableObjectArray<T> array, int index, JavaConstant constant) {
         if (constant instanceof IsolatedObjectConstant) {
             record(NonmovableArrays.addressOf(array, index), ConfigurationValues.getObjectLayout().getReferenceSize(), ((IsolatedObjectConstant) constant).getHandle());
         } else {
             @SuppressWarnings("unchecked")
-            T target = (T) KnownIntrinsics.convertUnknownValue(((DirectSubstrateObjectConstant) constant).getObject(), Object.class);
+            T target = (T) ((DirectSubstrateObjectConstant) constant).getObject();
             setObjectInArray(array, index, target);
         }
     }
@@ -80,11 +81,11 @@ final class IsolatedReferenceAdjuster implements ReferenceAdjuster {
 
     @Override
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    public void setConstantTargetAt(PointerBase address, int length, SubstrateObjectConstant constant) {
+    public void setConstantTargetAt(PointerBase address, int length, JavaConstant constant) {
         if (constant instanceof IsolatedObjectConstant) {
             record(address, length, ((IsolatedObjectConstant) constant).getHandle());
         } else {
-            Object target = KnownIntrinsics.convertUnknownValue(((DirectSubstrateObjectConstant) constant).getObject(), Object.class);
+            Object target = ((DirectSubstrateObjectConstant) constant).getObject();
             if (target instanceof IsolatedMirroredObject<?>) {
                 ClientHandle<?> mirror = ((IsolatedMirroredObject<?>) target).getMirror();
                 assert !mirror.equal(IsolatedHandles.nullHandle()) : "Mirror object must not be null";
@@ -98,9 +99,9 @@ final class IsolatedReferenceAdjuster implements ReferenceAdjuster {
 
     @Override
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    public <T> NonmovableObjectArray<T> copyOfObjectArray(T[] source) {
+    public <T> NonmovableObjectArray<T> copyOfObjectArray(T[] source, NmtCategory nmtCategory) {
         @SuppressWarnings("unchecked")
-        NonmovableObjectArray<T> copy = NonmovableArrays.createObjectArray((Class<T[]>) source.getClass(), source.length);
+        NonmovableObjectArray<T> copy = NonmovableArrays.createObjectArray((Class<T[]>) source.getClass(), source.length, nmtCategory);
         for (int i = 0; i < source.length; i++) {
             setObjectInArray(copy, i, source[i]);
         }
@@ -114,24 +115,19 @@ final class IsolatedReferenceAdjuster implements ReferenceAdjuster {
     }
 
     public ForeignIsolateReferenceAdjusterData exportData() {
-        ForeignIsolateReferenceAdjusterData data = UnmanagedMemory.malloc(SizeOf.get(ForeignIsolateReferenceAdjusterData.class));
+        ForeignIsolateReferenceAdjusterData data = NativeMemory.malloc(SizeOf.get(ForeignIsolateReferenceAdjusterData.class), NmtCategory.Compiler);
         data.setCount(count);
         data.setAddresses(addresses);
         data.setHandles(handles);
 
-        NonmovableArrays.untrackUnmanagedArray(addresses);
-        addresses = WordFactory.nullPointer();
-        NonmovableArrays.untrackUnmanagedArray(handles);
-        handles = WordFactory.nullPointer();
+        addresses = Word.nullPointer();
+        handles = Word.nullPointer();
         count = 0;
 
         return data;
     }
 
     public static <T extends ObjectHandle> void adjustAndDispose(ForeignIsolateReferenceAdjusterData data, ThreadLocalHandles<T> handleSet) {
-        NonmovableArrays.trackUnmanagedArray(data.getAddresses());
-        NonmovableArrays.trackUnmanagedArray(data.getHandles());
-
         int count = data.getCount();
         for (int i = 0; i < count; i++) {
             @SuppressWarnings("unchecked")
@@ -143,7 +139,7 @@ final class IsolatedReferenceAdjuster implements ReferenceAdjuster {
 
         NonmovableArrays.releaseUnmanagedArray(data.getAddresses());
         NonmovableArrays.releaseUnmanagedArray(data.getHandles());
-        UnmanagedMemory.free(data);
+        NativeMemory.free(data);
     }
 
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
@@ -166,8 +162,8 @@ final class IsolatedReferenceAdjuster implements ReferenceAdjuster {
         int oldSize = addresses.isNonNull() ? NonmovableArrays.lengthOf(addresses) : 0;
         if (count == oldSize) {
             int newSize = (oldSize != 0) ? (2 * oldSize) : 32;
-            NonmovableArray<Pointer> newAddresses = NonmovableArrays.createWordArray(newSize);
-            NonmovableArray<ObjectHandle> newHandles = NonmovableArrays.createWordArray(newSize);
+            NonmovableArray<Pointer> newAddresses = NonmovableArrays.createWordArray(newSize, NmtCategory.Compiler);
+            NonmovableArray<ObjectHandle> newHandles = NonmovableArrays.createWordArray(newSize, NmtCategory.Compiler);
             if (addresses.isNonNull()) {
                 NonmovableArrays.arraycopy(addresses, 0, newAddresses, 0, oldSize);
                 NonmovableArrays.releaseUnmanagedArray(addresses);

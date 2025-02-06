@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2017, 2023, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -26,22 +26,27 @@ package com.oracle.svm.core.jdk;
 
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 
-import com.oracle.svm.core.annotate.AutomaticFeature;
 import org.graalvm.nativeimage.ImageSingletons;
 import org.graalvm.nativeimage.Platform;
-import org.graalvm.nativeimage.hosted.Feature;
 import org.graalvm.nativeimage.impl.InternalPlatform;
 import org.graalvm.word.PointerBase;
+
+import com.oracle.svm.core.Isolates;
+import com.oracle.svm.core.feature.AutomaticallyRegisteredFeature;
+import com.oracle.svm.core.feature.InternalFeature;
+import com.oracle.svm.core.util.VMError;
+
+import jdk.graal.compiler.serviceprovider.JavaVersionUtil;
 
 public abstract class PlatformNativeLibrarySupport {
 
     public static final String[] defaultBuiltInLibraries = {
                     "java",
                     "nio",
-                    "net",
-                    "zip"
+                    "net"
     };
 
     private static final String[] defaultBuiltInPkgNatives = {
@@ -62,9 +67,13 @@ public abstract class PlatformNativeLibrarySupport {
                     "javax_net",
                     "javax_script",
                     "javax_security",
-                    "jdk_internal_org",
+                    "jdk_internal_io",
+                    "jdk_internal_jimage",
                     "jdk_internal_misc",
+                    "jdk_internal_org",
+                    "jdk_internal_platform",
                     "jdk_internal_util",
+                    "jdk_internal_vm",
                     "jdk_net",
                     "sun_invoke",
                     "sun_launcher",
@@ -79,10 +88,56 @@ public abstract class PlatformNativeLibrarySupport {
                     "com_oracle_svm_core_jdk"
     };
 
-    private static final String[] defaultBuiltInPkgNativesBlacklist = {
-                    "sun_security_krb5_SCDynamicStoreConfig_getKerberosConfig",
-                    "sun_security_krb5_Config_getWindowsDirectory"
-    };
+    private static final String[] defaultBuiltInPkgNativesBlocklist;
+
+    static {
+        ArrayList<String> blocklist = new ArrayList<>();
+        Collections.addAll(blocklist,
+                        "sun_security_krb5_SCDynamicStoreConfig_getKerberosConfig",
+                        "sun_security_krb5_Config_getWindowsDirectory",
+                        "jdk_internal_org_jline_terminal_impl_jna_win_Kernel32Impl",
+                        "jdk_internal_misc_ScopedMemoryAccess_closeScope0",
+                        "jdk_internal_misc_ScopedMemoryAccess_registerNatives",
+                        "java_lang_invoke_VarHandle_weakCompareAndSetPlain",
+                        "java_lang_invoke_VarHandle_weakCompareAndSetRelease",
+                        "java_lang_invoke_VarHandle_getAndBitwiseAndAcquire",
+                        "java_lang_invoke_VarHandle_getVolatile",
+                        "java_lang_invoke_VarHandle_compareAndSet",
+                        "java_lang_invoke_VarHandle_compareAndExchangeRelease",
+                        "java_lang_invoke_VarHandle_getAndAddRelease",
+                        "java_lang_invoke_VarHandle_getAndBitwiseOr",
+                        "java_lang_invoke_VarHandle_getOpaque",
+                        "java_lang_invoke_VarHandle_compareAndExchangeAcquire",
+                        "java_lang_invoke_VarHandle_getAndBitwiseXorAcquire",
+                        "java_lang_invoke_VarHandle_get",
+                        "java_lang_invoke_VarHandle_setRelease",
+                        "java_lang_invoke_VarHandle_setVolatile",
+                        "java_lang_invoke_VarHandle_getAndBitwiseOrRelease",
+                        "java_lang_invoke_VarHandle_getAndBitwiseAnd",
+                        "java_lang_invoke_VarHandle_getAndBitwiseXorRelease",
+                        "java_lang_invoke_VarHandle_weakCompareAndSet",
+                        "java_lang_invoke_VarHandle_getAndSetRelease",
+                        "java_lang_invoke_VarHandle_weakCompareAndSetAcquire",
+                        "java_lang_invoke_VarHandle_setOpaque",
+                        "java_lang_invoke_VarHandle_getAndBitwiseAndRelease",
+                        "java_lang_invoke_VarHandle_getAndAdd",
+                        "java_lang_invoke_VarHandle_getAndBitwiseXor",
+                        "java_lang_invoke_VarHandle_getAndAddAcquire",
+                        "java_lang_invoke_VarHandle_getAndSet",
+                        "java_lang_invoke_VarHandle_getAndBitwiseOrAcquire",
+                        "java_lang_invoke_VarHandle_set",
+                        "java_lang_invoke_VarHandle_compareAndExchange",
+                        "java_lang_invoke_VarHandle_getAcquire",
+                        "java_lang_invoke_VarHandle_getAndSetAcquire");
+        if (JavaVersionUtil.JAVA_SPEC > 21) {
+            Collections.addAll(blocklist,
+                            "java_nio_MappedMemoryUtils_load0",
+                            "java_nio_MappedMemoryUtils_unload0",
+                            "java_nio_MappedMemoryUtils_isLoaded0",
+                            "java_nio_MappedMemoryUtils_force0");
+        }
+        defaultBuiltInPkgNativesBlocklist = blocklist.toArray(new String[0]);
+    }
 
     public static PlatformNativeLibrarySupport singleton() {
         return ImageSingletons.lookup(PlatformNativeLibrarySupport.class);
@@ -105,16 +160,22 @@ public abstract class PlatformNativeLibrarySupport {
     }
 
     private List<String> builtInPkgNatives;
+    private boolean builtInPkgNativesSealed;
 
     public void addBuiltinPkgNativePrefix(String name) {
+        if (builtInPkgNativesSealed) {
+            throw VMError.shouldNotReachHere("Cannot register any more packages as built-ins because information has already been used.");
+        }
         builtInPkgNatives.add(name);
     }
 
     public boolean isBuiltinPkgNative(String name) {
+        builtInPkgNativesSealed = true;
+
         String commonPrefix = "Java_";
         if (name.startsWith(commonPrefix)) {
             String strippedName = name.substring(commonPrefix.length());
-            for (String str : defaultBuiltInPkgNativesBlacklist) {
+            for (String str : defaultBuiltInPkgNativesBlocklist) {
                 if (strippedName.startsWith(str)) {
                     return false;
                 }
@@ -136,6 +197,8 @@ public abstract class PlatformNativeLibrarySupport {
 
         boolean load();
 
+        boolean unload();
+
         boolean isLoaded();
 
         PointerBase findSymbol(String name);
@@ -145,41 +208,20 @@ public abstract class PlatformNativeLibrarySupport {
 
     public abstract PointerBase findBuiltinSymbol(String name);
 
-    private boolean firstIsolate = false;
-
-    /**
-     * This method is called before {@link #initializeBuiltinLibraries()}, which can then use
-     * {@link #isFirstIsolate()}.
-     */
-    public void setIsFirstIsolate() {
-        firstIsolate = true;
-    }
-
-    /**
-     * Indicates if the current isolate is the first isolate in this process and whether it is
-     * therefore responsible for initializing any built-in libraries that are explicitly or
-     * implicitly shared between the isolates of the process (for example, because they have a
-     * single native state that does not distinguish between isolates).
-     */
-    public boolean isFirstIsolate() {
-        return firstIsolate;
-    }
-
     /**
      * Initializes built-in libraries during isolate creation.
      *
-     * @see #isFirstIsolate()
+     * @see Isolates#isCurrentFirst()
      */
     public abstract boolean initializeBuiltinLibraries();
 }
 
-@AutomaticFeature
-class PlatformNativeLibrarySupportFeature implements Feature {
+@AutomaticallyRegisteredFeature
+class PlatformNativeLibrarySupportFeature implements InternalFeature {
     @Override
     public void beforeAnalysis(BeforeAnalysisAccess access) {
         if (Platform.includedIn(InternalPlatform.PLATFORM_JNI.class)) {
             for (String libName : PlatformNativeLibrarySupport.defaultBuiltInLibraries) {
-                PlatformNativeLibrarySupport.singleton();
                 NativeLibrarySupport.singleton().preregisterUninitializedBuiltinLibrary(libName);
             }
         }

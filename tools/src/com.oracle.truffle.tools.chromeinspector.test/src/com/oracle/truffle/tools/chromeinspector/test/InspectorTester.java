@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2017, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -33,6 +33,7 @@ import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Future;
 import java.util.concurrent.Semaphore;
+import java.util.function.Consumer;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.fail;
@@ -44,6 +45,7 @@ import org.graalvm.polyglot.Source;
 import org.graalvm.polyglot.Value;
 import org.graalvm.polyglot.io.MessageEndpoint;
 
+import com.oracle.truffle.api.test.polyglot.ProxyLanguage;
 import com.oracle.truffle.tools.chromeinspector.InspectorExecutionContext;
 import com.oracle.truffle.tools.chromeinspector.domains.DebuggerDomain;
 import com.oracle.truffle.tools.chromeinspector.server.ConnectionWatcher;
@@ -64,14 +66,16 @@ public final class InspectorTester {
     }
 
     public static InspectorTester start(boolean suspend, final boolean inspectInternal, final boolean inspectInitialization) throws InterruptedException {
-        return start(suspend, inspectInternal, inspectInitialization, Collections.emptyList());
+        return start(new Options(suspend, inspectInternal, inspectInitialization));
     }
 
-    public static InspectorTester start(boolean suspend, final boolean inspectInternal, final boolean inspectInitialization, List<URI> sourcePath) throws InterruptedException {
+    public static InspectorTester start(Options options)
+                    throws InterruptedException {
         RemoteObject.resetIDs();
         ExceptionDetails.resetIDs();
         InspectorExecutionContext.resetIDs();
-        InspectExecThread exec = new InspectExecThread(suspend, inspectInternal, inspectInitialization, sourcePath);
+        InspectExecThread exec = new InspectExecThread(options.isSuspend(), options.isInspectInternal(), options.isInspectInitialization(), options.getSourcePath(), options.getProlog(),
+                        options.getSuspensionTimeout());
         exec.start();
         exec.initialized.acquire();
         return new InspectorTester(exec);
@@ -256,12 +260,88 @@ public final class InspectorTester {
         return allMessages.toString();
     }
 
+    public static final class Options {
+
+        private boolean suspend;
+        private boolean inspectInternal;
+        private boolean inspectInitialization;
+        private List<URI> sourcePath = Collections.emptyList();
+        private Consumer<Context> prolog;
+        private Long suspensionTimeout;
+
+        public Options(boolean suspend) {
+            this.suspend = suspend;
+        }
+
+        public Options(boolean suspend, final boolean inspectInternal, final boolean inspectInitialization) {
+            this.suspend = suspend;
+            this.inspectInternal = inspectInternal;
+            this.inspectInitialization = inspectInitialization;
+        }
+
+        public boolean isSuspend() {
+            return suspend;
+        }
+
+        public Options setSuspend(boolean suspend) {
+            this.suspend = suspend;
+            return this;
+        }
+
+        public boolean isInspectInternal() {
+            return inspectInternal;
+        }
+
+        public Options setInspectInternal(boolean inspectInternal) {
+            this.inspectInternal = inspectInternal;
+            return this;
+        }
+
+        public boolean isInspectInitialization() {
+            return inspectInitialization;
+        }
+
+        public Options setInspectInitialization(boolean inspectInitialization) {
+            this.inspectInitialization = inspectInitialization;
+            return this;
+        }
+
+        public List<URI> getSourcePath() {
+            return sourcePath;
+        }
+
+        public Options setSourcePath(List<URI> sourcePath) {
+            this.sourcePath = sourcePath;
+            return this;
+        }
+
+        public Consumer<Context> getProlog() {
+            return prolog;
+        }
+
+        public Options setProlog(Consumer<Context> prolog) {
+            this.prolog = prolog;
+            return this;
+        }
+
+        public Long getSuspensionTimeout() {
+            return suspensionTimeout;
+        }
+
+        public Options setSuspensionTimeout(Long suspensionTimeout) {
+            this.suspensionTimeout = suspensionTimeout;
+            return this;
+        }
+    }
+
     private static class InspectExecThread extends Thread implements MessageEndpoint {
 
         private final boolean suspend;
         private final boolean inspectInternal;
         private final boolean inspectInitialization;
         private final List<URI> sourcePath;
+        private final Consumer<Context> prolog;
+        private final Long suspensionTimeout;
         private InspectServerSession inspect;
         private ConnectionWatcher connectionWatcher;
         private long contextId;
@@ -276,12 +356,14 @@ public final class InspectorTester {
         final ProxyOutputStream err = new ProxyOutputStream(System.err);
         private final EnginesGCedTest.GCCheck gcCheck;
 
-        InspectExecThread(boolean suspend, final boolean inspectInternal, final boolean inspectInitialization, List<URI> sourcePath) {
+        InspectExecThread(boolean suspend, final boolean inspectInternal, final boolean inspectInitialization, List<URI> sourcePath, Consumer<Context> prolog, Long suspensionTimeout) {
             super("Inspector Executor");
             this.suspend = suspend;
             this.inspectInternal = inspectInternal;
             this.inspectInitialization = inspectInitialization;
             this.sourcePath = sourcePath;
+            this.prolog = prolog;
+            this.suspensionTimeout = suspensionTimeout;
             this.gcCheck = new EnginesGCedTest.GCCheck();
         }
 
@@ -289,16 +371,19 @@ public final class InspectorTester {
         public void run() {
             Engine engine = Engine.newBuilder().err(err).build();
             gcCheck.addReference(engine);
+            Context context = Context.newBuilder().engine(engine).allowAllAccess(true).build();
+            if (prolog != null) {
+                prolog.accept(context);
+            }
             Instrument testInstrument = engine.getInstruments().get(InspectorTestInstrument.ID);
             InspectSessionInfoProvider sessionInfoProvider = testInstrument.lookup(InspectSessionInfoProvider.class);
-            InspectSessionInfo sessionInfo = sessionInfoProvider.getSessionInfo(suspend, inspectInternal, inspectInitialization, sourcePath);
+            InspectSessionInfo sessionInfo = sessionInfoProvider.getSessionInfo(suspend, inspectInternal, inspectInitialization, sourcePath, suspensionTimeout);
             inspect = sessionInfo.getInspectServerSession();
             try {
                 connectionWatcher = sessionInfo.getConnectionWatcher();
                 contextId = sessionInfo.getId();
                 inspectorContext = sessionInfo.getInspectorContext();
                 inspect.open(this);
-                Context context = Context.newBuilder().engine(engine).allowAllAccess(true).build();
                 initialized.release();
                 Source source = null;
                 CompletableFuture<Value> valueFuture = null;
@@ -321,6 +406,7 @@ public final class InspectorTester {
                         }
                     }
                     if (source != null) {
+                        inspectorContext.waitForRunPermission();
                         Value value = context.eval(source);
                         valueFuture.complete(value);
                     }
@@ -331,11 +417,10 @@ public final class InspectorTester {
                 error = t;
                 sendText("\nERROR: " + t.getClass().getName() + ": " + t.getLocalizedMessage());
             } finally {
-                try {
-                    inspect.sendClose();
-                } catch (IOException e) {
-                    fail(e.getLocalizedMessage());
-                }
+                engine.close();
+                // To cleanup any references to the closed context, we need to set a new instance
+                // of ProxyLanguage.
+                ProxyLanguage.setDelegate(new ProxyLanguage());
                 inspect = null;
                 inspectorContext = null;
                 evalValue = null;

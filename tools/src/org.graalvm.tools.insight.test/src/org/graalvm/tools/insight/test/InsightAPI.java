@@ -24,14 +24,15 @@
  */
 package org.graalvm.tools.insight.test;
 
-// @formatter:off
+// @formatter:off // @replace regex='.*' replacement=''
 import java.util.Map;
 import java.util.function.Predicate;
+
 import org.graalvm.polyglot.Source;
 import org.graalvm.tools.insight.Insight;
 
 
-// BEGIN: InsightAPI
+// @start region="InsightAPI"
 /** Instance of this class is accessible via {@code insight} variable
  * in the Insight scripts registered to the instrument.
  */
@@ -281,6 +282,38 @@ public interface InsightAPI {
         public String rootNameFilter;
         /* @since 0.4 */
         public Predicate<SourceInfo> sourceFilter;
+        /**
+         * Location in the source file.
+         * @since 1.2
+         */
+        public OnConfigAt at;
+    }
+
+    class OnConfigAt {
+        /**
+         * String with a regular expression to match source path.
+         * Exactly one of this or {@link #sourceURI} is a mandatory property of
+         * the `at` object.
+         * @since 1.2
+         */
+        public String sourcePath;
+        /**
+         * String representation of a source URI.
+         * Exactly one of this or {@link #sourcePath} is a mandatory property of
+         * the `at` object.
+         * @since 1.2
+         */
+        public String sourceURI;
+        /**
+         * The line to match.
+         * @since 1.2
+         */
+        public Object line;
+        /**
+         * The column to match.
+         * @since 1.2
+         */
+        public Object column;
     }
 
     /** Register a handler on a particular elements in the source code.
@@ -312,4 +345,4 @@ public interface InsightAPI {
      */
     void off(String event, Handler handler);
 }
-// END: InsightAPI
+// @end region="InsightAPI"

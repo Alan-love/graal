@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017, 2020, Oracle and/or its affiliates.
+ * Copyright (c) 2017, 2024, Oracle and/or its affiliates.
  *
  * All rights reserved.
  *
@@ -55,8 +55,8 @@
     {                                                                                                                                                \
         int native_errno = errno;                                                                                                                    \
         type result = name(__VA_ARGS__);                                                                                                             \
-        if (result == (type) -1) {                                                                                                                   \
-            result = (type)(long) -errno;                                                                                                            \
+        if (result == (type) - 1) {                                                                                                                  \
+            result = (type) (long) -errno;                                                                                                           \
         }                                                                                                                                            \
         errno = native_errno;                                                                                                                        \
         return result;                                                                                                                               \
@@ -65,7 +65,7 @@
 #define CALL(type, name, ...)                                                                                                                        \
     {                                                                                                                                                \
         fprintf(stderr, "Syscalls (" #name ") not supported on this OS.\n");                                                                         \
-        return (type) -ENOSYS;                                                                                                                       \
+        return (type) - ENOSYS;                                                                                                                      \
     }
 #endif
 

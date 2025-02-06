@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -96,26 +96,34 @@ public final class RuntimeClassInitialization {
     public static void initializeAtRunTime(Class<?>... classes) {
         StackTraceElement[] stacktrace = Thread.currentThread().getStackTrace();
         for (Class<?> aClass : classes) {
-            ImageSingletons.lookup(RuntimeClassInitializationSupport.class).initializeAtRunTime(aClass, MESSAGE + getCaller(stacktrace));
+            ImageSingletons.lookup(RuntimeClassInitializationSupport.class).initializeAtRunTime(aClass, classReason(stacktrace, getUnqualifiedName(aClass) + ".class"));
         }
     }
 
     /**
      * Registers the provided classes as eagerly initialized during image-build time.
      * <p>
-     * All static initializers of {@code classes} will be executed during image-build time and
-     * static fields that are assigned values will be available at runtime. {@code static final}
+     * All static initializers of {@code classes} will be executed immediately at image-build time
+     * and static fields that are assigned values will be available at runtime. {@code static final}
      * fields will be considered as constant.
      * <p>
      * It is up to the user to ensure that this behavior makes sense and does not lead to wrong
      * application behavior.
+     * <p>
+     * After this method returns, all listed classes are initialized in the VM that runs the image
+     * generator. Therefore, this method can be used to resolve deadlocks and cycles in class
+     * initializer by starting initialization with a known-good entry class.
+     * <p>
+     * All superclasses and superinterfaces that are initialized before any of the listed classes
+     * are registered for initialization at build time too. Please look at the Java specification
+     * for the exact rules, especially regarding interfaces that declare default methods.
      *
      * @since 19.0
      */
     public static void initializeAtBuildTime(Class<?>... classes) {
         StackTraceElement[] stacktrace = Thread.currentThread().getStackTrace();
         for (Class<?> aClass : classes) {
-            ImageSingletons.lookup(RuntimeClassInitializationSupport.class).initializeAtBuildTime(aClass, MESSAGE + getCaller(stacktrace));
+            ImageSingletons.lookup(RuntimeClassInitializationSupport.class).initializeAtBuildTime(aClass, classReason(stacktrace, getUnqualifiedName(aClass) + ".class"));
         }
     }
 
@@ -135,12 +143,16 @@ public final class RuntimeClassInitialization {
     public static void initializeAtRunTime(String... packages) {
         StackTraceElement[] stacktrace = Thread.currentThread().getStackTrace();
         for (String aPackage : packages) {
-            ImageSingletons.lookup(RuntimeClassInitializationSupport.class).initializeAtRunTime(aPackage, MESSAGE + getCaller(stacktrace));
+            ImageSingletons.lookup(RuntimeClassInitializationSupport.class).initializeAtRunTime(aPackage, classReason(stacktrace, aPackage));
         }
     }
 
     /**
      * Registers all classes in provided packages as eagerly initialized during image-build time.
+     * <p>
+     * Passing {@code ""} as a package, registers all packages and classes for initialization at
+     * build time. This might have unintended side-effects and should thus be used with great
+     * caution.
      * <p>
      * All static initializers of {@code classes} will be executed during image-build time and
      * static fields that are assigned values will be available at runtime. {@code static final}
@@ -154,7 +166,7 @@ public final class RuntimeClassInitialization {
     public static void initializeAtBuildTime(String... packages) {
         StackTraceElement[] stacktrace = Thread.currentThread().getStackTrace();
         for (String aPackage : packages) {
-            ImageSingletons.lookup(RuntimeClassInitializationSupport.class).initializeAtBuildTime(aPackage, MESSAGE + getCaller(stacktrace));
+            ImageSingletons.lookup(RuntimeClassInitializationSupport.class).initializeAtBuildTime(aPackage, classReason(stacktrace, aPackage));
         }
     }
 
@@ -163,7 +175,19 @@ public final class RuntimeClassInitialization {
         return e.getClassName() + "." + e.getMethodName();
     }
 
-    private static final String MESSAGE = "from feature ";
+    private static String classReason(StackTraceElement[] stacktrace, String simpleName) {
+        return "from feature " + getCaller(stacktrace) + " with '" + simpleName + "'";
+    }
+
+    /**
+     * Alternative to {@link Class#getSimpleName} that does not probe the enclosing class or method
+     * which fails when they are not yet loaded. Duplicated from
+     * {@code ClassUtil.getUnqualifiedName} which is not reachable here.
+     */
+    private static String getUnqualifiedName(Class<?> aClass) {
+        String name = aClass.getTypeName();
+        return name.substring(name.lastIndexOf('.') + 1); // strip the package name
+    }
 
     private RuntimeClassInitialization() {
     }

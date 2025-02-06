@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2017, 2022, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -58,6 +58,7 @@ import com.oracle.truffle.api.TruffleLanguage;
 import com.oracle.truffle.api.TruffleLanguage.Env;
 import com.oracle.truffle.api.nodes.ExplodeLoop;
 import com.oracle.truffle.api.nodes.LanguageInfo;
+import com.oracle.truffle.api.nodes.Node;
 
 /**
  * Reporter of guest language value allocations. Language implementation ought to use this class to
@@ -66,7 +67,10 @@ import com.oracle.truffle.api.nodes.LanguageInfo;
  * used from compiled code paths, then the allocation reporter must be stored in a compilation final
  * or final field.
  * <p>
- * Usage example: {@link AllocationReporterSnippets#example}
+ * Usage example:
+ *
+ * {@snippet file="com/oracle/truffle/api/instrumentation/AllocationReporter.java"
+ * region="AllocationReporterSnippets#example"}
  *
  * @since 0.27
  */
@@ -361,12 +365,8 @@ class AllocationReporterSnippets extends TruffleLanguage<ContextObject> {
     void example() {
     }
 
-    static ContextObject getCurrentContext() {
-        return getCurrentContext(AllocationReporterSnippets.class);
-    }
-
-    // @formatter:off
-    // BEGIN: AllocationReporterSnippets#example
+    // @formatter:off // @replace regex='.*' replacement=''
+    // @start region="AllocationReporterSnippets#example"
     @Override
     protected ContextObject createContext(Env env) {
         AllocationReporter reporter = env.lookup(AllocationReporter.class);
@@ -374,7 +374,7 @@ class AllocationReporterSnippets extends TruffleLanguage<ContextObject> {
     }
 
     Object allocateNew() {
-        AllocationReporter reporter = getCurrentContext().getReporter();
+        AllocationReporter reporter = ContextObject.get(null).getReporter();
         // Test if the reporter is active, we should compute the size estimate
         if (reporter.isActive()) {
             long size = findSizeEstimate();
@@ -392,7 +392,7 @@ class AllocationReporterSnippets extends TruffleLanguage<ContextObject> {
     }
 
     Object allocateComplex() {
-        AllocationReporter reporter = getCurrentContext().getReporter();
+        AllocationReporter reporter = ContextObject.get(null).getReporter();
         // If the allocated size is a constant, onEnter() and onReturnValue()
         // can be called without a fast-path performance penalty when not active
         reporter.onEnter(null, 0, 16);
@@ -402,8 +402,8 @@ class AllocationReporterSnippets extends TruffleLanguage<ContextObject> {
         reporter.onReturnValue(newObject, 0, 16);
         return newObject;
     }
-    // END: AllocationReporterSnippets#example
-    // @formatter:on
+    // @end region="AllocationReporterSnippets#example"
+    // @formatter:on // @replace regex='.*' replacement=''
 
     private static long findSizeEstimate() {
         return 0L;
@@ -418,7 +418,7 @@ class AllocationReporterSnippets extends TruffleLanguage<ContextObject> {
         return null;
     }
 
-    private static class MyTruffleObject {
+    private static final class MyTruffleObject {
     }
 
 }
@@ -433,6 +433,10 @@ class ContextObject {
 
     public AllocationReporter getReporter() {
         return reporter;
+    }
+
+    static ContextObject get(@SuppressWarnings("unused") Node node) {
+        return null;
     }
 
 }

@@ -8,6 +8,7 @@ CLSS public java.lang.Object
 cons public init()
 meth protected java.lang.Object clone() throws java.lang.CloneNotSupportedException
 meth protected void finalize() throws java.lang.Throwable
+ anno 0 java.lang.Deprecated(boolean forRemoval=true, java.lang.String since="9")
 meth public boolean equals(java.lang.Object)
 meth public final java.lang.Class<?> getClass()
 meth public final void notify()
@@ -35,7 +36,9 @@ meth public boolean equals(java.lang.Object)
 meth public boolean isRelease()
 meth public boolean isSnapshot()
 meth public int compareTo(org.graalvm.home.Version)
+meth public int getComponent(int)
 meth public int hashCode()
+meth public java.lang.String format(java.lang.String)
 meth public java.lang.String toString()
 meth public static org.graalvm.home.Version getCurrent()
 meth public static org.graalvm.home.Version parse(java.lang.String)

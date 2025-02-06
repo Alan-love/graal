@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2016, 2020, Oracle and/or its affiliates.
+ * Copyright (c) 2016, 2023, Oracle and/or its affiliates.
  *
  * All rights reserved.
  *
@@ -29,10 +29,10 @@
  */
 package com.oracle.truffle.llvm.runtime.nodes.intrinsics.interop;
 
-import com.oracle.truffle.api.CompilerDirectives;
 import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
 import com.oracle.truffle.api.dsl.Cached;
 import com.oracle.truffle.api.dsl.Fallback;
+import com.oracle.truffle.api.dsl.GenerateAOT;
 import com.oracle.truffle.api.dsl.NodeChild;
 import com.oracle.truffle.api.dsl.Specialization;
 import com.oracle.truffle.api.interop.InteropLibrary;
@@ -47,6 +47,9 @@ import com.oracle.truffle.llvm.runtime.except.LLVMPolyglotException;
 import com.oracle.truffle.llvm.runtime.interop.LLVMAsForeignNode;
 import com.oracle.truffle.llvm.runtime.interop.LLVMDataEscapeNode;
 import com.oracle.truffle.llvm.runtime.nodes.api.LLVMExpressionNode;
+import com.oracle.truffle.llvm.runtime.nodes.api.LLVMLazyException;
+import com.oracle.truffle.llvm.runtime.nodes.intrinsics.interop.LLVMPolyglotWriteFactory.LLVMPolyglotPutMemberNodeGen;
+import com.oracle.truffle.llvm.runtime.nodes.intrinsics.interop.LLVMPolyglotWriteFactory.LLVMPolyglotSetArrayElementNodeGen;
 import com.oracle.truffle.llvm.runtime.pointer.LLVMManagedPointer;
 import com.oracle.truffle.llvm.runtime.types.Type;
 
@@ -59,14 +62,22 @@ public final class LLVMPolyglotWrite {
 
         @Child LLVMDataEscapeNode prepareValueForEscape;
 
-        public LLVMPolyglotPutMember(Type[] argTypes) {
+        public static LLVMExpressionNode create(Type[] argTypes, LLVMExpressionNode target, LLVMExpressionNode id, LLVMExpressionNode value) {
             if (argTypes.length != 4) { // first argument is the stack pointer
-                throw new LLVMPolyglotException(this, "polyglot_put_member must be called with exactly 3 arguments.");
+                return LLVMLazyException.createExpressionNode((node, ex) -> {
+                    return new LLVMPolyglotException(node, "polyglot_put_member must be called with exactly 3 arguments.");
+                }, null);
+            } else {
+                return LLVMPolyglotPutMemberNodeGen.create(argTypes, target, id, value);
             }
+        }
+
+        LLVMPolyglotPutMember(Type[] argTypes) {
             prepareValueForEscape = LLVMDataEscapeNode.create(argTypes[3]);
         }
 
         @Specialization
+        @GenerateAOT.Exclude
         protected void doIntrinsic(LLVMManagedPointer target, Object id, Object value,
                         @Cached LLVMAsForeignNode asForeign,
                         @CachedLibrary(limit = "3") InteropLibrary foreignWrite,
@@ -109,29 +120,38 @@ public final class LLVMPolyglotWrite {
 
         @Child LLVMDataEscapeNode prepareValueForEscape;
 
-        public LLVMPolyglotSetArrayElement(Type[] argTypes) {
+        public static LLVMExpressionNode create(Type[] argTypes, LLVMExpressionNode target, LLVMExpressionNode idx, LLVMExpressionNode value) {
             if (argTypes.length != 4) { // first argument is the stack pointer
-                throw new LLVMPolyglotException(this, "polyglot_set_array_element must be called with exactly 3 arguments.");
+                return LLVMLazyException.createExpressionNode((node, ex) -> {
+                    return new LLVMPolyglotException(node, "polyglot_set_array_element must be called with exactly 3 arguments.");
+                }, null);
+            } else {
+                return LLVMPolyglotSetArrayElementNodeGen.create(argTypes, target, idx, value);
             }
+        }
+
+        LLVMPolyglotSetArrayElement(Type[] argTypes) {
             prepareValueForEscape = LLVMDataEscapeNode.create(argTypes[3]);
         }
 
         @Specialization
+        @GenerateAOT.Exclude
         protected Object doIntrinsic(LLVMManagedPointer target, int id, Object value,
                         @Cached LLVMAsForeignNode asForeign,
-                        @CachedLibrary(limit = "3") InteropLibrary foreignWrite) {
+                        @CachedLibrary(limit = "3") InteropLibrary foreignWrite,
+                        @Cached BranchProfile exception) {
             Object foreign = asForeign.execute(target);
             Object escapedValue = prepareValueForEscape.executeWithTarget(value);
             try {
                 foreignWrite.writeArrayElement(foreign, id, escapedValue);
             } catch (UnsupportedMessageException e) {
-                CompilerDirectives.transferToInterpreter();
+                exception.enter();
                 throw new LLVMPolyglotException(foreignWrite, "Cannot write to index %d of polyglot value.", id);
             } catch (InvalidArrayIndexException e) {
-                CompilerDirectives.transferToInterpreter();
+                exception.enter();
                 throw new LLVMPolyglotException(foreignWrite, "Index %d does not exist.", id);
             } catch (UnsupportedTypeException e) {
-                CompilerDirectives.transferToInterpreter();
+                exception.enter();
                 throw new LLVMPolyglotException(foreignWrite, "Unsupported type writing index %d.", id);
             }
             return null;

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2020, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -59,6 +59,7 @@ import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
 
+import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
 import com.oracle.truffle.api.frame.VirtualFrame;
 import com.oracle.truffle.api.instrumentation.EventBinding;
 import com.oracle.truffle.api.instrumentation.EventContext;
@@ -203,7 +204,7 @@ public class GradualInstrumentationTest {
      * new materialized subtree are not present when the subtree is cloned during materialization.
      */
     @Test
-    public void testRepeatedInstrumentationDoesNotChangeParentsInMaterializedTree() {
+    public void testSubTreeClonedForMaterialization() {
         Source source = Source.create(ID, "ROOT(MATERIALIZE_CHILD_STMT_AND_EXPR(EXPRESSION(EXPRESSION)))");
         // execute first so that the next execution cannot take advantage of the "onFirstExecution"
         // optimization
@@ -230,7 +231,7 @@ public class GradualInstrumentationTest {
      * subtree can lead to some nodes in the new tree not be materialized.
      */
     @Test
-    public void testRepeatedInstrumentationChangesParentsInMaterializedTreeIfSubtreesAreNotCloned() {
+    public void testSubTreeNotClonedForMaterialization() {
         Source source = Source.create(ID, "ROOT(MATERIALIZE_CHILD_STMT_AND_EXPR_NC(EXPRESSION(EXPRESSION)))");
         // execute first so that the next execution cannot take advantage of the "onFirstExecution"
         // optimization
@@ -247,12 +248,16 @@ public class GradualInstrumentationTest {
          * materialized node has an expression as a child and the children of that expression
          * consist of only one expression, then the nested expression is connected as a child
          * directly to the materialized node in place of its parent and for each expression which is
-         * ommited this way, one child expression is added to the extra statement node. Since the NC
+         * omitted this way, one child expression is added to the extra statement node. Since the NC
          * node erroneously does not clone the subtree on materialization, the repeated
          * instrumentation changes the parent of the nested expression to its original expression
          * parent, and so in the new materialized tree, the nested expression node which is now a
          * direct child of the materialized NC node is not instrumented in the new tree, because it
-         * was already instrumented in the old tree (it already has instrumentation wrapper).
+         * was already instrumented in the old tree (it already has instrumentation wrapper). The
+         * stability of this test depends on keeping the node
+         * MaterializeChildStatementAndExpressionNode retired during the first instrumentation alive
+         * so that it is used in the second instrumentation. Therefore, the reference to it is kept
+         * in a field of MaterializedChildStatementAndExpressionNode.
          */
         assertEquals("+S+S+E-E-S-S", listener2.getRecording());
     }
@@ -355,9 +360,7 @@ public class GradualInstrumentationTest {
          * via parents.
          */
         listener2.clearEnteredNodes();
-        for (WeakReference<Node> retiredStatementNodeWeakReference : retiredStatementNodes) {
-            GCUtils.assertGc("Retired node is was not collected!", retiredStatementNodeWeakReference);
-        }
+        GCUtils.assertGc("Retired node is was not collected!", retiredStatementNodes);
         binding.dispose();
         context.eval(source);
         for (Node enteredNode : enteredMaterializedStatementNodes) {
@@ -477,6 +480,11 @@ public class GradualInstrumentationTest {
 
         @Override
         public void onEnter(EventContext context, VirtualFrame frame) {
+            onEnterBoundary(context);
+        }
+
+        @TruffleBoundary
+        private void onEnterBoundary(EventContext context) {
             String stepId = getStepId("+", context);
             waitBeforeStep(stepId);
             sb.append(stepId);
@@ -484,6 +492,11 @@ public class GradualInstrumentationTest {
 
         @Override
         public void onReturnValue(EventContext context, VirtualFrame frame, Object result) {
+            onReturnValueBoundary(context);
+        }
+
+        @TruffleBoundary
+        private void onReturnValueBoundary(EventContext context) {
             String stepId = getStepId("-", context);
             waitBeforeStep(stepId);
             sb.append(stepId);
@@ -491,6 +504,11 @@ public class GradualInstrumentationTest {
 
         @Override
         public void onReturnExceptional(EventContext context, VirtualFrame frame, Throwable exception) {
+            onReturnExceptionalBoundary(context);
+        }
+
+        @TruffleBoundary
+        private void onReturnExceptionalBoundary(EventContext context) {
             String stepId = getStepId("*", context);
             waitBeforeStep(stepId);
             sb.append(stepId);

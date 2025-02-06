@@ -1,3 +1,9 @@
+---
+layout: docs
+toc_group: truffle
+link_title: Dynamic Object Model
+permalink: /graalvm-as-a-platform/language-implementation-framework/DynamicObjectModel/
+---
 # Dynamic Object Model
 
 This guide demonstrates how to get started with using the [DynamicObject](https://www.graalvm.org/truffle/javadoc/com/oracle/truffle/api/object/DynamicObject.html) and [DynamicObjectLibrary](https://www.graalvm.org/truffle/javadoc/com/oracle/truffle/api/object/DynamicObjectLibrary.html) APIs introduced with GraalVM 20.2.0.
@@ -116,7 +122,7 @@ public final class MyLanguage extends TruffleLanguage<MyContext> {
     private final Shape initialArrayShape;
 
     public MyLanguage() {
-        this.initialObjectShape = Shape.newBuilder(ExtendedObject.class).build();
+        this.initialObjectShape = Shape.newBuilder().layout(ExtendedObject.class).build();
         this.initialArrayShape = Shape.newBuilder().build();
     }
 
@@ -162,8 +168,8 @@ public abstract class MakePairNode extends BinaryExpressionNode {
     @Specialization
     Object makePair(Object left, Object right,
                     @CachedLanguage MyLanguage language,
-                    @CachedLibrary(limit = "3") putLeft,
-                    @CachedLibrary(limit = "3") putRight) {
+                    @CachedLibrary(limit = "3") DynamicObjectLibrary putLeft,
+                    @CachedLibrary(limit = "3") DynamicObjectLibrary putRight) {
         MyObject obj = language.createObject();
         putLeft.put(obj, "left", left);
         putRight.put(obj, "right", right);
@@ -178,4 +184,4 @@ public abstract class MakePairNode extends BinaryExpressionNode {
 
 A high-level description of the object model has been published in [**An Object Storage Model for the Truffle Language Implementation Framework**](http://dl.acm.org/citation.cfm?id=2647517).
 
-See [Truffle documentation](https://github.com/oracle/graal/tree/master/truffle/docs) and [publications](https://github.com/oracle/graal/blob/master/docs/Publications.md) for more tutorials, presentations, and publications about Truffle and GraalVM.
+See [Truffle publications](https://github.com/oracle/graal/blob/master/docs/Publications.md) for more presentations and publications about Truffle and GraalVM.

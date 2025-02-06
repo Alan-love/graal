@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -61,10 +61,16 @@ import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.FileAttribute;
 import java.nio.file.attribute.FileAttributeView;
+import java.nio.file.spi.FileSystemProvider;
 import java.util.Collection;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.function.Predicate;
+
+import org.graalvm.polyglot.Context;
+import org.graalvm.polyglot.Engine;
+import org.graalvm.polyglot.io.IOAccess.Builder;
 
 /**
  * Service-provider for {@code Truffle} files.
@@ -79,6 +85,8 @@ public interface FileSystem {
      * @param uri the {@link URI} to be converted to {@link Path}
      * @return the {@link Path} representing given {@link URI}
      * @throws UnsupportedOperationException when {@link URI} scheme is not supported
+     * @throws IllegalArgumentException if preconditions on the {@code uri} do not hold. The format
+     *             of the URI is {@link FileSystem} specific.
      * @since 19.0
      */
     Path parsePath(URI uri);
@@ -90,6 +98,8 @@ public interface FileSystem {
      * @param path the string path to be converted to {@link Path}
      * @return the {@link Path}
      * @throws UnsupportedOperationException when the {@link FileSystem} supports only {@link URI}
+     * @throws IllegalArgumentException if the {@code path} string cannot be converted to a
+     *             {@link Path}
      * @since 19.0
      */
     Path parsePath(String path);
@@ -429,19 +439,23 @@ public interface FileSystem {
      * Creates a {@link FileSystem} implementation based on the host Java NIO. The returned instance
      * can be used as a delegate by a decorating {@link FileSystem}.
      * <p>
-     * The following example shows a {@link FileSystem} restricting an IO access only to a given
-     * folder.
+     * For an untrusted code execution, access to the host filesystem should be prevented either by
+     * using {@link IOAccess#NONE} or an {@link #newFileSystem(java.nio.file.FileSystem)} in-memory
+     * filesystem}. For more details on executing untrusted code, see the
+     * <a href="https://www.graalvm.org/dev/security-guide/polyglot-sandbox/">Polyglot Sandboxing
+     * Security Guide</a>.
+     * <p>
+     * The following example shows a {@link FileSystem} logging filesystem operations.
      *
      * <pre>
-     * class RestrictedFileSystem implements FileSystem {
+     * class TracingFileSystem implements FileSystem {
+     *
+     *     private static final Logger LOGGER = Logger.getLogger(TracingFileSystem.class.getName());
      *
      *     private final FileSystem delegate;
-     *     private final Path allowedFolder;
      *
-     *     RestrictedFileSystem(String allowedFolder) throws IOException {
+     *     TracingFileSystem() {
      *         this.delegate = FileSystem.newDefaultFileSystem();
-     *         this.allowedFolder = delegate.toRealPath(
-     *                         delegate.parsePath(allowedFolder));
      *     }
      *
      *     &#64;Override
@@ -456,33 +470,228 @@ public interface FileSystem {
      *
      *     &#64;Override
      *     public SeekableByteChannel newByteChannel(Path path,
-     *                     Set&lt;? extends OpenOption&gt; options,
-     *                     FileAttribute&lt;?&gt;... attrs) throws IOException {
-     *         verifyAccess(path);
-     *         return delegate.newByteChannel(path, options, attrs);
+     *                                               Set&lt;? extends OpenOption&gt; options,
+     *                                               FileAttribute&lt;?&gt;... attrs) throws IOException {
+     *         boolean success = false;
+     *         try {
+     *             SeekableByteChannel result =  delegate.newByteChannel(path, options, attrs);
+     *             success = true;
+     *             return result;
+     *         } finally {
+     *             trace("newByteChannel", path, success);
+     *         }
      *     }
      *
-     *     private void verifyAccess(Path path) {
-     *         Path realPath = null;
-     *         for (Path c = path; c != null; c = c.getParent()) {
-     *             try {
-     *                 realPath = delegate.toRealPath(c);
-     *                 break;
-     *             } catch (IOException ioe) {
-     *             }
-     *         }
-     *         if (realPath == null || !realPath.startsWith(allowedFolder)) {
-     *             throw new SecurityException("Access to " + path + " is denied.");
-     *         }
+     *     ...
+     *
+     *     private void trace(String operation, Path path, boolean success) {
+     *         LOGGER.log(Level.FINE, "The {0} request for the path {1} {2}.",new Object[] {
+     *                         operation, path, success ? "was successful" : "failed"
+     *                 });
      *     }
      * }
      * </pre>
      *
-     * @see org.graalvm.polyglot.Context.Builder#fileSystem(org.graalvm.polyglot.io.FileSystem)
+     * @see Builder#fileSystem(FileSystem)
+     * @see org.graalvm.polyglot.Context.Builder#allowIO(IOAccess)
      *
      * @since 20.2.0
      */
     static FileSystem newDefaultFileSystem() {
-        return IOHelper.IMPL.newDefaultFileSystem();
+        return IOHelper.ImplHolder.IMPL.newDefaultFileSystem(System.getProperty("java.io.tmpdir"));
+    }
+
+    /**
+     * Decorates the given {@code fileSystem} by an implementation that forwards access to files in
+     * the language home to the default file system. The method is intended to be used by custom
+     * filesystem implementations with non default storage to allow guest languages to access files
+     * in the languages homes. As the returned filesystem uses a default file system to access files
+     * in the language home, the {@code fileSystem} has to use the same {@link Path} type,
+     * {@link #getSeparator() separator} and {@link #getPathSeparator() path separator} as the
+     * {@link #newDefaultFileSystem() default filesystem}.
+     *
+     * @throws IllegalArgumentException when the {@code fileSystem} does not use the same
+     *             {@link Path} type or has a different {@link #getSeparator() separator} or
+     *             {@link #getPathSeparator() path separator} as the {@link #newDefaultFileSystem()
+     *             default file system}.
+     * @since 22.2
+     * @deprecated Use {{@link #allowInternalResourceAccess(FileSystem)}}.
+     */
+    @Deprecated
+    static FileSystem allowLanguageHomeAccess(FileSystem fileSystem) {
+        return allowInternalResourceAccess(fileSystem);
+    }
+
+    /**
+     * Decorates the given {@code fileSystem} by an implementation that forwards access to the
+     * internal resources to the default file system. The method is intended to be used by custom
+     * filesystem implementations with non default storage to allow guest languages to access
+     * internal resources. As the returned filesystem uses a default file system to access internal
+     * resources, the {@code fileSystem} has to use the same {@link Path} type,
+     * {@link #getSeparator() separator} and {@link #getPathSeparator() path separator} as the
+     * {@link #newDefaultFileSystem() default filesystem}.
+     *
+     * @throws IllegalArgumentException when the {@code fileSystem} does not use the same
+     *             {@link Path} type or has a different {@link #getSeparator() separator} or
+     *             {@link #getPathSeparator() path separator} as the {@link #newDefaultFileSystem()
+     *             default file system}.
+     * @see Engine#copyResources(Path, String...)
+     * @since 24.0
+     */
+    static FileSystem allowInternalResourceAccess(FileSystem fileSystem) {
+        return IOHelper.ImplHolder.IMPL.allowInternalResourceAccess(fileSystem);
+    }
+
+    /**
+     * Decorates the given {@code fileSystem} by an implementation that makes the passed
+     * {@code fileSystem} read-only by forbidding all write operations. This method can be used to
+     * make an existing file system, such as the {@link #newDefaultFileSystem() default filesystem},
+     * read-only.
+     *
+     * @since 22.2
+     */
+    static FileSystem newReadOnlyFileSystem(FileSystem fileSystem) {
+        return IOHelper.ImplHolder.IMPL.newReadOnlyFileSystem(fileSystem);
+    }
+
+    /**
+     * Creates a {@link FileSystem} implementation based on the given Java NIO filesystem. The
+     * returned {@link FileSystem} delegates all operations to {@code fileSystem}'s
+     * {@link FileSystemProvider provider}.
+     *
+     * <p>
+     * The following example shows how to configure {@link Context} so that languages read files
+     * from a prepared zip file.
+     *
+     * <pre>
+     * Path zipFile = Paths.get("filesystem.zip");
+     * try (java.nio.file.FileSystem nioFs = FileSystems.newFileSystem(zipFile)) {
+     *     IOAccess ioAccess = IOAccess.newBuilder().fileSystem(FileSystem.newFileSystem(nioFs)).build();
+     *     try (Context ctx = Context.newBuilder().allowIO(ioAccess).build()) {
+     *         Value result = ctx.eval("js", "load('scripts/app.sh'); execute()");
+     *     }
+     * }
+     * </pre>
+     *
+     * @see IOAccess
+     * @since 23.0
+     */
+    static FileSystem newFileSystem(java.nio.file.FileSystem fileSystem) {
+        return IOHelper.ImplHolder.IMPL.newNIOFileSystem(fileSystem);
+    }
+
+    /**
+     * Creates a {@link FileSystem} that denies all file operations except for path parsing. Any
+     * attempt to perform file operations such as reading, writing, or deletion will result in a
+     * {@link SecurityException} being thrown.
+     * <p>
+     * Typically, this file system does not need to be explicitly installed to restrict access to
+     * host file systems. Instead, use {@code Context.newBuilder().allowIO(IOAccess.NONE)}. This
+     * method is intended primarily for use as a fallback file system in a
+     * {@link #newCompositeFileSystem(FileSystem, Selector...) composite file system}.
+     *
+     * @since 24.2
+     */
+    static FileSystem newDenyIOFileSystem() {
+        return IOHelper.ImplHolder.IMPL.newDenyIOFileSystem();
+    }
+
+    /**
+     * Creates a composite {@link FileSystem} that delegates operations to the provided
+     * {@code delegates}. The {@link FileSystem} of the first {@code delegate} whose
+     * {@link Selector#test(Path)} method accepts the path is used for the file system operation. If
+     * no {@code delegate} accepts the path, the {@code fallbackFileSystem} is used.
+     * <p>
+     * The {@code fallbackFileSystem} is responsible for parsing {@link Path} objects. All provided
+     * file systems must use the same {@link Path} type, {@link #getSeparator() separator}, and
+     * {@link #getPathSeparator() path separator}. If any file system does not meet this
+     * requirement, an {@link IllegalArgumentException} is thrown.
+     * <p>
+     * The composite file system maintains its own notion of the current working directory and
+     * ensures that the {@link #setCurrentWorkingDirectory(Path)} method is not invoked on any of
+     * the delegates. When a request to set the current working directory is received, the composite
+     * file system verifies that the specified path corresponds to an existing directory by
+     * consulting either the appropriate delegate or the {@code fallbackFileSystem}. If an explicit
+     * current working directory has been set, the composite file system normalizes and resolves all
+     * relative paths to absolute paths prior to delegating operations. Conversely, if no explicit
+     * current working directory is set, the composite file system directly forwards the incoming
+     * path, whether relative or absolute, to the appropriate delegate. Furthermore, when an
+     * explicit current working directory is set, the composite file system does not delegate
+     * {@code toAbsolutePath} operations, as delegates do not maintain an independent notion of the
+     * current working directory. If the current working directory is unset, {@code toAbsolutePath}
+     * operations are delegated to the {@code fallbackFileSystem}.
+     * <p>
+     * Operations that are independent of path context, including {@code getTempDirectory},
+     * {@code getSeparator}, and {@code getPathSeparator}, are handled exclusively by the
+     * {@code fallbackFileSystem}.
+     *
+     * @throws IllegalArgumentException if the file systems do not use the same {@link Path} type,
+     *             {@link #getSeparator() separator}, or {@link #getPathSeparator() path separator}
+     * @since 24.2
+     */
+    static FileSystem newCompositeFileSystem(FileSystem fallbackFileSystem, Selector... delegates) {
+        return IOHelper.ImplHolder.IMPL.newCompositeFileSystem(fallbackFileSystem, delegates);
+    }
+
+    /**
+     * A selector for determining which {@link FileSystem} should handle operations on a given
+     * {@link Path}. This class encapsulates a {@link FileSystem} and defines a condition for
+     * selecting it.
+     *
+     * @since 24.2
+     */
+    abstract class Selector implements Predicate<Path> {
+
+        private final FileSystem fileSystem;
+
+        /**
+         * Creates a {@link Selector} for the specified {@link FileSystem}.
+         *
+         * @since 24.2
+         */
+        protected Selector(FileSystem fileSystem) {
+            this.fileSystem = Objects.requireNonNull(fileSystem, "FileSystem must be non-null");
+        }
+
+        /**
+         * Returns the {@link FileSystem} associated with this selector.
+         *
+         * @since 24.2
+         */
+        public final FileSystem getFileSystem() {
+            return fileSystem;
+        }
+
+        /**
+         * Tests whether the {@link FileSystem} associated with this selector can handle operations
+         * on the specified {@link Path}.
+         *
+         * @param path the path to test, provided as a normalized absolute path. The given
+         *            {@code path} has no path components equal to {@code "."} or {@code ".."}.
+         * @return {@code true} if the associated {@link FileSystem} can handle the {@code path};
+         *         {@code false} otherwise
+         * @since 24.2
+         */
+        public abstract boolean test(Path path);
+
+        /**
+         * Creates a {@link Selector} for the specified {@link FileSystem} using the provided
+         * {@link Predicate}.
+         *
+         * @param fileSystem the {@link FileSystem} to associate with the selector
+         * @param predicate the condition to determine if the {@link FileSystem} can handle a given
+         *            path
+         * @return a new {@link Selector} that delegates path testing to the {@code predicate}
+         * @since 24.2
+         */
+        public static Selector of(FileSystem fileSystem, Predicate<Path> predicate) {
+            Objects.requireNonNull(predicate, "Predicate must be non-null");
+            return new Selector(fileSystem) {
+                @Override
+                public boolean test(Path path) {
+                    return predicate.test(path);
+                }
+            };
+        }
     }
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2019, 2022, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -40,7 +40,6 @@
  */
 package com.oracle.truffle.api.instrumentation.test;
 
-import static com.oracle.truffle.api.test.polyglot.AbstractPolyglotTest.assertFails;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertSame;
@@ -54,33 +53,69 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 
+import com.oracle.truffle.api.test.polyglot.AbstractPolyglotTest;
 import org.graalvm.polyglot.Context;
 import org.graalvm.polyglot.Engine;
 import org.graalvm.polyglot.PolyglotException;
 import org.graalvm.polyglot.ResourceLimitEvent;
 import org.graalvm.polyglot.ResourceLimits;
 import org.graalvm.polyglot.Source;
+import org.junit.After;
+import org.junit.Assert;
+import org.junit.Assume;
+import org.junit.Rule;
 import org.junit.Test;
+import org.junit.experimental.theories.DataPoints;
+import org.junit.experimental.theories.Theories;
+import org.junit.experimental.theories.Theory;
+import org.junit.rules.TestName;
+import org.junit.runner.RunWith;
 
-public class ResourceLimitsTest {
+@SuppressWarnings("hiding")
+@RunWith(Theories.class)
+public class ResourceLimitsTest extends AbstractPolyglotTest {
+
+    @DataPoints public static final boolean[] useVirtualThreads = new boolean[]{false, true};
+
+    @Rule public TestName testNameRule = new TestName();
+
+    @After
+    public void checkInterrupted() {
+        Assert.assertFalse("Interrupted flag was left set by test: " + testNameRule.getMethodName(), Thread.interrupted());
+    }
 
     @Test
     public void testStatementLimit() {
+        testStatementLimit(false);
+    }
+
+    @Test
+    public void testStatementLimitExplicitEnter() {
+        testStatementLimit(true);
+    }
+
+    private static void testStatementLimit(boolean explicitEnter) {
         ResourceLimits limits = ResourceLimits.newBuilder().//
                         statementLimit(50, null).//
                         build();
 
         try (Context context = Context.newBuilder().resourceLimits(limits).build()) {
+            if (explicitEnter) {
+                context.enter();
+            }
             context.eval(statements(50));
             try {
                 context.eval(statements(1));
                 fail();
             } catch (PolyglotException e) {
                 assertStatementCountLimit(context, e, 50);
+            }
+        } catch (PolyglotException pe) {
+            if (!pe.isCancelled()) {
+                throw pe;
             }
         }
     }
@@ -107,6 +142,10 @@ public class ResourceLimitsTest {
             } catch (PolyglotException e) {
                 assertStatementCountLimit(context, e, 50);
             }
+        } catch (PolyglotException pe) {
+            if (!pe.isCancelled()) {
+                throw pe;
+            }
         }
     }
 
@@ -121,17 +160,18 @@ public class ResourceLimitsTest {
         Context.newBuilder().resourceLimits(limits0).build().close();
         Context.newBuilder().resourceLimits(limits1).build().close();
 
-        Engine engine = Engine.create();
-        Context.newBuilder().engine(engine).resourceLimits(limits0).build().close();
-        Context.Builder builder = Context.newBuilder().engine(engine).resourceLimits(limits1);
-        try {
-            builder.build();
-            fail();
-        } catch (IllegalArgumentException e) {
-            assertEquals("Using multiple source predicates per engine is not supported. " +
-                            "The same statement limit source predicate must be used for all polyglot contexts that are assigned to the same engine. " +
-                            "Resolve this by using the same predicate instance when constructing the limits object with ResourceLimits.Builder.statementLimit(long, Predicate).",
-                            e.getMessage());
+        try (Engine engine = Engine.create()) {
+            Context.newBuilder().engine(engine).resourceLimits(limits0).build().close();
+            Context.Builder builder = Context.newBuilder().engine(engine).resourceLimits(limits1);
+            try {
+                builder.build();
+                fail();
+            } catch (IllegalArgumentException e) {
+                assertEquals("Using multiple source predicates per engine is not supported. " +
+                                "The same statement limit source predicate must be used for all polyglot contexts that are assigned to the same engine. " +
+                                "Resolve this by using the same predicate instance when constructing the limits object with ResourceLimits.Builder.statementLimit(long, Predicate).",
+                                e.getMessage());
+            }
         }
     }
 
@@ -174,6 +214,10 @@ public class ResourceLimitsTest {
                 assertEquals(1, events.size());
                 assertSame(context, events.iterator().next().getContext());
             }
+        } catch (PolyglotException pe) {
+            if (!pe.isCancelled()) {
+                throw pe;
+            }
         }
     }
 
@@ -186,58 +230,8 @@ public class ResourceLimitsTest {
                         statementLimit(2, null).//
                         build();
         Source source = statements(1);
-        Engine engine = Engine.create();
-
-        for (int i = 0; i < 10; i++) {
-            // test no limit
-            try (Context context = Context.newBuilder().engine(engine).build()) {
-                context.eval(source);
-                context.eval(source);
-                context.eval(source);
-            }
-
-            // test with limit
-            try (Context context = Context.newBuilder().engine(engine).resourceLimits(limits1).build()) {
-                context.eval(source);
-                try {
-                    context.eval(source);
-                    fail();
-                } catch (PolyglotException ex) {
-                    assertStatementCountLimit(context, ex, 1);
-                }
-            }
-
-            // test with different limit
-            try (Context context = Context.newBuilder().engine(engine).resourceLimits(limits2).build()) {
-                context.eval(source);
-                context.eval(source);
-                try {
-                    context.eval(source);
-                    fail();
-                } catch (PolyglotException ex) {
-                    assertStatementCountLimit(context, ex, 2);
-                }
-            }
-        }
-    }
-
-    @Test
-    public void testStatementLimitDifferentPerContextParallel() throws InterruptedException {
-        ResourceLimits limits1 = ResourceLimits.newBuilder().//
-                        statementLimit(1, null).//
-                        build();
-        ResourceLimits limits2 = ResourceLimits.newBuilder().//
-                        statementLimit(2, null).//
-                        build();
-        Source source = statements(1);
-        Engine engine = Engine.create();
-
-        ExecutorService executorService = Executors.newFixedThreadPool(20);
-        List<Future<?>> futures = new ArrayList<>();
-
-        for (int i = 0; i < 10; i++) {
-            futures.add(executorService.submit(() -> {
-
+        try (Engine engine = Engine.create()) {
+            for (int i = 0; i < 10; i++) {
                 // test no limit
                 try (Context context = Context.newBuilder().engine(engine).build()) {
                     context.eval(source);
@@ -254,6 +248,10 @@ public class ResourceLimitsTest {
                     } catch (PolyglotException ex) {
                         assertStatementCountLimit(context, ex, 1);
                     }
+                } catch (PolyglotException pe) {
+                    if (!pe.isCancelled()) {
+                        throw pe;
+                    }
                 }
 
                 // test with different limit
@@ -266,12 +264,80 @@ public class ResourceLimitsTest {
                     } catch (PolyglotException ex) {
                         assertStatementCountLimit(context, ex, 2);
                     }
+                } catch (PolyglotException pe) {
+                    if (!pe.isCancelled()) {
+                        throw pe;
+                    }
                 }
-            }));
+            }
         }
+    }
 
-        executorService.shutdown();
-        executorService.awaitTermination(100, TimeUnit.SECONDS);
+    @Theory
+    public void testStatementLimitDifferentPerContextParallel(boolean vthreads) throws ExecutionException, InterruptedException {
+        Assume.assumeFalse(vthreads && !canCreateVirtualThreads());
+        ResourceLimits limits1 = ResourceLimits.newBuilder().//
+                        statementLimit(1, null).//
+                        build();
+        ResourceLimits limits2 = ResourceLimits.newBuilder().//
+                        statementLimit(2, null).//
+                        build();
+        Source source = statements(1);
+
+        try (Engine engine = Engine.create()) {
+            ExecutorService executorService = threadPool(20, vthreads);
+            List<Future<?>> futures = new ArrayList<>();
+
+            for (int i = 0; i < 10; i++) {
+                futures.add(executorService.submit(() -> {
+
+                    // test no limit
+                    try (Context context = Context.newBuilder().engine(engine).build()) {
+                        context.eval(source);
+                        context.eval(source);
+                        context.eval(source);
+                    }
+
+                    // test with limit
+                    try (Context context = Context.newBuilder().engine(engine).resourceLimits(limits1).build()) {
+                        context.eval(source);
+                        try {
+                            context.eval(source);
+                            fail();
+                        } catch (PolyglotException ex) {
+                            assertStatementCountLimit(context, ex, 1);
+                        }
+                    } catch (PolyglotException pe) {
+                        if (!pe.isCancelled()) {
+                            throw pe;
+                        }
+                    }
+
+                    // test with different limit
+                    try (Context context = Context.newBuilder().engine(engine).resourceLimits(limits2).build()) {
+                        context.eval(source);
+                        context.eval(source);
+                        try {
+                            context.eval(source);
+                            fail();
+                        } catch (PolyglotException ex) {
+                            assertStatementCountLimit(context, ex, 2);
+                        }
+                    } catch (PolyglotException pe) {
+                        if (!pe.isCancelled()) {
+                            throw pe;
+                        }
+                    }
+                }));
+            }
+
+            for (Future<?> future : futures) {
+                future.get();
+            }
+
+            executorService.shutdown();
+            executorService.awaitTermination(100, TimeUnit.SECONDS);
+        }
     }
 
     private static Source statements(int count) {
@@ -289,71 +355,83 @@ public class ResourceLimitsTest {
                         statementLimit(50, null).//
                         onLimit((e) -> events.add(e)).//
                         build();
-        Engine engine = Engine.create();
 
-        for (int i = 0; i < 10; i++) {
-            try (Context c = Context.newBuilder().engine(engine).resourceLimits(limits).build()) {
-                c.eval(statements(50));
-                try {
-                    c.eval(statements(1));
-                    fail();
-                } catch (PolyglotException e) {
-                    assertStatementCountLimit(c, e, 50);
-                    assertEquals(1, events.size());
-                    assertSame(c, events.iterator().next().getContext());
-                    assertNotNull(events.iterator().next().toString());
-                }
-            }
-            events.clear();
-        }
-    }
-
-    @Test
-    public void testSharedContextStatementLimitParallel() throws InterruptedException, ExecutionException {
-        Engine engine = Engine.create();
-        Map<Context, ResourceLimitEvent> events = new HashMap<>();
-        final int limit = 50;
-        ResourceLimits limits = ResourceLimits.newBuilder().//
-                        statementLimit(limit, null).//
-                        onLimit((e) -> {
-                            synchronized (events) {
-                                events.put(e.getContext(), e);
-                            }
-                        }).//
-                        build();
-        ExecutorService executorService = Executors.newFixedThreadPool(20);
-        List<Future<?>> futures = new ArrayList<>();
-        final int tasks = 1000;
-        for (int i = 0; i < tasks; i++) {
-            futures.add(executorService.submit(() -> {
+        try (Engine engine = Engine.create()) {
+            for (int i = 0; i < 10; i++) {
                 try (Context c = Context.newBuilder().engine(engine).resourceLimits(limits).build()) {
-                    c.eval(statements(limit));
+                    c.eval(statements(50));
                     try {
                         c.eval(statements(1));
                         fail();
                     } catch (PolyglotException e) {
-                        assertStatementCountLimit(c, e, limit);
-                        synchronized (events) {
-                            assertNotNull(events.get(c));
-                            assertSame(c, events.get(c).getContext());
-                            assertNotNull(events.get(c).toString());
-                        }
+                        assertStatementCountLimit(c, e, 50);
+                        assertEquals(1, events.size());
+                        assertSame(c, events.iterator().next().getContext());
+                        assertNotNull(events.iterator().next().toString());
+                    }
+                } catch (PolyglotException pe) {
+                    if (!pe.isCancelled()) {
+                        throw pe;
                     }
                 }
-            }));
-        }
-        for (Future<?> future : futures) {
-            future.get();
-        }
-        executorService.shutdown();
-        executorService.awaitTermination(100, TimeUnit.SECONDS);
-        synchronized (events) {
-            assertEquals(tasks, events.size());
+                events.clear();
+            }
         }
     }
 
-    @Test
-    public void testParallelContextStatementLimit() throws InterruptedException, ExecutionException {
+    @Theory
+    public void testSharedContextStatementLimitParallel(boolean vthreads) throws InterruptedException, ExecutionException {
+        Assume.assumeFalse(vthreads && !canCreateVirtualThreads());
+        try (Engine engine = Engine.create()) {
+            Map<Context, ResourceLimitEvent> events = new HashMap<>();
+            final int limit = 50;
+            ResourceLimits limits = ResourceLimits.newBuilder().//
+                            statementLimit(limit, null).//
+                            onLimit((e) -> {
+                                synchronized (events) {
+                                    events.put(e.getContext(), e);
+                                }
+                            }).//
+                            build();
+            ExecutorService executorService = threadPool(20, vthreads);
+            List<Future<?>> futures = new ArrayList<>();
+            final int tasks = 1000;
+            for (int i = 0; i < tasks; i++) {
+                futures.add(executorService.submit(() -> {
+                    try (Context c = Context.newBuilder().engine(engine).resourceLimits(limits).build()) {
+                        c.eval(statements(limit));
+                        try {
+                            c.eval(statements(1));
+                            fail();
+                        } catch (PolyglotException e) {
+                            assertStatementCountLimit(c, e, limit);
+                            synchronized (events) {
+                                assertNotNull(events.get(c));
+                                assertSame(c, events.get(c).getContext());
+                                assertNotNull(events.get(c).toString());
+                            }
+                        }
+                    } catch (PolyglotException pe) {
+                        if (!pe.isCancelled()) {
+                            throw pe;
+                        }
+                    }
+                }));
+            }
+            for (Future<?> future : futures) {
+                future.get();
+            }
+            executorService.shutdown();
+            executorService.awaitTermination(100, TimeUnit.SECONDS);
+            synchronized (events) {
+                assertEquals(tasks, events.size());
+            }
+        }
+    }
+
+    @Theory
+    public void testParallelContextStatementLimit(boolean vthreads) throws InterruptedException, ExecutionException {
+        Assume.assumeFalse(vthreads && !canCreateVirtualThreads());
         Map<Context, ResourceLimitEvent> events = new HashMap<>();
         final int limit = 10000;
         ResourceLimits limits = ResourceLimits.newBuilder().//
@@ -365,7 +443,7 @@ public class ResourceLimitsTest {
                             }
                         }).//
                         build();
-        ExecutorService executorService = Executors.newFixedThreadPool(20);
+        ExecutorService executorService = threadPool(20, vthreads);
         List<Future<?>> futures = new ArrayList<>();
         try (Context c = Context.newBuilder().resourceLimits(limits).build()) {
             forceMultiThreading(executorService, c);
@@ -388,72 +466,134 @@ public class ResourceLimitsTest {
                     assertNotNull(events.get(c).toString());
                 }
             }
+        } catch (PolyglotException pe) {
+            if (!pe.isCancelled()) {
+                throw pe;
+            }
         }
         executorService.shutdown();
         executorService.awaitTermination(100, TimeUnit.SECONDS);
     }
 
-    @Test
-    public void testParallelMultiContextStatementLimit() throws InterruptedException, ExecutionException {
-        Engine engine = Engine.create();
-        Map<Context, ResourceLimitEvent> events = new ConcurrentHashMap<>();
-        final int executions = 100;
-        final int contexts = 100;
-        final int threads = 20;
+    @Theory
+    public void testParallelContextStatementLimit2(boolean vthreads) throws InterruptedException, ExecutionException {
+        Assume.assumeFalse(vthreads && !canCreateVirtualThreads());
+        Map<Context, ResourceLimitEvent> events = new HashMap<>();
+        final int limit = 10000000;
         ResourceLimits limits = ResourceLimits.newBuilder().//
-                        statementLimit(executions, null).//
+                        statementLimit(limit, null).//
                         onLimit((e) -> {
-                            events.put(e.getContext(), e);
-                        }).//
-                        build();
-        ExecutorService executorService = Executors.newFixedThreadPool(threads);
-        List<Future<?>> testFutures = new ArrayList<>();
-
-        for (int contextIndex = 0; contextIndex < contexts; contextIndex++) {
-            Context c = Context.newBuilder().engine(engine).resourceLimits(limits).build();
-            forceMultiThreading(executorService, c);
-
-            List<Future<?>> futures = new ArrayList<>();
-            for (int i = 0; i < executions; i++) {
-                futures.add(executorService.submit(() -> {
-                    c.eval(statements(1));
-                }));
-            }
-            testFutures.add(executorService.submit(() -> {
-                for (Future<?> future : futures) {
-                    try {
-                        future.get();
-                    } catch (InterruptedException | ExecutionException e1) {
-                        if (e1 instanceof ExecutionException) {
-                            if (e1.getCause() instanceof PolyglotException) {
-                                PolyglotException e = (PolyglotException) e1.getCause();
-                                if (e.isCancelled()) {
-                                    throw new AssertionError("Context was cancelled too early.", e);
+                            synchronized (events) {
+                                if (events.isEmpty()) {
+                                    events.put(e.getContext(), e);
+                                } else {
+                                    assertTrue(events.containsKey(e.getContext()));
                                 }
                             }
+                        }).//
+                        build();
+        ExecutorService executorService = threadPool(20, vthreads);
+        List<Future<?>> futures = new ArrayList<>();
+        try (Context c = Context.newBuilder().resourceLimits(limits).build()) {
+            for (int i = 0; i < (vthreads ? 200 : 20); i++) {
+                futures.add(executorService.submit(() -> {
+                    try {
+                        c.eval(statements(Integer.MAX_VALUE));
+                        fail();
+                    } catch (PolyglotException e) {
+                        if (!e.isCancelled() || !e.isResourceExhausted()) {
+                            throw e;
                         }
-                        throw new RuntimeException(e1);
                     }
-                }
-                try {
-                    c.eval(statements(1));
-                    fail();
-                } catch (PolyglotException e) {
-                    assertStatementCountLimit(c, e, executions);
-                    assertNotNull(events.get(c));
-                    assertSame(c, events.get(c).getContext());
-                    assertNotNull(events.get(c).toString());
-                }
-                c.close();
-            }));
-        }
-        for (Future<?> future : testFutures) {
-            future.get();
-        }
 
-        assertEquals(contexts, events.size());
+                }));
+            }
+            for (Future<?> future : futures) {
+                future.get();
+            }
+            synchronized (events) {
+                assertNotNull(events.get(c));
+                assertSame(c, events.get(c).getContext());
+                assertNotNull(events.get(c).toString());
+            }
+        } catch (PolyglotException pe) {
+            if (!pe.isCancelled()) {
+                throw pe;
+            }
+        }
         executorService.shutdown();
         executorService.awaitTermination(100, TimeUnit.SECONDS);
+    }
+
+    @Theory
+    public void testParallelMultiContextStatementLimit(boolean vthreads) throws InterruptedException, ExecutionException {
+        Assume.assumeFalse(vthreads && !canCreateVirtualThreads());
+        try (Engine engine = Engine.create()) {
+            Map<Context, ResourceLimitEvent> events = new ConcurrentHashMap<>();
+            final int executions = 100;
+            final int contexts = 100;
+            final int threads = 20;
+            ResourceLimits limits = ResourceLimits.newBuilder().//
+                            statementLimit(executions, null).//
+                            onLimit((e) -> {
+                                events.put(e.getContext(), e);
+                            }).//
+                            build();
+            ExecutorService executorService = threadPool(threads, vthreads);
+            List<Future<?>> testFutures = new ArrayList<>();
+
+            for (int contextIndex = 0; contextIndex < contexts; contextIndex++) {
+                Context c = Context.newBuilder().engine(engine).resourceLimits(limits).build();
+                forceMultiThreading(executorService, c);
+
+                List<Future<?>> futures = new ArrayList<>();
+                for (int i = 0; i < executions; i++) {
+                    futures.add(executorService.submit(() -> {
+                        c.eval(statements(1));
+                    }));
+                }
+                testFutures.add(executorService.submit(() -> {
+                    for (Future<?> future : futures) {
+                        try {
+                            future.get();
+                        } catch (InterruptedException | ExecutionException e1) {
+                            if (e1 instanceof ExecutionException) {
+                                if (e1.getCause() instanceof PolyglotException) {
+                                    PolyglotException e = (PolyglotException) e1.getCause();
+                                    if (e.isCancelled()) {
+                                        throw new AssertionError("Context was cancelled too early.", e);
+                                    }
+                                }
+                            }
+                            throw new RuntimeException(e1);
+                        }
+                    }
+                    try {
+                        c.eval(statements(1));
+                        fail();
+                    } catch (PolyglotException e) {
+                        assertStatementCountLimit(c, e, executions);
+                        assertNotNull(events.get(c));
+                        assertSame(c, events.get(c).getContext());
+                        assertNotNull(events.get(c).toString());
+                    }
+                    try {
+                        c.close();
+                    } catch (PolyglotException pe) {
+                        if (!pe.isCancelled()) {
+                            throw pe;
+                        }
+                    }
+                }));
+            }
+            for (Future<?> future : testFutures) {
+                future.get();
+            }
+
+            assertEquals(contexts, events.size());
+            executorService.shutdown();
+            executorService.awaitTermination(100, TimeUnit.SECONDS);
+        }
     }
 
     private static void forceMultiThreading(ExecutorService executorService, Context c) throws InterruptedException, ExecutionException {
@@ -467,69 +607,77 @@ public class ResourceLimitsTest {
         c.leave();
     }
 
-    @Test
-    public void testParallelMultiContextStatementResetLimit() throws InterruptedException, ExecutionException {
-        Engine engine = Engine.create();
-        Map<Context, ResourceLimitEvent> events = new ConcurrentHashMap<>();
-        final int executions = 100;
-        final int contexts = 100;
-        final int threads = 20;
-        ResourceLimits limits = ResourceLimits.newBuilder().//
-                        statementLimit(executions, null).//
-                        onLimit((e) -> {
-                            events.put(e.getContext(), e);
-                        }).//
-                        build();
-        ExecutorService executorService = Executors.newFixedThreadPool(threads);
-        List<Future<?>> testFutures = new ArrayList<>();
-        for (int contextIndex = 0; contextIndex < contexts; contextIndex++) {
-            Context c = Context.newBuilder().engine(engine).resourceLimits(limits).build();
-            forceMultiThreading(executorService, c);
-            List<Future<?>> futures = new ArrayList<>();
-            for (int i = 0; i < executions; i++) {
-                futures.add(executorService.submit(() -> {
-                    c.eval(statements(1));
-                }));
-            }
-            Future<?> prev = executorService.submit(() -> {
-                for (Future<?> future : futures) {
+    @Theory
+    public void testParallelMultiContextStatementResetLimit(boolean vthreads) throws InterruptedException, ExecutionException {
+        Assume.assumeFalse(vthreads && !canCreateVirtualThreads());
+        try (Engine engine = Engine.create()) {
+            Map<Context, ResourceLimitEvent> events = new ConcurrentHashMap<>();
+            final int executions = 100;
+            final int contexts = 100;
+            final int threads = 20;
+            ResourceLimits limits = ResourceLimits.newBuilder().//
+                            statementLimit(executions, null).//
+                            onLimit((e) -> {
+                                events.put(e.getContext(), e);
+                            }).//
+                            build();
+            ExecutorService executorService = threadPool(threads, vthreads);
+            List<Future<?>> testFutures = new ArrayList<>();
+            for (int contextIndex = 0; contextIndex < contexts; contextIndex++) {
+                Context c = Context.newBuilder().engine(engine).resourceLimits(limits).build();
+                forceMultiThreading(executorService, c);
+                List<Future<?>> futures = new ArrayList<>();
+                for (int i = 0; i < executions; i++) {
+                    futures.add(executorService.submit(() -> {
+                        c.eval(statements(1));
+                    }));
+                }
+                Future<?> prev = executorService.submit(() -> {
+                    for (Future<?> future : futures) {
+                        try {
+                            future.get();
+                        } catch (InterruptedException | ExecutionException e1) {
+                            throw new RuntimeException(e1);
+                        }
+                    }
+                    c.resetLimits();
+                });
+
+                testFutures.add(executorService.submit(() -> {
                     try {
-                        future.get();
+                        prev.get();
                     } catch (InterruptedException | ExecutionException e1) {
                         throw new RuntimeException(e1);
                     }
-                }
-                c.resetLimits();
-            });
+                    c.eval(statements(executions));
+                    try {
+                        c.eval(statements(1));
+                        fail();
+                    } catch (PolyglotException e) {
+                        assertStatementCountLimit(c, e, executions);
+                        assertNotNull(events.get(c));
+                        assertSame(c, events.get(c).getContext());
+                        assertNotNull(events.get(c).toString());
+                    }
+                    try {
+                        c.close();
+                    } catch (PolyglotException pe) {
+                        if (!pe.isCancelled()) {
+                            throw pe;
+                        }
+                    }
+                }));
+            }
+            for (
 
-            testFutures.add(executorService.submit(() -> {
-                try {
-                    prev.get();
-                } catch (InterruptedException | ExecutionException e1) {
-                    throw new RuntimeException(e1);
-                }
-                c.eval(statements(executions));
-                try {
-                    c.eval(statements(1));
-                    fail();
-                } catch (PolyglotException e) {
-                    assertStatementCountLimit(c, e, executions);
-                    assertNotNull(events.get(c));
-                    assertSame(c, events.get(c).getContext());
-                    assertNotNull(events.get(c).toString());
-                }
-                c.close();
-            }));
+            Future<?> future : testFutures) {
+                future.get();
+            }
+
+            assertEquals(contexts, events.size());
+            executorService.shutdown();
+            executorService.awaitTermination(100, TimeUnit.SECONDS);
         }
-        for (
-
-        Future<?> future : testFutures) {
-            future.get();
-        }
-
-        assertEquals(contexts, events.size());
-        executorService.shutdown();
-        executorService.awaitTermination(100, TimeUnit.SECONDS);
     }
 
     @Test
@@ -571,6 +719,10 @@ public class ResourceLimitsTest {
                     fail();
                 } catch (PolyglotException e) {
                     assertStatementCountLimit(context, e, 50);
+                }
+            } catch (PolyglotException pe) {
+                if (!pe.isCancelled()) {
+                    throw pe;
                 }
             }
 

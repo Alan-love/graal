@@ -30,16 +30,12 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 
-import org.graalvm.compiler.options.Option;
-import org.graalvm.compiler.serviceprovider.JavaVersionUtil;
 import org.graalvm.nativeimage.ImageSingletons;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
-import org.graalvm.nativeimage.hosted.Feature;
+import org.graalvm.nativeimage.hosted.FieldValueTransformer;
 
 import com.oracle.svm.core.annotate.Alias;
-import com.oracle.svm.core.annotate.AutomaticFeature;
-import com.oracle.svm.core.annotate.Delete;
 import com.oracle.svm.core.annotate.Inject;
 import com.oracle.svm.core.annotate.InjectAccessors;
 import com.oracle.svm.core.annotate.RecomputeFieldValue;
@@ -47,10 +43,13 @@ import com.oracle.svm.core.annotate.RecomputeFieldValue.Kind;
 import com.oracle.svm.core.annotate.Substitute;
 import com.oracle.svm.core.annotate.TargetClass;
 import com.oracle.svm.core.annotate.TargetElement;
+import com.oracle.svm.core.feature.AutomaticallyRegisteredFeature;
+import com.oracle.svm.core.feature.InternalFeature;
 import com.oracle.svm.core.option.HostedOptionKey;
+import com.oracle.svm.core.util.VMError;
 
-import jdk.vm.ci.meta.MetaAccessProvider;
-import jdk.vm.ci.meta.ResolvedJavaField;
+import jdk.graal.compiler.options.Option;
+import jdk.internal.util.StaticProperty;
 
 public final class FileSystemProviderSupport {
 
@@ -114,8 +113,8 @@ public final class FileSystemProviderSupport {
     }
 }
 
-@AutomaticFeature
-final class FileSystemProviderFeature implements Feature {
+@AutomaticallyRegisteredFeature
+final class FileSystemProviderFeature implements InternalFeature {
 
     @Override
     public void afterRegistration(AfterRegistrationAccess access) {
@@ -185,11 +184,14 @@ final class Target_sun_nio_fs_UnixFileSystem {
      * at run time.
      */
 
-    @Alias @InjectAccessors(UnixFileSystemAccessors.class) //
+    @Alias //
+    @InjectAccessors(UnixFileSystemAccessors.class) //
     private byte[] defaultDirectory;
-    @Alias @InjectAccessors(UnixFileSystemAccessors.class) //
+    @Alias //
+    @InjectAccessors(UnixFileSystemAccessors.class) //
     private boolean needToResolveAgainstDefaultDirectory;
-    @Alias @InjectAccessors(UnixFileSystemAccessors.class) //
+    @Alias //
+    @InjectAccessors(UnixFileSystemAccessors.class) //
     private Target_sun_nio_fs_UnixPath rootDirectory;
 
     /**
@@ -200,16 +202,20 @@ final class Target_sun_nio_fs_UnixFileSystem {
      * not be allocated at run time, since only the singleton from the image heap should exist.
      * However, there were JDK bugs in various JDK versions where unwanted allocations happened.
      */
-    @Inject @RecomputeFieldValue(kind = Kind.Custom, declClass = NeedsReinitializationProvider.class)//
+    @Inject //
+    @RecomputeFieldValue(kind = Kind.Custom, declClass = NeedsReinitializationProvider.class)//
     volatile int needsReinitialization;
 
     /* Replacement injected fields that store the state at run time. */
 
-    @Inject @RecomputeFieldValue(kind = Kind.Reset)//
+    @Inject //
+    @RecomputeFieldValue(kind = Kind.Reset)//
     byte[] injectedDefaultDirectory;
-    @Inject @RecomputeFieldValue(kind = Kind.Reset)//
+    @Inject //
+    @RecomputeFieldValue(kind = Kind.Reset)//
     boolean injectedNeedToResolveAgainstDefaultDirectory;
-    @Inject @RecomputeFieldValue(kind = Kind.Reset)//
+    @Inject //
+    @RecomputeFieldValue(kind = Kind.Reset)//
     Target_sun_nio_fs_UnixPath injectedRootDirectory;
 
     @Alias
@@ -227,7 +233,7 @@ final class Target_sun_nio_fs_UnixFileSystemProvider {
 final class Target_sun_nio_fs_UnixPath {
 }
 
-class NeedsReinitializationProvider implements RecomputeFieldValue.CustomFieldValueComputer {
+class NeedsReinitializationProvider implements FieldValueTransformer {
     static final int STATUS_NEEDS_REINITIALIZATION = 2;
     static final int STATUS_IN_REINITIALIZATION = 1;
     /*
@@ -237,7 +243,7 @@ class NeedsReinitializationProvider implements RecomputeFieldValue.CustomFieldVa
     static final int STATUS_REINITIALIZED = 0;
 
     @Override
-    public Object compute(MetaAccessProvider metaAccess, ResolvedJavaField original, ResolvedJavaField annotated, Object receiver) {
+    public Object transform(Object receiver, Object originalValue) {
         return STATUS_NEEDS_REINITIALIZATION;
     }
 }
@@ -289,8 +295,6 @@ class UnixFileSystemAccessors {
         that.injectedRootDirectory = value;
     }
 
-    // Checkstyle: allow synchronization
-
     private static synchronized void reinitialize(Target_sun_nio_fs_UnixFileSystem that) {
         if (that.needsReinitialization != NeedsReinitializationProvider.STATUS_NEEDS_REINITIALIZATION) {
             /* Field initialized is volatile, so double-checked locking is OK. */
@@ -310,7 +314,7 @@ class UnixFileSystemAccessors {
          * Note that the `System.getProperty("user.dir")` value is always used when re-initializing
          * a UnixFileSystem, which is not the case with the WindowsFileSystem (JDK-8066709).
          */
-        that.originalConstructor(that.provider, System.getProperty("user.dir"));
+        that.originalConstructor(that.provider, System.getProperty(UserSystemProperty.DIR));
 
         /*
          * Now the object is completely re-initialized and can be used by any thread without
@@ -332,17 +336,22 @@ final class Target_sun_nio_fs_WindowsFileSystem {
     @Alias //
     Target_sun_nio_fs_WindowsFileSystemProvider provider;
 
-    @Alias @InjectAccessors(WindowsFileSystemAccessors.class) //
+    @Alias //
+    @InjectAccessors(WindowsFileSystemAccessors.class) //
     private String defaultDirectory;
-    @Alias @InjectAccessors(WindowsFileSystemAccessors.class) //
+    @Alias //
+    @InjectAccessors(WindowsFileSystemAccessors.class) //
     private String defaultRoot;
 
-    @Inject @RecomputeFieldValue(kind = Kind.Custom, declClass = NeedsReinitializationProvider.class)//
+    @Inject //
+    @RecomputeFieldValue(kind = Kind.Custom, declClass = NeedsReinitializationProvider.class)//
     volatile int needsReinitialization;
 
-    @Inject @RecomputeFieldValue(kind = Kind.Reset)//
+    @Inject //
+    @RecomputeFieldValue(kind = Kind.Reset)//
     String injectedDefaultDirectory;
-    @Inject @RecomputeFieldValue(kind = Kind.Reset)//
+    @Inject //
+    @RecomputeFieldValue(kind = Kind.Reset)//
     String injectedDefaultRoot;
 
     @Alias
@@ -384,13 +393,7 @@ class WindowsFileSystemAccessors {
             return;
         }
         that.needsReinitialization = NeedsReinitializationProvider.STATUS_IN_REINITIALIZATION;
-        /*
-         * On JDK 11, the `StaticProperty.userDir()` value is used when re-initializing a
-         * WindowsFileSystem (JDK-8066709).
-         */
-        that.originalConstructor(that.provider, JavaVersionUtil.JAVA_SPEC >= 11
-                        ? ImageSingletons.lookup(SystemPropertiesSupport.class).userDir()
-                        : System.getProperty("user.dir"));
+        that.originalConstructor(that.provider, SystemPropertiesSupport.singleton().getInitialProperty(UserSystemProperty.DIR));
         that.needsReinitialization = NeedsReinitializationProvider.STATUS_REINITIALIZED;
     }
 }
@@ -399,38 +402,13 @@ class WindowsFileSystemAccessors {
 @Platforms({Platform.LINUX.class, Platform.DARWIN.class})
 final class Target_java_io_UnixFileSystem {
 
-    @Alias @InjectAccessors(UserDirAccessors.class) //
-    @TargetElement(onlyWith = JDK11OrLater.class)//
+    @Alias //
+    @InjectAccessors(UserDirAccessors.class) //
     private String userDir;
-
-    @Alias @RecomputeFieldValue(kind = Kind.NewInstance, declClassName = "java.io.ExpiringCache") //
-    private Target_java_io_ExpiringCache cache;
-
-    /*
-     * The prefix cache on Linux/MacOS only caches elements in the Java home directory, which does
-     * not exist at image runtime. So we disable that cache completely, which is done by
-     * substituting the value of FileSystem.useCanonPrefixCache to false in the substitution below.
-     */
-    @Delete //
-    private String javaHome;
-    /*
-     * Ideally, we would mark this field as @Delete too. However, the javaHomePrefixCache is cleared
-     * from various methods, and we do not want to change those methods.
-     */
-    @Alias @RecomputeFieldValue(kind = Kind.NewInstance, declClassName = "java.io.ExpiringCache") //
-    private Target_java_io_ExpiringCache javaHomePrefixCache;
 }
 
 @TargetClass(className = "java.io.FileSystem")
 final class Target_java_io_FileSystem {
-
-    /*
-     * Linux/MacOS only: disable the usage of the javaHomePrefixCache. On Windows, the prefix cache
-     * is not specific to the Java home directory and therefore can remain enabled.
-     */
-    @Platforms({Platform.LINUX.class, Platform.DARWIN.class}) //
-    @Alias @RecomputeFieldValue(kind = Kind.FromAlias, isFinal = true) //
-    static boolean useCanonPrefixCache = false;
 
     @Alias
     native String normalize(String path);
@@ -439,13 +417,19 @@ final class Target_java_io_FileSystem {
 class UserDirAccessors {
     @SuppressWarnings("unused")
     static String getUserDir(Target_java_io_FileSystem that) {
-        /*
-         * Note that on Windows, we normalize the property value (JDK-8198997) and do not use the
-         * `StaticProperty.userDir()` like the rest (JDK-8066709).
-         */
-        return Platform.includedIn(Platform.WINDOWS.class)
-                        ? that.normalize(System.getProperty("user.dir"))
-                        : ImageSingletons.lookup(SystemPropertiesSupport.class).userDir();
+        if (Platform.includedIn(Platform.WINDOWS.class)) {
+            /*
+             * Note that on Windows, we normalize the property value (JDK-8198997) and do not use
+             * the `StaticProperty.userDir()` like the rest (JDK-8066709).
+             */
+            return that.normalize(System.getProperty(UserSystemProperty.DIR));
+        }
+        return StaticProperty.userDir();
+    }
+
+    @SuppressWarnings("unused")
+    static void setUserDir(Target_java_io_FileSystem that, String value) {
+        throw VMError.shouldNotReachHere("Field userDir is initialized at build time");
     }
 }
 
@@ -453,17 +437,7 @@ class UserDirAccessors {
 @Platforms(Platform.WINDOWS.class)
 final class Target_java_io_WinNTFileSystem {
 
-    @Alias @InjectAccessors(UserDirAccessors.class) //
-    @TargetElement(onlyWith = JDK11OrLater.class) //
+    @Alias //
+    @InjectAccessors(UserDirAccessors.class) //
     private String userDir;
-
-    @Alias @RecomputeFieldValue(kind = Kind.NewInstance, declClassName = "java.io.ExpiringCache") //
-    private Target_java_io_ExpiringCache cache;
-
-    @Alias @RecomputeFieldValue(kind = Kind.NewInstance, declClassName = "java.io.ExpiringCache") //
-    private Target_java_io_ExpiringCache prefixCache;
-}
-
-@TargetClass(className = "java.io.ExpiringCache")
-final class Target_java_io_ExpiringCache {
 }

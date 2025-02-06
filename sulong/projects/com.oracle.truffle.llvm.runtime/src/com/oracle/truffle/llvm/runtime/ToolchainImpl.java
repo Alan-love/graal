@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, 2020, Oracle and/or its affiliates.
+ * Copyright (c) 2019, 2023, Oracle and/or its affiliates.
  *
  * All rights reserved.
  *
@@ -32,13 +32,13 @@ package com.oracle.truffle.llvm.runtime;
 import com.oracle.truffle.api.TruffleFile;
 import com.oracle.truffle.api.TruffleLanguage;
 import com.oracle.truffle.llvm.api.Toolchain;
+import com.oracle.truffle.llvm.runtime.nodes.asm.syscall.LLVMInfo;
 
-import java.util.Arrays;
-import java.util.Collections;
 import java.util.List;
 
 public final class ToolchainImpl implements Toolchain {
 
+    private static final String[] WINDOWS_EXECUTABLE_EXTENSIONS = {".exe", ".cmd"};
     private final ToolchainConfig toolchainConfig;
     private final LLVMLanguage language;
 
@@ -47,12 +47,36 @@ public final class ToolchainImpl implements Toolchain {
         this.language = language;
     }
 
+    @Override
+    public TruffleFile getToolPath(String tool) {
+        TruffleFile res = getToolPathImpl(tool);
+        if (LLVMInfo.SYSNAME.toLowerCase().contains("windows")) {
+            /*
+             * On Windows the tools have either a .exe or a .cmd suffix. ATM there is no other way
+             * than to see if the file exists.
+             */
+            TruffleFile parent = res.getParent();
+            String name = res.getName();
+            for (String ext : WINDOWS_EXECUTABLE_EXTENSIONS) {
+                TruffleFile fileWithExt = parent.resolve(name + ext);
+                try {
+                    if (fileWithExt.exists()) {
+                        return fileWithExt;
+                    }
+                } catch (Throwable e) {
+                    // ignore if call to exists() fails
+                }
+            }
+        }
+        return res;
+    }
+
     /**
      * Please keep this list in sync with Toolchain.java (method documentation) and mx_sulong.py's
      * ToolchainConfig::_tool_map.
      */
-    @Override
-    public TruffleFile getToolPath(String tool) {
+    private TruffleFile getToolPathImpl(String tool) {
+
         if (toolchainConfig == null) {
             return null;
         }
@@ -63,6 +87,13 @@ public final class ToolchainImpl implements Toolchain {
                 return binPrefix;
             case "CC":
                 return binPrefix.resolve("graalvm-" + toolchainConfig.getToolchainSubdir() + "-clang");
+            case "FC":
+                return binPrefix.resolve("graalvm-" + toolchainConfig.getToolchainSubdir() + "-flang");
+            case "CL":
+                if (!toolchainConfig.enableCL()) {
+                    return null;
+                }
+                return binPrefix.resolve("graalvm-" + toolchainConfig.getToolchainSubdir() + "-clang-cl");
             case "CXX":
                 if (!toolchainConfig.enableCXX()) {
                     return null;
@@ -90,14 +121,17 @@ public final class ToolchainImpl implements Toolchain {
             return null;
         }
 
-        switch (pathName) {
-            case "PATH":
-                return Collections.unmodifiableList(Arrays.asList(getWrappersRoot().resolve("bin")));
-            case "LD_LIBRARY_PATH":
-                return Collections.unmodifiableList(Arrays.asList(getSysroot().resolve("lib")));
-            default:
-                return null;
-        }
+        return switch (pathName) {
+            case "PATH" -> {
+                TruffleFile wrappersRoot = getWrappersRoot();
+                yield wrappersRoot != null ? List.of(wrappersRoot.resolve("bin")) : List.of();
+            }
+            case "LD_LIBRARY_PATH" -> {
+                TruffleFile sysRoot = getSysroot();
+                yield sysRoot != null ? List.of(sysRoot.resolve("lib")) : List.of();
+            }
+            default -> null;
+        };
     }
 
     /**
@@ -120,7 +154,12 @@ public final class ToolchainImpl implements Toolchain {
      */
     private TruffleFile getSysroot() {
         TruffleLanguage.Env env = LLVMLanguage.getContext().getEnv();
-        return env.getInternalTruffleFile(language.getLLVMLanguageHome()).resolve(toolchainConfig.getToolchainSubdir());
+        String home = language.getLLVMLanguageHome();
+        if (home != null) {
+            return env.getInternalTruffleFile(home).resolve(toolchainConfig.getToolchainSubdir());
+        } else {
+            return null;
+        }
     }
 
     @Override

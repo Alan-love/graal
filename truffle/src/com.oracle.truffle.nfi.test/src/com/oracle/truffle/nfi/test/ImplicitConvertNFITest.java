@@ -46,6 +46,7 @@ import static org.hamcrest.core.Is.is;
 import java.util.ArrayList;
 import java.util.Collection;
 
+import org.hamcrest.MatcherAssert;
 import org.junit.Assert;
 import org.junit.Assume;
 import org.junit.Test;
@@ -56,7 +57,6 @@ import org.junit.runners.Parameterized.Parameters;
 
 import com.oracle.truffle.api.CallTarget;
 import com.oracle.truffle.api.CompilerDirectives;
-import com.oracle.truffle.api.Truffle;
 import com.oracle.truffle.api.frame.VirtualFrame;
 import com.oracle.truffle.api.nodes.RootNode;
 import com.oracle.truffle.nfi.backend.spi.types.NativeSimpleType;
@@ -69,7 +69,7 @@ import com.oracle.truffle.tck.TruffleRunner.Inject;
 public class ImplicitConvertNFITest extends NFITest {
 
     private static final Object[] NUMERIC_VALUES = {
-                    false, true, (byte) 42, (short) 42, (char) 42, 42, (long) 42, (float) 42, (double) 42
+                    false, true, (byte) 42, (short) 42, 42, (long) 42, (float) 42, (double) 42
     };
 
     @Parameters(name = "{0}, ({3}) {1}")
@@ -80,8 +80,6 @@ public class ImplicitConvertNFITest extends NFITest {
                 long numericValue = 0;
                 if (value instanceof Number) {
                     numericValue = ((Number) value).longValue();
-                } else if (value instanceof Character) {
-                    numericValue = (Character) value;
                 } else if (value instanceof Boolean) {
                     numericValue = (Boolean) value ? 1 : 0;
                 }
@@ -120,7 +118,7 @@ public class ImplicitConvertNFITest extends NFITest {
         if (type == NativeSimpleType.POINTER) {
             Assert.assertTrue("isNumber", UNCACHED_INTEROP.isNumber(ret));
         } else {
-            Assert.assertThat("return value", ret, is(instanceOf(Number.class)));
+            MatcherAssert.assertThat("return value", ret, is(instanceOf(Number.class)));
         }
 
         long retValue = NumericNFITest.unboxNumber(ret);
@@ -128,12 +126,12 @@ public class ImplicitConvertNFITest extends NFITest {
     }
 
     private static boolean isCompileImmediately() {
-        CallTarget target = Truffle.getRuntime().createCallTarget(new RootNode(null) {
+        CallTarget target = new RootNode(null) {
             @Override
             public Object execute(VirtualFrame frame) {
                 return CompilerDirectives.inCompiledCode();
             }
-        });
+        }.getCallTarget();
         return (boolean) target.call();
     }
 

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2022, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -40,15 +40,43 @@
  */
 package com.oracle.truffle.tck.tests;
 
-import org.graalvm.polyglot.HostAccess.Implementable;
-import org.graalvm.polyglot.PolyglotException;
-import org.graalvm.polyglot.TypeLiteral;
-import org.graalvm.polyglot.Value;
-import org.graalvm.polyglot.proxy.Proxy;
+import static com.oracle.truffle.tck.tests.ValueAssert.Trait.ARRAY_ELEMENTS;
+import static com.oracle.truffle.tck.tests.ValueAssert.Trait.BOOLEAN;
+import static com.oracle.truffle.tck.tests.ValueAssert.Trait.BUFFER_ELEMENTS;
+import static com.oracle.truffle.tck.tests.ValueAssert.Trait.DATE;
+import static com.oracle.truffle.tck.tests.ValueAssert.Trait.DURATION;
+import static com.oracle.truffle.tck.tests.ValueAssert.Trait.EXCEPTION;
+import static com.oracle.truffle.tck.tests.ValueAssert.Trait.EXECUTABLE;
+import static com.oracle.truffle.tck.tests.ValueAssert.Trait.HASH;
+import static com.oracle.truffle.tck.tests.ValueAssert.Trait.HOST_OBJECT;
+import static com.oracle.truffle.tck.tests.ValueAssert.Trait.INSTANTIABLE;
+import static com.oracle.truffle.tck.tests.ValueAssert.Trait.ITERABLE;
+import static com.oracle.truffle.tck.tests.ValueAssert.Trait.ITERATOR;
+import static com.oracle.truffle.tck.tests.ValueAssert.Trait.MEMBERS;
+import static com.oracle.truffle.tck.tests.ValueAssert.Trait.META;
+import static com.oracle.truffle.tck.tests.ValueAssert.Trait.NATIVE;
+import static com.oracle.truffle.tck.tests.ValueAssert.Trait.NULL;
+import static com.oracle.truffle.tck.tests.ValueAssert.Trait.NUMBER;
+import static com.oracle.truffle.tck.tests.ValueAssert.Trait.PROXY_OBJECT;
+import static com.oracle.truffle.tck.tests.ValueAssert.Trait.STRING;
+import static com.oracle.truffle.tck.tests.ValueAssert.Trait.TIME;
+import static com.oracle.truffle.tck.tests.ValueAssert.Trait.TIMEZONE;
+import static org.junit.Assert.assertArrayEquals;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotEquals;
+import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertSame;
+import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 
 import java.lang.reflect.Modifier;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
+import java.nio.charset.UnsupportedCharsetException;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.LocalDate;
@@ -71,63 +99,41 @@ import java.util.Set;
 import java.util.concurrent.Callable;
 import java.util.function.Function;
 
-import static com.oracle.truffle.tck.tests.ValueAssert.Trait.ARRAY_ELEMENTS;
-import static com.oracle.truffle.tck.tests.ValueAssert.Trait.BOOLEAN;
-import static com.oracle.truffle.tck.tests.ValueAssert.Trait.BUFFER_ELEMENTS;
-import static com.oracle.truffle.tck.tests.ValueAssert.Trait.DATE;
-import static com.oracle.truffle.tck.tests.ValueAssert.Trait.DURATION;
-import static com.oracle.truffle.tck.tests.ValueAssert.Trait.EXCEPTION;
-import static com.oracle.truffle.tck.tests.ValueAssert.Trait.EXECUTABLE;
-import static com.oracle.truffle.tck.tests.ValueAssert.Trait.HASH;
-import static com.oracle.truffle.tck.tests.ValueAssert.Trait.HOST_OBJECT;
-import static com.oracle.truffle.tck.tests.ValueAssert.Trait.INSTANTIABLE;
-import static com.oracle.truffle.tck.tests.ValueAssert.Trait.ITERABLE;
-import static com.oracle.truffle.tck.tests.ValueAssert.Trait.ITERATOR;
-import static com.oracle.truffle.tck.tests.ValueAssert.Trait.MEMBERS;
-import static com.oracle.truffle.tck.tests.ValueAssert.Trait.META;
-import static com.oracle.truffle.tck.tests.ValueAssert.Trait.NATIVE;
-import static com.oracle.truffle.tck.tests.ValueAssert.Trait.NULL;
-import static com.oracle.truffle.tck.tests.ValueAssert.Trait.NUMBER;
-import static com.oracle.truffle.tck.tests.ValueAssert.Trait.PROXY_OBJECT;
-import static com.oracle.truffle.tck.tests.ValueAssert.Trait.STRING;
-import static com.oracle.truffle.tck.tests.ValueAssert.Trait.TIME;
-import static com.oracle.truffle.tck.tests.ValueAssert.Trait.TIMEZONE;
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertFalse;
-import static org.junit.Assert.assertNotEquals;
-import static org.junit.Assert.assertNotNull;
-import static org.junit.Assert.assertNull;
-import static org.junit.Assert.assertSame;
-import static org.junit.Assert.assertTrue;
-import static org.junit.Assert.fail;
+import org.graalvm.polyglot.HostAccess.Implementable;
+import org.graalvm.polyglot.PolyglotException;
+import org.graalvm.polyglot.TypeLiteral;
+import org.graalvm.polyglot.Value;
+import org.graalvm.polyglot.Value.StringEncoding;
+import org.graalvm.polyglot.io.ByteSequence;
+import org.graalvm.polyglot.proxy.Proxy;
 
 public class ValueAssert {
 
-    private static final TypeLiteral<List<Object>> OBJECT_LIST = new TypeLiteral<List<Object>>() {
+    private static final TypeLiteral<List<Object>> OBJECT_LIST = new TypeLiteral<>() {
     };
-    private static final TypeLiteral<Map<Object, Object>> OBJECT_OBJECT_MAP = new TypeLiteral<Map<Object, Object>>() {
+    private static final TypeLiteral<Map<Object, Object>> OBJECT_OBJECT_MAP = new TypeLiteral<>() {
     };
-    private static final TypeLiteral<Map<String, Object>> STRING_OBJECT_MAP = new TypeLiteral<Map<String, Object>>() {
+    private static final TypeLiteral<Map<String, Object>> STRING_OBJECT_MAP = new TypeLiteral<>() {
     };
-    private static final TypeLiteral<Map<Long, Object>> LONG_OBJECT_MAP = new TypeLiteral<Map<Long, Object>>() {
+    private static final TypeLiteral<Map<Long, Object>> LONG_OBJECT_MAP = new TypeLiteral<>() {
     };
-    private static final TypeLiteral<Map<Integer, Object>> INTEGER_OBJECT_MAP = new TypeLiteral<Map<Integer, Object>>() {
+    private static final TypeLiteral<Map<Integer, Object>> INTEGER_OBJECT_MAP = new TypeLiteral<>() {
     };
-    private static final TypeLiteral<Map<Short, Object>> SHORT_OBJECT_MAP = new TypeLiteral<Map<Short, Object>>() {
+    private static final TypeLiteral<Map<Short, Object>> SHORT_OBJECT_MAP = new TypeLiteral<>() {
     };
-    private static final TypeLiteral<Map<Byte, Object>> BYTE_OBJECT_MAP = new TypeLiteral<Map<Byte, Object>>() {
+    private static final TypeLiteral<Map<Byte, Object>> BYTE_OBJECT_MAP = new TypeLiteral<>() {
     };
-    private static final TypeLiteral<Map<Number, Object>> NUMBER_OBJECT_MAP = new TypeLiteral<Map<Number, Object>>() {
+    private static final TypeLiteral<Map<Number, Object>> NUMBER_OBJECT_MAP = new TypeLiteral<>() {
     };
-    private static final TypeLiteral<Map<Float, Object>> FLOAT_OBJECT_MAP = new TypeLiteral<Map<Float, Object>>() {
+    private static final TypeLiteral<Map<Float, Object>> FLOAT_OBJECT_MAP = new TypeLiteral<>() {
     };
-    private static final TypeLiteral<Map<Double, Object>> DOUBLE_OBJECT_MAP = new TypeLiteral<Map<Double, Object>>() {
+    private static final TypeLiteral<Map<Double, Object>> DOUBLE_OBJECT_MAP = new TypeLiteral<>() {
     };
-    private static final TypeLiteral<Function<Object, Object>> FUNCTION = new TypeLiteral<Function<Object, Object>>() {
+    private static final TypeLiteral<Function<Object, Object>> FUNCTION = new TypeLiteral<>() {
     };
-    private static final TypeLiteral<Iterable<Object>> OBJECT_ITERABLE = new TypeLiteral<Iterable<Object>>() {
+    private static final TypeLiteral<Iterable<Object>> OBJECT_ITERABLE = new TypeLiteral<>() {
     };
-    private static final TypeLiteral<Iterator<Object>> OBJECT_ITERATOR = new TypeLiteral<Iterator<Object>>() {
+    private static final TypeLiteral<Iterator<Object>> OBJECT_ITERATOR = new TypeLiteral<>() {
     };
 
     public static void assertValue(Value value) {
@@ -303,8 +309,7 @@ public class ValueAssert {
                     break;
                 case INSTANTIABLE:
                     assertFalse(value.canInstantiate());
-                    // TODO remove PolyglotException if GR-21743 and GR-21744 is fixed.
-                    // assertFails(() -> value.newInstance(), UnsupportedOperationException.class);
+                    assertFails(() -> value.newInstance(), UnsupportedOperationException.class);
                     if (value.isNull()) {
                         assertNull(value.as(Function.class));
                         assertNull(value.as(IsFunctionalInterfaceVarArgs.class));
@@ -326,12 +331,9 @@ public class ValueAssert {
                     break;
                 case ARRAY_ELEMENTS:
                     assertFalse(value.hasArrayElements());
-                    // temporary workaround for GR-21744
-                    // assertFails(() -> value.getArrayElement(0),
-                    // UnsupportedOperationException.class);
-                    // assertFails(() -> value.setArrayElement(0, null),
-                    // UnsupportedOperationException.class);
-                    // assertFails(() -> value.getArraySize(), UnsupportedOperationException.class);
+                    assertFails(() -> value.getArrayElement(0), UnsupportedOperationException.class);
+                    assertFails(() -> value.setArrayElement(0, null), UnsupportedOperationException.class);
+                    assertFails(() -> value.getArraySize(), UnsupportedOperationException.class);
                     if (!value.isNull()) {
                         if ((!value.isHostObject() || (!(value.asHostObject() instanceof List) && !(value.asHostObject() instanceof Object[])))) {
                             assertFails(() -> value.as(List.class), ClassCastException.class);
@@ -455,6 +457,8 @@ public class ValueAssert {
                     assertFails(() -> value.getMetaQualifiedName(), UnsupportedOperationException.class);
                     assertFails(() -> value.getMetaSimpleName(), UnsupportedOperationException.class);
                     assertFails(() -> value.isMetaInstance(""), UnsupportedOperationException.class);
+                    assertFalse(value.hasMetaParents());
+                    assertFails(() -> value.getMetaParents(), UnsupportedOperationException.class);
                     break;
                 case ITERABLE:
                     assertFalse(value.hasIterator());
@@ -522,6 +526,21 @@ public class ValueAssert {
                         assertEquals(stringValue.charAt(0), (char) value.as(Character.class));
                         assertEquals(stringValue.charAt(0), (char) value.as(char.class));
                     }
+                    Charset charSet = ByteOrder.nativeOrder() == ByteOrder.LITTLE_ENDIAN ? Charset.forName("UTF-16LE") : Charset.forName("UTF-16BE");
+                    byte[] expectedBytes = value.asString().getBytes(charSet);
+                    assertArrayEquals(expectedBytes, value.asStringBytes(StringEncoding.UTF_16));
+
+                    try {
+                        charSet = ByteOrder.nativeOrder() == ByteOrder.LITTLE_ENDIAN ? Charset.forName("UTF-32LE") : Charset.forName("UTF-32BE");
+                        expectedBytes = value.asString().getBytes(charSet);
+                        assertArrayEquals(expectedBytes, value.asStringBytes(StringEncoding.UTF_32));
+                    } catch (UnsupportedCharsetException e) {
+                        // expected for JDK 21
+                    }
+
+                    charSet = StandardCharsets.UTF_8;
+                    expectedBytes = value.asString().getBytes(charSet);
+                    assertArrayEquals(expectedBytes, value.asStringBytes(StringEncoding.UTF_8));
                     break;
                 case NUMBER:
                     assertValueNumber(value);
@@ -550,9 +569,10 @@ public class ValueAssert {
                     assertTrue(msg, value.isHostObject());
                     Object hostObject = value.asHostObject();
                     assertFalse(hostObject instanceof Proxy);
+                    boolean isStaticClass = false;
                     if (hasHostAccess && hostObject != null && value.hasMembers() && !java.lang.reflect.Proxy.isProxyClass(hostObject.getClass())) {
                         if (hostObject instanceof Class) {
-                            boolean isStaticClass = value.hasMember("class");
+                            isStaticClass = value.hasMember("class");
                             if (isStaticClass) {
                                 assertClassMembers(value, (Class<?>) hostObject, true);
                             } else {
@@ -570,7 +590,11 @@ public class ValueAssert {
                             }
                         }
                     }
-                    assertEquals(Value.asValue(hostObject), value);
+                    if (isStaticClass) {
+                        assertNotEquals(Value.asValue(hostObject), value);
+                    } else {
+                        assertEquals(Value.asValue(hostObject), value);
+                    }
                     assertEquals(Value.asValue(hostObject).hashCode(), value.hashCode());
 
                     break;
@@ -588,7 +612,9 @@ public class ValueAssert {
 
                     for (String key : value.getMemberKeys()) {
                         Value child = value.getMember(key);
-                        if (!isSameHostObject(value, child)) {
+                        if (child == null) {
+                            assertTrue("A non-readable member must at least be modifiable, removable, or invocable", value.hasMember(key));
+                        } else if (!isSameHostObject(value, child)) {
                             assertValueImpl(child, depth + 1, hasHostAccess, detectSupportedTypes(child));
                         }
                     }
@@ -684,6 +710,30 @@ public class ValueAssert {
                     assertNotNull(value.getMetaQualifiedName());
                     assertNotNull(value.getMetaSimpleName());
                     value.isMetaInstance("");
+                    if (value.hasMetaParents()) {
+                        try {
+                            Value metaParents = value.getMetaParents();
+                            assertTrue(metaParents.hasArrayElements());
+                            long size = metaParents.getArraySize();
+                            for (long i = 0; i < size; i++) {
+                                Value metaParent = metaParents.getArrayElement(i);
+                                assertValueImpl(metaParent, depth + 1, hasHostAccess, detectSupportedTypes(metaParent));
+                            }
+                        } catch (PolyglotException notExpected) {
+                            throw new AssertionError(notExpected);
+                        } catch (UnsupportedOperationException expected) {
+                            // caught expected exception
+                        }
+                    } else {
+                        try {
+                            value.getMetaParents();
+                            fail("should have thrown");
+                        } catch (PolyglotException expected) {
+                            throw new AssertionError(expected);
+                        } catch (UnsupportedOperationException expected) {
+                            // caught expected exception
+                        }
+                    }
                     break;
                 case ITERABLE:
                     assertTrue(msg, value.hasIterator());
@@ -809,6 +859,11 @@ public class ValueAssert {
                 value.writeBufferDouble(ByteOrder.LITTLE_ENDIAN, i, result);
             }
         }
+
+        byte[] dest = new byte[(int) value.getBufferSize()];
+        value.readBuffer(0, dest, 0, (int) value.getBufferSize());
+        value.as(ByteSequence.class).toByteArray();
+        value.as(byte[].class);
     }
 
     private static void assertCollectionEqualValues(Collection<? extends Object> expected, Collection<? extends Object> actual) {
@@ -972,15 +1027,13 @@ public class ValueAssert {
         if (value.fitsInByte()) {
             value.asByte();
         } else {
-            // TODO expecting PolyglotException is a temporary workaround GR-21744
-            assertFails(() -> value.asByte(), ClassCastException.class, PolyglotException.class);
+            assertFails(() -> value.asByte(), ClassCastException.class);
         }
         if (value.fitsInShort()) {
             short shortValue = value.asShort();
             assertEquals((byte) shortValue == shortValue, value.fitsInByte());
         } else {
-            // TODO expecting PolyglotException is a temporary workaround GR-21744
-            assertFails(() -> value.asShort(), ClassCastException.class, PolyglotException.class);
+            assertFails(() -> value.asShort(), ClassCastException.class);
         }
 
         if (value.fitsInInt()) {
@@ -988,8 +1041,7 @@ public class ValueAssert {
             assertEquals((byte) intValue == intValue, value.fitsInByte());
             assertEquals((short) intValue == intValue, value.fitsInShort());
         } else {
-            // TODO expecting PolyglotException is a temporary workaround GR-21744
-            assertFails(() -> value.asInt(), ClassCastException.class, PolyglotException.class);
+            assertFails(() -> value.asInt(), ClassCastException.class);
         }
 
         if (value.fitsInLong()) {
@@ -998,22 +1050,19 @@ public class ValueAssert {
             assertEquals((short) longValue == longValue, value.fitsInShort());
             assertEquals((int) longValue == longValue, value.fitsInInt());
         } else {
-            // TODO expecting PolyglotException is a temporary workaround GR-21744
-            assertFails(() -> value.asLong(), ClassCastException.class, PolyglotException.class);
+            assertFails(() -> value.asLong(), ClassCastException.class);
         }
 
         if (value.fitsInFloat()) {
             value.asFloat();
         } else {
-            // TODO expecting PolyglotException is a temporary workaround GR-21744
-            assertFails(() -> value.asFloat(), ClassCastException.class, PolyglotException.class);
+            assertFails(() -> value.asFloat(), ClassCastException.class);
         }
 
         if (value.fitsInDouble()) {
             value.asDouble();
         } else {
-            // TODO expecting PolyglotException is a temporary workaround GR-21744
-            assertFails(() -> value.asDouble(), ClassCastException.class, PolyglotException.class);
+            assertFails(() -> value.asDouble(), ClassCastException.class);
         }
     }
 

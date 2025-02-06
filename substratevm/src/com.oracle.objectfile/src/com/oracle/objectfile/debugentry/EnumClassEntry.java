@@ -26,9 +26,11 @@
 
 package com.oracle.objectfile.debugentry;
 
-import com.oracle.objectfile.debuginfo.DebugInfoProvider;
 import com.oracle.objectfile.debuginfo.DebugInfoProvider.DebugEnumTypeInfo;
-import org.graalvm.compiler.debug.DebugContext;
+import com.oracle.objectfile.debuginfo.DebugInfoProvider.DebugTypeInfo;
+import com.oracle.objectfile.debuginfo.DebugInfoProvider.DebugTypeInfo.DebugTypeKind;
+
+import jdk.graal.compiler.debug.DebugContext;
 
 public class EnumClassEntry extends ClassEntry {
     public EnumClassEntry(String typeName, FileEntry fileEntry, int size) {
@@ -36,7 +38,12 @@ public class EnumClassEntry extends ClassEntry {
     }
 
     @Override
-    public void addDebugInfo(DebugInfoBase debugInfoBase, DebugInfoProvider.DebugTypeInfo debugTypeInfo, DebugContext debugContext) {
+    public DebugTypeKind typeKind() {
+        return DebugTypeKind.ENUM;
+    }
+
+    @Override
+    public void addDebugInfo(DebugInfoBase debugInfoBase, DebugTypeInfo debugTypeInfo, DebugContext debugContext) {
         assert debugTypeInfo instanceof DebugEnumTypeInfo;
         super.addDebugInfo(debugInfoBase, debugTypeInfo, debugContext);
     }

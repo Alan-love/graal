@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2017, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -52,17 +52,17 @@ import com.oracle.truffle.api.source.Source;
  */
 public final class LanguageInfo {
 
+    private final Object languageCache;
     private final String id;
     private final String name;
     private final String version;
     private final Set<String> mimeTypes;
-    private final Object polyglotLanguage;
     private final String defaultMimeType;
     private final boolean internal;
     private final boolean interactive;
 
-    LanguageInfo(Object polyglotLanguage, String id, String name, String version, String defaultMimeType, Set<String> mimeTypes, boolean internal, boolean interactive) {
-        this.polyglotLanguage = polyglotLanguage;
+    LanguageInfo(Object languageCache, String id, String name, String version, String defaultMimeType, Set<String> mimeTypes, boolean internal, boolean interactive) {
+        this.languageCache = languageCache;
         this.id = id;
         this.name = name;
         this.version = version;
@@ -125,10 +125,6 @@ public final class LanguageInfo {
         return mimeTypes;
     }
 
-    Object getPolyglotLanguage() {
-        return polyglotLanguage;
-    }
-
     /**
      * @return {@code true} if the language is {@link Registration#internal() internal},
      *         {@code false} otherwise
@@ -145,5 +141,9 @@ public final class LanguageInfo {
      */
     public boolean isInteractive() {
         return interactive;
+    }
+
+    Object getLanguageCache() {
+        return languageCache;
     }
 }

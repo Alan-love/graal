@@ -25,28 +25,31 @@
 package com.oracle.graal.pointsto.phases;
 
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.List;
 
-import org.graalvm.compiler.bytecode.Bytecode;
-import org.graalvm.compiler.debug.DebugContext;
-import org.graalvm.compiler.graph.Node;
-import org.graalvm.compiler.nodes.FrameState;
-import org.graalvm.compiler.nodes.MergeNode;
-import org.graalvm.compiler.nodes.StateSplit;
-import org.graalvm.compiler.nodes.StructuredGraph.AllowAssumptions;
-import org.graalvm.compiler.nodes.UnwindNode;
-import org.graalvm.compiler.nodes.ValueNode;
-import org.graalvm.compiler.nodes.graphbuilderconf.GeneratedInvocationPlugin;
-import org.graalvm.compiler.nodes.spi.CoreProviders;
-import org.graalvm.compiler.options.OptionValues;
-import org.graalvm.compiler.phases.common.inlining.InliningUtil;
-import org.graalvm.compiler.replacements.IntrinsicGraphBuilder;
+import jdk.graal.compiler.bytecode.Bytecode;
+import jdk.graal.compiler.debug.DebugContext;
+import jdk.graal.compiler.graph.Node;
+import jdk.graal.compiler.nodes.FrameState;
+import jdk.graal.compiler.nodes.MergeNode;
+import jdk.graal.compiler.nodes.StateSplit;
+import jdk.graal.compiler.nodes.StructuredGraph.AllowAssumptions;
+import jdk.graal.compiler.nodes.UnwindNode;
+import jdk.graal.compiler.nodes.ValueNode;
+import jdk.graal.compiler.nodes.graphbuilderconf.GeneratedInvocationPlugin;
+import jdk.graal.compiler.nodes.java.MonitorIdNode;
+import jdk.graal.compiler.nodes.spi.CoreProviders;
+import jdk.graal.compiler.options.OptionValues;
+import jdk.graal.compiler.phases.common.inlining.InliningUtil;
+import jdk.graal.compiler.replacements.IntrinsicGraphBuilder;
+
+import jdk.vm.ci.meta.JavaKind;
 
 public class SubstrateIntrinsicGraphBuilder extends IntrinsicGraphBuilder {
 
     private int bci;
 
+    @SuppressWarnings("this-escape")
     public SubstrateIntrinsicGraphBuilder(OptionValues options, DebugContext debug, CoreProviders providers, Bytecode code) {
         super(options, debug, providers, code, -1, AllowAssumptions.NO);
         setStateAfter(getGraph().start());
@@ -54,30 +57,46 @@ public class SubstrateIntrinsicGraphBuilder extends IntrinsicGraphBuilder {
 
     @Override
     public void setStateAfter(StateSplit sideEffect) {
-        List<ValueNode> values = new ArrayList<>(Arrays.asList(arguments));
-        int stackSize = 0;
+        FrameState stateAfter = getFrameState(returnValue);
+        sideEffect.setStateAfter(stateAfter);
+    }
 
-        if (returnValue != null) {
-            values.add(returnValue);
-            stackSize++;
+    private FrameState getFrameState(ValueNode returnVal) {
+        ValueNode[] locals = arguments;
+        JavaKind[] pushedSlotKinds = null;
+        ValueNode[] pushedValues = null;
+        ValueNode[] locks = ValueNode.EMPTY_ARRAY;
+        ValueNode[] stack;
+
+        if (returnVal != null) {
             if (method.getSignature().getReturnKind().needsTwoSlots()) {
-                values.add(null);
-                stackSize++;
+                stack = new ValueNode[]{returnVal, null};
+            } else {
+                stack = new ValueNode[]{returnVal};
             }
+        } else {
+            stack = ValueNode.EMPTY_ARRAY;
         }
 
-        FrameState stateAfter = getGraph().add(new FrameState(null, code, bci, values, arguments.length, stackSize, false, false, null, null));
-        sideEffect.setStateAfter(stateAfter);
+        FrameState stateAfter = getGraph().add(new FrameState(null, code, bci, locals, stack, stack.length, pushedSlotKinds, pushedValues, locks, null, FrameState.StackState.BeforePop));
         bci++;
+        return stateAfter;
+    }
+
+    @Override
+    public FrameState getInvocationPluginReturnState(JavaKind retKind, ValueNode retVal) {
+        return getFrameState(retVal);
     }
 
     @Override
     protected void setExceptionState(StateSplit exceptionObject) {
-        List<ValueNode> values = new ArrayList<>(Arrays.asList(arguments));
-        values.add(exceptionObject.asNode());
-        int stackSize = 1;
-
-        FrameState stateAfter = getGraph().add(new FrameState(null, code, bci, values, arguments.length, stackSize, true, false, null, null));
+        ValueNode[] locals = arguments;
+        ValueNode[] stack = {exceptionObject.asNode()};
+        JavaKind[] pushedSlotKinds = null;
+        ValueNode[] pushedValues = null;
+        ValueNode[] locks = ValueNode.EMPTY_ARRAY;
+        List<MonitorIdNode> monitorIds = null;
+        FrameState stateAfter = getGraph().add(new FrameState(null, code, bci, locals, stack, 1, pushedSlotKinds, pushedValues, locks, monitorIds, FrameState.StackState.Rethrow));
         exceptionObject.setStateAfter(stateAfter);
         bci++;
     }
@@ -103,11 +122,14 @@ public class SubstrateIntrinsicGraphBuilder extends IntrinsicGraphBuilder {
             unwindMergeNode.setNext(unwindReplacement);
 
             /* Creating FrameState for new UnwindNode. */
-            List<ValueNode> values = new ArrayList<>(Arrays.asList(arguments));
-            values.add(exceptionValue);
-            int stackSize = 1;
+            ValueNode[] locals = arguments;
+            ValueNode[] stack = {exceptionValue};
+            JavaKind[] pushedSlotKinds = null;
+            ValueNode[] pushedValues = null;
+            ValueNode[] locks = ValueNode.EMPTY_ARRAY;
+            List<MonitorIdNode> monitorIds = null;
 
-            FrameState stateAfter = getGraph().add(new FrameState(null, code, bci, values, arguments.length, stackSize, true, false, null, null));
+            FrameState stateAfter = getGraph().add(new FrameState(null, code, bci, locals, stack, 1, pushedSlotKinds, pushedValues, locks, monitorIds, FrameState.StackState.Rethrow));
             unwindMergeNode.setStateAfter(stateAfter);
             bci++;
         }

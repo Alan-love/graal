@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013, 2017, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2013, 2023, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -43,53 +43,43 @@ import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
-import org.graalvm.compiler.graph.NodeSourcePosition;
-import org.graalvm.compiler.nodes.ValueNode;
-
 import com.oracle.graal.pointsto.BigBang;
+import com.oracle.graal.pointsto.PointsToAnalysis;
 import com.oracle.graal.pointsto.flow.ActualReturnTypeFlow;
 import com.oracle.graal.pointsto.flow.AllInstantiatedTypeFlow;
 import com.oracle.graal.pointsto.flow.AllSynchronizedTypeFlow;
 import com.oracle.graal.pointsto.flow.ArrayElementsTypeFlow;
 import com.oracle.graal.pointsto.flow.CloneTypeFlow;
+import com.oracle.graal.pointsto.flow.ContextInsensitiveFieldTypeFlow;
 import com.oracle.graal.pointsto.flow.DynamicNewInstanceTypeFlow;
 import com.oracle.graal.pointsto.flow.FieldFilterTypeFlow;
-import com.oracle.graal.pointsto.flow.FieldSinkTypeFlow;
 import com.oracle.graal.pointsto.flow.FieldTypeFlow;
 import com.oracle.graal.pointsto.flow.FilterTypeFlow;
 import com.oracle.graal.pointsto.flow.FormalParamTypeFlow;
 import com.oracle.graal.pointsto.flow.FormalReturnTypeFlow;
-import com.oracle.graal.pointsto.flow.FrozenFieldFilterTypeFlow;
-import com.oracle.graal.pointsto.flow.InitialParamTypeFlow;
-import com.oracle.graal.pointsto.flow.InstanceOfTypeFlow;
 import com.oracle.graal.pointsto.flow.InvokeTypeFlow;
 import com.oracle.graal.pointsto.flow.LoadFieldTypeFlow.LoadInstanceFieldTypeFlow;
 import com.oracle.graal.pointsto.flow.LoadFieldTypeFlow.LoadStaticFieldTypeFlow;
 import com.oracle.graal.pointsto.flow.MergeTypeFlow;
-import com.oracle.graal.pointsto.flow.MonitorEnterTypeFlow;
 import com.oracle.graal.pointsto.flow.NewInstanceTypeFlow;
 import com.oracle.graal.pointsto.flow.NullCheckTypeFlow;
-import com.oracle.graal.pointsto.flow.OffsetLoadTypeFlow.AtomicReadTypeFlow;
-import com.oracle.graal.pointsto.flow.OffsetLoadTypeFlow.JavaReadTypeFlow;
 import com.oracle.graal.pointsto.flow.OffsetLoadTypeFlow.LoadIndexedTypeFlow;
 import com.oracle.graal.pointsto.flow.OffsetLoadTypeFlow.UnsafeLoadTypeFlow;
-import com.oracle.graal.pointsto.flow.OffsetLoadTypeFlow.UnsafePartitionLoadTypeFlow;
-import com.oracle.graal.pointsto.flow.OffsetStoreTypeFlow.AtomicWriteTypeFlow;
-import com.oracle.graal.pointsto.flow.OffsetStoreTypeFlow.CompareAndSwapTypeFlow;
-import com.oracle.graal.pointsto.flow.OffsetStoreTypeFlow.JavaWriteTypeFlow;
 import com.oracle.graal.pointsto.flow.OffsetStoreTypeFlow.StoreIndexedTypeFlow;
-import com.oracle.graal.pointsto.flow.OffsetStoreTypeFlow.UnsafePartitionStoreTypeFlow;
 import com.oracle.graal.pointsto.flow.OffsetStoreTypeFlow.UnsafeStoreTypeFlow;
 import com.oracle.graal.pointsto.flow.SourceTypeFlow;
 import com.oracle.graal.pointsto.flow.StoreFieldTypeFlow.StoreInstanceFieldTypeFlow;
 import com.oracle.graal.pointsto.flow.StoreFieldTypeFlow.StoreStaticFieldTypeFlow;
 import com.oracle.graal.pointsto.flow.TypeFlow;
-import com.oracle.graal.pointsto.flow.UnknownTypeFlow;
 import com.oracle.graal.pointsto.flow.UnsafeWriteSinkTypeFlow;
 import com.oracle.graal.pointsto.flow.builder.TypeFlowBuilder;
 import com.oracle.graal.pointsto.meta.AnalysisField;
 import com.oracle.graal.pointsto.meta.AnalysisType;
+import com.oracle.graal.pointsto.util.AnalysisError;
+import com.oracle.svm.util.ClassUtil;
 
+import jdk.graal.compiler.graph.NodeSourcePosition;
+import jdk.graal.compiler.nodes.ValueNode;
 import jdk.vm.ci.code.BytecodePosition;
 import jdk.vm.ci.common.JVMCIError;
 import jdk.vm.ci.meta.JavaType;
@@ -99,10 +89,11 @@ public class PointsToStats {
 
     static boolean reportStatistics;
 
-    public static void init(BigBang bb) {
+    public static void init(PointsToAnalysis bb) {
         registerTypeState(bb, EmptyTypeState.SINGLETON);
         registerTypeState(bb, NullTypeState.SINGLETON);
-        registerTypeState(bb, UnknownTypeState.SINGLETON);
+        registerTypeState(bb, AnyPrimitiveTypeState.SINGLETON);
+        PrimitiveConstantTypeState.registerCachedTypeStates(bb);
         reportStatistics = bb.reportAnalysisStatistics();
     }
 
@@ -141,7 +132,7 @@ public class PointsToStats {
 
     private static List<TypeFlowBuilder<?>> typeFlowBuilders = new CopyOnWriteArrayList<>();
 
-    public static void registerTypeFlowBuilder(BigBang bb, TypeFlowBuilder<?> builder) {
+    public static void registerTypeFlowBuilder(PointsToAnalysis bb, TypeFlowBuilder<?> builder) {
         if (!bb.reportAnalysisStatistics()) {
             return;
         }
@@ -151,16 +142,16 @@ public class PointsToStats {
 
     private static void reportPrunedTypeFlows(BufferedWriter out) {
 
-        doWrite(out, String.format("%-35s\n", "Summary"));
-        doWrite(out, String.format("%-35s\t%-10s\n", "Type Flow Class", "Removed Count"));
+        doWrite(out, String.format("%-35s%n", "Summary"));
+        doWrite(out, String.format("%-35s\t%-10s%n", "Type Flow Class", "Removed Count"));
 
         typeFlowBuilders.stream().filter(Objects::nonNull).filter(b -> !b.isMaterialized()).collect(Collectors.groupingBy(TypeFlowBuilder::getFlowClass)).forEach((flowClass, providers) -> {
-            doWrite(out, String.format("%-35s\t%-10d\n",
-                            flowClass.getSimpleName(), providers.size()));
+            doWrite(out, String.format("%-35s\t%-10d%n",
+                            ClassUtil.getUnqualifiedName(flowClass), providers.size()));
         });
 
-        doWrite(out, String.format("\n%-35s\n", "Removed flows"));
-        doWrite(out, String.format("%-35s\t%-10s\n", "Type Flow Class", "Location"));
+        doWrite(out, String.format("%n%-35s%n", "Removed flows"));
+        doWrite(out, String.format("%-35s\t%-10s%n", "Type Flow Class", "Location"));
 
         typeFlowBuilders.stream().filter(Objects::nonNull).filter(b -> !b.isMaterialized()).forEach((provider) -> {
             Object source = provider.getSource();
@@ -174,20 +165,15 @@ public class PointsToStats {
                     sourceStr = value.toString() + " @ " + value.graph().method().format("%H.%n(%p)");
                 }
             } else {
-                sourceStr = source.toString();
+                sourceStr = source != null ? source.toString() : "null";
             }
-            doWrite(out, String.format("%-35s\t%-10s\n",
-                            provider.getFlowClass().getSimpleName(), sourceStr));
+            doWrite(out, String.format("%-35s\t%-10s%n",
+                            ClassUtil.getUnqualifiedName(provider.getFlowClass()), sourceStr));
         });
 
     }
 
     static class TypeFlowStats {
-        static final Comparator<TypeFlowStats> totalUpdatesCountComparator = Comparator.comparingInt(TypeFlowStats::allUpdatesCount);
-
-        /* Reason why this state was not removed during graph pruning. */
-        String retainReason;
-
         final TypeFlow<?> flow;
 
         final List<TypeState> allUpdates;
@@ -195,19 +181,10 @@ public class PointsToStats {
         final AtomicInteger queuedUpdates;
 
         TypeFlowStats(TypeFlow<?> flow) {
-            this.retainReason = "";
             this.flow = flow;
             this.allUpdates = new CopyOnWriteArrayList<>();
             this.successfulUpdates = new CopyOnWriteArrayList<>();
             this.queuedUpdates = new AtomicInteger(0);
-        }
-
-        public void setRetainReason(String retainReason) {
-            this.retainReason = retainReason;
-        }
-
-        public String getRetainReason() {
-            return retainReason;
         }
 
         int allUpdatesCount() {
@@ -256,7 +233,7 @@ public class PointsToStats {
     private static ConcurrentHashMap<TypeFlow<?>, TypeFlowStats> typeFlowStats = new ConcurrentHashMap<>();
     private static ConcurrentHashMap<TypeFlow<?>, String> retainReson = new ConcurrentHashMap<>();
 
-    public static void registerTypeFlowRetainReason(BigBang bb, TypeFlow<?> flow, String reason) {
+    public static void registerTypeFlowRetainReason(PointsToAnalysis bb, TypeFlow<?> flow, String reason) {
         if (!bb.reportAnalysisStatistics()) {
             return;
         }
@@ -273,12 +250,12 @@ public class PointsToStats {
         retainReson.put(flow, originalFlowReason);
     }
 
-    public static void registerTypeFlowUpdate(BigBang bb, TypeFlow<?> flow, TypeState state) {
+    public static void registerTypeFlowUpdate(PointsToAnalysis bb, TypeFlow<?> flow, TypeState state) {
         if (!bb.reportAnalysisStatistics()) {
             return;
         }
 
-        if (state.isUnknown() || state.isEmpty()) {
+        if (state.isEmpty()) {
             return;
         }
 
@@ -286,12 +263,12 @@ public class PointsToStats {
         stats.registerUpdate(state);
     }
 
-    public static void registerTypeFlowSuccessfulUpdate(BigBang bb, TypeFlow<?> flow, TypeState state) {
+    public static void registerTypeFlowSuccessfulUpdate(PointsToAnalysis bb, TypeFlow<?> flow, TypeState state) {
         if (!bb.reportAnalysisStatistics()) {
             return;
         }
 
-        if (state.isUnknown() || state.isEmpty()) {
+        if (state.isEmpty()) {
             return;
         }
 
@@ -299,7 +276,7 @@ public class PointsToStats {
         stats.registerSuccessfulUpdate(state);
     }
 
-    public static void registerTypeFlowQueuedUpdate(BigBang bb, TypeFlow<?> flow) {
+    public static void registerTypeFlowQueuedUpdate(PointsToAnalysis bb, TypeFlow<?> flow) {
         if (!bb.reportAnalysisStatistics()) {
             return;
         }
@@ -312,7 +289,7 @@ public class PointsToStats {
 
     private static void reportTypeFlowStats(BufferedWriter out) {
 
-        doWrite(out, String.format("%-35s\t%-10s\t%-10s\t%-10s\t%-10s\t%-10s\t%-10s\t%-10s\t%-10s\t%-10s\t%-10s\t%-10s\t%10s\n",
+        doWrite(out, String.format("%-35s\t%-10s\t%-10s\t%-10s\t%-10s\t%-10s\t%-10s\t%-10s\t%-10s\t%-10s\t%-10s\t%-10s\t%10s%n",
                         "TypeFlow", "TypeStateID", "StateObjects#", "CanBeNull", "IsClone", "Uses", "Observers", "Uses+Observers",
                         "RetainReason", "QueuedUpdates", "AllUpdates", "TypeStateAdds", "All Updates History (<update frequency>x<type state id>)"));
 
@@ -321,9 +298,9 @@ public class PointsToStats {
                             TypeFlow<?> flow = e.getKey();
                             TypeFlowStats stats = e.getValue();
 
-                            doWrite(out, String.format("%-35s\t%-10d\t%-10d\t%-10b\t%-10b\t%-10d\t%-10d\t%-10d\t%-10s\t%-10d\t%10d\t%10d\t%10s\n",
-                                            asString(flow), stateToId.get(flow.getState()), objectsCount(flow.getState()),
-                                            flow.getState().canBeNull(), flow.isClone(),
+                            doWrite(out, String.format("%-35s\t%-10d\t%-10d\t%-10b\t%-10b\t%-10d\t%-10d\t%-10d\t%-10s\t%-10d\t%10d\t%10d\t%10s%n",
+                                            asString(flow), stateToId.get(flow.getRawState()), objectsCount(flow.getRawState()),
+                                            flow.getRawState().canBeNull(), flow.isClone(),
                                             flow.getUses().size(), flow.getObservers().size(), flow.getUses().size() + flow.getObservers().size(),
                                             retainReson.getOrDefault(flow, ""),
                                             stats.queuedUpdatesCount(), stats.successfulUpdatesCount(), stats.allUpdatesCount(),
@@ -340,27 +317,28 @@ public class PointsToStats {
     private static final AtomicInteger nextStateId = new AtomicInteger();
     private static ConcurrentHashMap<TypeState, AtomicInteger> typeStateStats = new ConcurrentHashMap<>();
 
-    static void registerTypeState(BigBang bb, TypeState state) {
+    public static <T extends TypeState> T registerTypeState(PointsToAnalysis bb, T state) {
 
         if (!bb.reportAnalysisStatistics()) {
-            return;
+            return state;
         }
 
         Integer id = stateToId.computeIfAbsent(state, (s) -> nextStateId.incrementAndGet());
         TypeState actualState = idToState.computeIfAbsent(id, (i) -> state);
 
         typeStateStats.computeIfAbsent(actualState, (s) -> new AtomicInteger()).incrementAndGet();
+        return state;
     }
 
     private static int objectsCount(TypeState state) {
-        if (state == UnknownTypeState.SINGLETON) {
+        if (state.isPrimitive()) {
             return 0;
         }
         return state.objectsCount();
     }
 
     private static int typesCount(TypeState state) {
-        if (state == UnknownTypeState.SINGLETON) {
+        if (state.isPrimitive()) {
             return 0;
         }
         return state.typesCount();
@@ -368,7 +346,7 @@ public class PointsToStats {
 
     private static void reportTypeStateStats(BufferedWriter out) {
 
-        doWrite(out, String.format("%10s\t%10s\t%10s\t%10s\t%10s\n", "Id", "Frequency", "Types#", "Object#", "Types"));
+        doWrite(out, String.format("%10s\t%10s\t%10s\t%10s\t%10s%n", "Id", "Frequency", "Types#", "Object#", "Types"));
 
         typeStateStats.entrySet().stream()
                         .sorted(Entry.comparingByValue(atomicIntegerComparator.reversed()))
@@ -376,7 +354,7 @@ public class PointsToStats {
                             TypeState s = entry.getKey();
                             int frequency = entry.getValue().intValue();
 
-                            doWrite(out, String.format("%10d\t%10d\t%10d\t%10d\t%10s\n",
+                            doWrite(out, String.format("%10d\t%10d\t%10d\t%10d\t%10s%n",
                                             stateToId.get(s), frequency, typesCount(s), objectsCount(s), asString(s)));
                         });
     }
@@ -385,13 +363,13 @@ public class PointsToStats {
 
     private static ConcurrentHashMap<UnionOperation, AtomicInteger> unionStats = new ConcurrentHashMap<>();
 
-    static void registerUnionOperation(BigBang bb, TypeState s1, TypeState s2, TypeState result) {
+    public static void registerUnionOperation(PointsToAnalysis bb, TypeState s1, TypeState s2, TypeState result) {
 
         if (!bb.reportAnalysisStatistics()) {
             return;
         }
 
-        assert typeStateStats.containsKey(s1) && typeStateStats.containsKey(s2) && typeStateStats.containsKey(result);
+        assert typeStateStats.containsKey(s1) && typeStateStats.containsKey(s2) && typeStateStats.containsKey(result) : typeFlowStats;
 
         UnionOperation union = new UnionOperation(s1, s2, result);
         AtomicInteger counter = unionStats.computeIfAbsent(union, (k) -> new AtomicInteger());
@@ -400,7 +378,7 @@ public class PointsToStats {
 
     private static void reportUnionOpertationsStats(BufferedWriter out) {
 
-        doWrite(out, String.format("%10s + %10s = %10s\t%10s\n", "State1ID", "State2ID", "ResultID", "Frequency"));
+        doWrite(out, String.format("%10s + %10s = %10s\t%10s%n", "State1ID", "State2ID", "ResultID", "Frequency"));
         unionStats.entrySet().stream()
                         .filter(e -> e.getValue().intValue() > 1)
                         .sorted(Entry.comparingByValue(atomicIntegerComparator.reversed()))
@@ -408,7 +386,7 @@ public class PointsToStats {
                             UnionOperation union = entry.getKey();
                             Integer frequency = entry.getValue().intValue();
 
-                            doWrite(out, String.format("%10d + %10d = %10d\t%10d\t%10s + %10s = %10s\n",
+                            doWrite(out, String.format("%10d + %10d = %10d\t%10d\t%10s + %10s = %10s%n",
                                             union.getState1Id(), union.getState2Id(), union.getResultId(),
                                             frequency, asString(union.getState1()), asString(union.getState2()), asString(union.getResult())));
                         });
@@ -464,47 +442,14 @@ public class PointsToStats {
         }
     }
 
-    static class FilterOperation {
-        int filterId;
-        int inputId;
-        int resultId;
-
-        FilterOperation(int filterId, int inputId, int resultId) {
-            this.filterId = filterId;
-            this.inputId = inputId;
-            this.resultId = resultId;
-        }
-
-        @Override
-        public boolean equals(Object obj) {
-            if (obj instanceof FilterOperation) {
-                FilterOperation other = (FilterOperation) obj;
-                return this.filterId == other.filterId && this.inputId == other.inputId && this.resultId == other.resultId;
-            }
-            return false;
-        }
-
-        @Override
-        public int hashCode() {
-            final int prime = 31;
-            int result = 1;
-            result = prime * result + filterId;
-            result = prime * result + inputId;
-            result = prime * result + resultId;
-            return result;
-        }
-    }
-
     private static String asString(TypeFlow<?> flow) {
 
         if (flow instanceof AllInstantiatedTypeFlow) {
             return "AllInstantiated(" + formatType(flow.getDeclaredType(), true) + ")";
         } else if (flow instanceof AllSynchronizedTypeFlow) {
             return "AllSynchronized";
-        } else if (flow instanceof UnknownTypeFlow) {
-            return "Unknown";
-        } else if (flow instanceof FieldSinkTypeFlow) {
-            FieldSinkTypeFlow sink = (FieldSinkTypeFlow) flow;
+        } else if (flow instanceof ContextInsensitiveFieldTypeFlow) {
+            ContextInsensitiveFieldTypeFlow sink = (ContextInsensitiveFieldTypeFlow) flow;
             return "FieldSink(" + formatField(sink.getSource()) + ")";
         } else if (flow instanceof FieldTypeFlow) {
             FieldTypeFlow fieldFlow = (FieldTypeFlow) flow;
@@ -526,27 +471,13 @@ public class PointsToStats {
             return "IndexedStore @ " + formatSource(flow);
         } else if (flow instanceof UnsafeStoreTypeFlow) {
             return "UnsafeStore @ " + formatSource(flow);
-        } else if (flow instanceof UnsafePartitionStoreTypeFlow) {
-            return "UnsafePartitionStore @ " + formatSource(flow);
         } else if (flow instanceof UnsafeWriteSinkTypeFlow) {
             UnsafeWriteSinkTypeFlow sink = (UnsafeWriteSinkTypeFlow) flow;
             return "UnsafeWriteSink(" + formatField(sink.getSource()) + ")";
-        } else if (flow instanceof JavaWriteTypeFlow) {
-            return "JavaWrite @ " + formatSource(flow);
-        } else if (flow instanceof AtomicWriteTypeFlow) {
-            return "AtomicWrite @ " + formatSource(flow);
-        } else if (flow instanceof CompareAndSwapTypeFlow) {
-            return "CompareAndSwap @ " + formatSource(flow);
         } else if (flow instanceof LoadIndexedTypeFlow) {
             return "IndexedLoad @ " + formatSource(flow);
         } else if (flow instanceof UnsafeLoadTypeFlow) {
             return "UnsafeLoad @ " + formatSource(flow);
-        } else if (flow instanceof UnsafePartitionLoadTypeFlow) {
-            return "UnsafePartitionLoad @ " + formatSource(flow);
-        } else if (flow instanceof JavaReadTypeFlow) {
-            return "JavaRead @ " + formatSource(flow);
-        } else if (flow instanceof AtomicReadTypeFlow) {
-            return "AtomicRead @ " + formatSource(flow);
         } else if (flow instanceof ArrayElementsTypeFlow) {
             ArrayElementsTypeFlow arrayFlow = (ArrayElementsTypeFlow) flow;
             return "ArrayElements(" + (arrayFlow.object() != null ? arrayFlow.object().type().toJavaName(false) : "?") + ")";
@@ -562,12 +493,6 @@ public class PointsToStats {
         } else if (flow instanceof FieldFilterTypeFlow) {
             FieldFilterTypeFlow filter = (FieldFilterTypeFlow) flow;
             return "FieldFilter(" + formatField(filter.getSource()) + ")";
-        } else if (flow instanceof FrozenFieldFilterTypeFlow) {
-            FrozenFieldFilterTypeFlow filter = (FrozenFieldFilterTypeFlow) flow;
-            return "FrozenFieldFilter(" + formatField(filter.getSource()) + ")";
-        } else if (flow instanceof InstanceOfTypeFlow) {
-            InstanceOfTypeFlow instanceOf = (InstanceOfTypeFlow) flow;
-            return "InstanceOf(" + formatType(instanceOf.getDeclaredType(), true) + ")@" + formatSource(flow);
         } else if (flow instanceof NewInstanceTypeFlow) {
             return "NewInstance(" + flow.getDeclaredType().toJavaName(false) + ")@" + formatSource(flow);
         } else if (flow instanceof DynamicNewInstanceTypeFlow) {
@@ -575,9 +500,6 @@ public class PointsToStats {
         } else if (flow instanceof InvokeTypeFlow) {
             InvokeTypeFlow invoke = (InvokeTypeFlow) flow;
             return "Invoke(" + formatMethod(invoke.getTargetMethod()) + ")@" + formatSource(flow);
-        } else if (flow instanceof InitialParamTypeFlow) {
-            InitialParamTypeFlow param = (InitialParamTypeFlow) flow;
-            return "InitialParam(" + param.position() + ")@" + formatMethod(param.method());
         } else if (flow instanceof FormalParamTypeFlow) {
             FormalParamTypeFlow param = (FormalParamTypeFlow) flow;
             return "Parameter(" + param.position() + ")@" + formatMethod(param.method());
@@ -593,11 +515,8 @@ public class PointsToStats {
             return "Source @ " + formatSource(flow);
         } else if (flow instanceof CloneTypeFlow) {
             return "Clone @ " + formatSource(flow);
-        } else if (flow instanceof MonitorEnterTypeFlow) {
-            MonitorEnterTypeFlow monitor = (MonitorEnterTypeFlow) flow;
-            return "MonitorEnter @ " + formatMethod(monitor.getMethod());
         } else {
-            return flow.getClass().getSimpleName() + "@" + formatSource(flow);
+            return ClassUtil.getUnqualifiedName(flow.getClass()) + "@" + formatSource(flow);
         }
     }
 
@@ -615,7 +534,7 @@ public class PointsToStats {
         } else if (source == null) {
             return "<no-source>";
         } else {
-            return source.getClass().getSimpleName();
+            return ClassUtil.getUnqualifiedName(source.getClass());
         }
     }
 
@@ -632,11 +551,11 @@ public class PointsToStats {
     }
 
     private static String formatType(AnalysisType type, boolean qualified) {
-        return type.toJavaName(qualified);
+        return type != null ? type.toJavaName(qualified) : "null";
     }
 
     @SuppressWarnings("unused")
-    private static String asDetailedString(TypeState s) {
+    private static String asDetailedString(BigBang bb, TypeState s) {
         if (s.isEmpty()) {
             return "<Empty>";
         }
@@ -644,12 +563,8 @@ public class PointsToStats {
             return "<Null>";
         }
 
-        if (s.isUnknown()) {
-            return "<Unknown>";
-        }
-
         String canBeNull = s.canBeNull() ? "null" : "!null";
-        String types = s.typesStream().map(JavaType::getUnqualifiedName).sorted().collect(Collectors.joining(", "));
+        String types = s.typesStream(bb).map(JavaType::getUnqualifiedName).sorted().collect(Collectors.joining(", "));
 
         return canBeNull + ", " + types;
     }
@@ -662,13 +577,16 @@ public class PointsToStats {
         if (s.isNull()) {
             return "<Null>";
         }
-
-        if (s.isUnknown()) {
-            return "<Unknown>";
+        if (s.isPrimitive()) {
+            return switch (s) {
+                case AnyPrimitiveTypeState ignored -> "<AnyInt>";
+                case PrimitiveConstantTypeState constant -> "<Int:" + constant.getValue() + ">";
+                default -> throw AnalysisError.shouldNotReachHere("Unknown primitive type state: " + s.getClass());
+            };
         }
 
-        String sKind = s.isAllocation() ? "Alloc" : s.isConstant() ? "Const" : s.isSingleTypeState() ? "Single" : s.isMultiTypeState() ? "Multi" : "";
-        String sSizeOrType = s.isMultiTypeState() ? s.typesCount() + "" : s.exactType().toJavaName(false);
+        String sKind = s.isAllocation() ? "Alloc" : s.asConstant() != null ? "Const" : s instanceof SingleTypeState ? "Single" : s instanceof MultiTypeState ? "Multi" : "";
+        String sSizeOrType = s instanceof MultiTypeState ? s.typesCount() + "" : s.exactType().toJavaName(false);
         int objectsNumber = s.objectsCount();
         String canBeNull = s.canBeNull() ? "null" : "!null";
 
@@ -678,7 +596,7 @@ public class PointsToStats {
     /**
      * Wrapper for BufferedWriter.out to deal with checked exception. Useful for avoiding catching
      * exceptions in lamdas.
-     * 
+     *
      * @param out the writer
      * @param str the string to write
      */

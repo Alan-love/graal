@@ -24,19 +24,17 @@
  */
 package com.oracle.svm.hosted.substitute;
 
-import java.lang.annotation.Annotation;
-import java.lang.reflect.Field;
+import java.lang.reflect.AnnotatedElement;
 
 import com.oracle.graal.pointsto.infrastructure.OriginalFieldProvider;
-import com.oracle.svm.core.meta.ReadableJavaField;
-import com.oracle.svm.hosted.c.GraalAccess;
+import com.oracle.svm.hosted.annotation.AnnotationWrapper;
 
 import jdk.vm.ci.meta.JavaConstant;
 import jdk.vm.ci.meta.JavaType;
 import jdk.vm.ci.meta.ResolvedJavaField;
 import jdk.vm.ci.meta.ResolvedJavaType;
 
-public class SubstitutionField implements ReadableJavaField, OriginalFieldProvider {
+public class SubstitutionField implements ResolvedJavaField, OriginalFieldProvider, AnnotationWrapper {
 
     private final ResolvedJavaField original;
     private final ResolvedJavaField annotated;
@@ -51,30 +49,6 @@ public class SubstitutionField implements ReadableJavaField, OriginalFieldProvid
         this.original = original;
         this.annotated = annotated;
         this.isUserSubstitution = isUserSubstitution;
-    }
-
-    @Override
-    public boolean allowConstantFolding() {
-        return true;
-    }
-
-    @Override
-    public boolean injectFinalForRuntimeCompilation() {
-        return false;
-    }
-
-    @Override
-    public JavaConstant readValue(JavaConstant receiver) {
-        /* First try reading the value using the original field. */
-        JavaConstant value = ReadableJavaField.readFieldValue(GraalAccess.getOriginalProviders().getConstantReflection(), original, receiver);
-        if (value == null) {
-            /*
-             * If the original field didn't yield a value, try reading using the annotated field.
-             * The value can be null only if the receiver doesn't contain the field.
-             */
-            value = ReadableJavaField.readFieldValue(GraalAccess.getOriginalProviders().getConstantReflection(), annotated, receiver);
-        }
-        return value;
     }
 
     public boolean isUserSubstitution() {
@@ -125,22 +99,17 @@ public class SubstitutionField implements ReadableJavaField, OriginalFieldProvid
     }
 
     @Override
-    public <T extends Annotation> T getAnnotation(Class<T> annotationClass) {
-        return annotated.getAnnotation(annotationClass);
+    public AnnotatedElement getAnnotationRoot() {
+        return annotated;
     }
 
     @Override
-    public Annotation[] getAnnotations() {
-        return annotated.getAnnotations();
+    public ResolvedJavaField unwrapTowardsOriginalField() {
+        return original;
     }
 
     @Override
-    public Annotation[] getDeclaredAnnotations() {
-        return annotated.getDeclaredAnnotations();
-    }
-
-    @Override
-    public Field getJavaField() {
-        return OriginalFieldProvider.getJavaField(GraalAccess.getOriginalSnippetReflection(), original);
+    public JavaConstant getConstantValue() {
+        return original.getConstantValue();
     }
 }

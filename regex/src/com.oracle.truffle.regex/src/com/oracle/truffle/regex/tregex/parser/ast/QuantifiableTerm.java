@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2020, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -40,8 +40,6 @@
  */
 package com.oracle.truffle.regex.tregex.parser.ast;
 
-import java.util.Objects;
-
 import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
 import com.oracle.truffle.regex.tregex.parser.Token;
 import com.oracle.truffle.regex.tregex.parser.Token.Quantifier;
@@ -71,6 +69,10 @@ public abstract class QuantifiableTerm extends Term {
         return quantifier != null;
     }
 
+    public boolean hasMin0Quantifier() {
+        return hasQuantifier() && quantifier.getMin() == 0;
+    }
+
     /**
      * Returns {@code true} iff this term has a quantifier that was not unrolled by the parser.
      */
@@ -92,7 +94,13 @@ public abstract class QuantifiableTerm extends Term {
     }
 
     boolean quantifierEquals(QuantifiableTerm o) {
-        return Objects.equals(quantifier, o.quantifier);
+        if (quantifier == null) {
+            return o.quantifier == null;
+        }
+        if (o.quantifier == null) {
+            return quantifier == null;
+        }
+        return quantifier.equalsSemantic(o.quantifier);
     }
 
     @Override

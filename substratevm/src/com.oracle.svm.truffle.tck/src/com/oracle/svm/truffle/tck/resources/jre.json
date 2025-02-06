@@ -3,37 +3,9 @@
     "name" : "java.io.FileDescriptor",
     "methods" : [
         { "name" : "closeAll",
-          "justification" : "Safe, called with Closeable parameter by FileInputStream, FileOutputStream, RandomAccessFile to close the file handler. The Closeable is  megamorphic.",
+          "justification" : "Safe, called with Closeable parameter by FileInputStream, FileOutputStream, RandomAccessFile to close the file handler. The Closeable is megamorphic.",
           "parameterTypes" : [
               "java.io.Closeable"
-        ]}
-    ]
-  },
-  {
-    "name" : "java.lang.StringCoding",
-    "methods" : [
-        { "name" : "encode" ,
-          "parameterTypes" : [
-              "char[]",
-              "int",
-              "int"
-        ]},
-        { "name" : "decode",
-          "parameterTypes" : [
-              "byte[]",
-              "int",
-              "int"
-        ]}
-    ]
-  },
-  {
-    "name" : "java.lang.UNIXProcess",
-    "methods" : [
-        { "name" : "lambda$null$0" ,
-          "justification" : "UNIXProcess internal processReaperExecutor.",
-          "parameterTypes" : [
-              "java.lang.ThreadGroup",
-              "java.lang.Runnable"
         ]}
     ]
   },
@@ -98,10 +70,17 @@
   {
     "name" : "java.util.ServiceLoader",
     "methods" : [
+      { "name" : "loadProvider" ,
+        "justification" : " Loads a service provider in a module."
+      }
+    ]
+  },
+  {
+    "name" : "java.util.ServiceLoader$LazyClassPathLookupIterator",
+    "methods" : [
         { "name" : "parse" ,
           "justification" : "Reads META-INF/services files from classpath.",
           "parameterTypes" : [
-              "java.lang.Class",
               "java.net.URL"
         ]}
     ]
@@ -126,6 +105,17 @@
     ]
   },
   {
+    "name" : "java.util.concurrent.ForkJoinPool",
+    "methods" : [
+      { "name" : "deregisterWorker" ,
+        "justification" : "Calls ForkJoinPool.tryTerminate but always with now=false",
+        "parameterTypes" : [
+          "java.util.concurrent.ForkJoinWorkerThread",
+          "java.lang.Throwable"
+        ]}
+    ]
+  },
+  {
     "name" : "java.util.concurrent.ForkJoinWorkerThread",
     "methods" : [
         { "name" : "run" ,
@@ -137,14 +127,6 @@
     "name" : "java.util.concurrent.ForkJoinTask",
     "methods" : [
         { "name" : "invoke" ,
-          "parameterTypes" : [
-        ]}
-    ]
-  },
-  {
-    "name" : "java.util.concurrent.ForkJoinPool",
-    "methods" : [
-        { "name" : "makeCommonPool" ,
           "parameterTypes" : [
         ]}
     ]
@@ -174,9 +156,10 @@
   {
     "name" : "java.security.ProtectionDomain",
     "methods" : [
-        { "name" : "toString" ,
-          "parameterTypes" : [
-        ]}
+      { "name" : "seeAllp" ,
+        "parameterTypes" : [],
+        "justification" : "Safe operation, calls SecurityManager and catches a SecurityException to determine if toString should print all permissions."
+      }
     ]
   },
   {
@@ -186,6 +169,28 @@
           "parameterTypes" : [
               "java.lang.String"
         ]}
+    ]
+  },
+  {
+    "name" : "java.security.Provider$Service",
+    "methods" : [
+      { "name" : "getKeyClass" ,
+        "parameterTypes" : [
+          "java.lang.String"
+        ],
+        "justification" : "On SVM security providers are statically configured."
+      }
+    ]
+  },
+  {
+    "name" : "java.security.Provider$Service",
+    "methods" : [
+      { "name" : "newInstance" ,
+        "parameterTypes" : [
+          "java.lang.Object"
+        ],
+        "justification" : "On SVM security providers are statically configured."
+      }
     ]
   },
   {
@@ -210,16 +215,6 @@
     ]
   },
   {
-    "name" : "com.oracle.svm.core.jdk.Resources",
-    "methods" : [
-        { "name" : "createURL" ,
-          "parameterTypes" : [
-            "java.lang.String",
-            "byte[]"
-        ]}
-    ]
-  },
-  {
     "name" : "com.oracle.svm.core.handles.ObjectHandlesImpl",
     "allDeclaredMethods" : true,
     "justification" : "Internal SVM implementation of JNI object handles"
@@ -232,6 +227,129 @@
           "parameterTypes" : [
             "com.oracle.svm.core.thread.NativeVMOperationData"
         ]}
+    ]
+  },
+  {
+    "name": "sun.util.logging.PlatformLogger",
+    "methods" : [
+       {
+         "name" : "getLogger",
+         "parameterTypes" : [
+           "java.lang.String"
+         ]
+       }
+    ]
+  },
+  {
+    "name": "java.util.logging.LogManager",
+    "methods" : [
+      {
+        "name" : "checkPermission",
+        "parameterTypes" : []
+      },
+      {
+        "name" : "getLogManager",
+        "justification" : "substituted method has hook to install shutdown hook.",
+        "parameterTypes" : []
+      }
+    ]
+  },
+  {
+    "name": "java.lang.Class",
+    "methods": [
+      {
+        "name": "forName",
+        "justification": "Only classes that were present during the image build (on the classpath or predefined classes) can be accessed."
+      }
+    ]
+  },
+  {
+    "name": "java.lang.reflect.Proxy",
+    "methods": [
+      {
+        "name": "getInvocationHandler",
+        "parameterTypes" : [
+          "java.lang.Object"
+        ],
+        "justification": "On SVM proxies are statically configured."
+      }
+    ]
+  },
+  {
+    "name": "java.lang.runtime.ObjectMethods",
+    "methods":[
+      {
+        "name": "bootstrap",
+        "justification": "Bootstrap method for record's toString, hashCode and equals methods."
+      }
+    ]
+  },
+  {
+    "name": "java.lang.runtime.SwitchBootstraps",
+    "methods":[
+      {
+        "name": "typeSwitch",
+        "justification": "Bootstrap method for switch on a reference type."
+      },
+      {
+        "name": "enumSwitch",
+        "justification": "Bootstrap method for switch on enum constants."
+      }
+    ]
+  },
+  {
+    "name": "java.math.BigInteger",
+    "methods": [
+      {
+        "name": "multiply",
+        "justification": "JDK 19 introduced parallelMultiply(BI) that shares its implementation with multiply(BI), which causes a spurious privileged call being found in the latter, so we explicitly deny parallelMultiply(BI) and allow multiply(BI) to avoid this false positive."
+      },
+      {
+        "name": "square",
+        "parameterTypes" : [],
+        "justification": "square() calls a method which has both serial and parallel implementations; however, it will always use the serial implementation."
+      }
+    ]
+  },
+  {
+    "name": "java.util.Arrays",
+    "methods": [
+      {
+        "name": "sort",
+        "justification": "In the JDK 17 Arrays#sort and Arrays#parallelSort share the same DualPivotQuicksort#sort(array,parallelism,low,high) implementation that uses ForkJoinPool for parallelism > 1. This causes a spurious privileged call being found in the Arrays#sort, so we allow Arrays#sort to avoid this false positive and keep Arrays#parallelSort denied."
+      }
+    ]
+  },
+  {
+    "name": "java.util.ResourceBundle",
+    "methods": [
+      {
+        "name": "loadBundle",
+        "justification": "On SVM resource bundles are statically configured."
+      }
+    ]
+  },
+  {  
+    "name": "java.util.ServiceLoader$ModuleServicesLookupIterator",
+    "methods": [
+      {
+        "name": "loaderFor",
+        "parameterTypes" : [
+          "java.lang.Module"
+        ]
+      }
+    ]
+  },
+  {
+    "name": "java.lang.ClassLoader",
+    "methods": [
+      {
+        "name": "getResourceAsStream",
+        "parameterTypes" : [
+          "java.lang.String"
+        ],
+        "justification": "All the resources loaded by this method are registered using ResourcesFeature, so this call is safe."
+      }
     ]
   }
 ]

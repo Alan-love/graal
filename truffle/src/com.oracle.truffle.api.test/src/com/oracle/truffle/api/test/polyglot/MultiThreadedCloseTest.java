@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2020, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -40,22 +40,34 @@
  */
 package com.oracle.truffle.api.test.polyglot;
 
-import com.oracle.truffle.api.CallTarget;
-import com.oracle.truffle.api.Truffle;
-import com.oracle.truffle.api.TruffleLanguage.Env;
-import com.oracle.truffle.api.nodes.RootNode;
-import com.oracle.truffle.api.source.Source;
+import static org.junit.Assert.assertTrue;
+
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicReference;
+
 import org.graalvm.polyglot.Context;
-import static org.junit.Assert.assertTrue;
+import org.junit.BeforeClass;
 import org.junit.Test;
 
-public class MultiThreadedCloseTest extends AbstractPolyglotTest {
+import com.oracle.truffle.api.CallTarget;
+import com.oracle.truffle.api.TruffleLanguage.Env;
+import com.oracle.truffle.api.nodes.RootNode;
+import com.oracle.truffle.api.source.Source;
+import com.oracle.truffle.tck.tests.TruffleTestAssumptions;
+import org.junit.runner.RunWith;
+import org.junit.runners.Parameterized;
+
+@RunWith(Parameterized.class)
+public class MultiThreadedCloseTest extends AbstractThreadedPolyglotTest {
+
+    @BeforeClass
+    public static void runWithWeakEncapsulationOnly() {
+        TruffleTestAssumptions.assumeWeakEncapsulation();
+    }
 
     public MultiThreadedCloseTest() {
         enterContext = false;
@@ -68,7 +80,7 @@ public class MultiThreadedCloseTest extends AbstractPolyglotTest {
             @Override
             protected void initializeContext(CloseContext ctx) throws Exception {
                 ctx.executor = Executors.newCachedThreadPool((r) -> {
-                    return ctx.registerThread(ctx.env.createThread(r, null, ctx.group));
+                    return ctx.registerThread(ctx.env.newTruffleThreadBuilder(r).virtual(vthreads).threadGroup(ctx.group).build());
                 });
                 ctx.executor.submit(() -> {
                     ctx.env.parseInternal(Source.newBuilder(ProxyLanguage.ID, "", "test").build());
@@ -91,13 +103,13 @@ public class MultiThreadedCloseTest extends AbstractPolyglotTest {
 
     @Test
     public void testWithThreads() {
-        setupEnv(Context.newBuilder().allowCreateThread(true).build(), new CloseLanguage() {
+        setupEnv(Context.newBuilder(ProxyLanguage.ID).allowCreateThread(true).build(), new CloseLanguage() {
 
             @Override
             protected void initializeContext(CloseContext ctx) throws Exception {
-                ctx.registerThread(ctx.env.createThread(() -> {
+                ctx.registerThread(ctx.env.newTruffleThreadBuilder(() -> {
                     ctx.env.parseInternal(Source.newBuilder(ProxyLanguage.ID, "", "test").build());
-                }, null, ctx.group)).start();
+                }).virtual(vthreads).threadGroup(ctx.group).build()).start();
             }
 
             @Override
@@ -173,7 +185,7 @@ public class MultiThreadedCloseTest extends AbstractPolyglotTest {
 
         @Override
         protected CallTarget parse(ParsingRequest request) throws Exception {
-            return Truffle.getRuntime().createCallTarget(RootNode.createConstantNode(true));
+            return RootNode.createConstantNode(true).getCallTarget();
         }
     }
 }

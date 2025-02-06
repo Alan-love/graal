@@ -41,6 +41,9 @@
 
 package com.oracle.truffle.espresso.polyglot;
 
+import java.math.BigInteger;
+import java.nio.ByteOrder;
+
 /**
  * Provides access to the interoperability message protocol between Truffle languages. Every method
  * represents one message specified by the protocol. In the following text we will abbreviate
@@ -122,10 +125,10 @@ public final class Interop {
     /**
      * Returns the Java string value if the receiver represents a {@link #isString(Object) string}
      * like value.
-     * 
+     *
      * <p>
      * There's no guarantee about preserving or not the identity of foreign objects.
-     * 
+     *
      * @throws UnsupportedMessageException if and only if {@link #isString(Object)} returns
      *             <code>false</code> for the same receiver.
      * @see #isString(Object)
@@ -248,6 +251,20 @@ public final class Interop {
     public static native boolean fitsInDouble(Object receiver);
 
     /**
+     * Returns <code>true</code> if the receiver represents a <code>number</code> and its value fits
+     * in a Java BigInteger without loss of precision, else <code>false</code>. Invoking this
+     * message does not cause any observable side-effects.
+     *
+     * Foreign objects for which this method returns <code>true</code>, can be
+     * {@link Polyglot#cast(Class, Object) polyglot-casted} as <code>BigInteger</code>.
+     *
+     * @see #isNumber(Object)
+     * @see #asBigInteger(Object)
+     * @since 24.0
+     */
+    public static native boolean fitsInBigInteger(Object receiver);
+
+    /**
      * Returns the receiver value as Java byte primitive if the number fits without loss of
      * precision. Invoking this message does not cause any observable side-effects.
      *
@@ -319,6 +336,18 @@ public final class Interop {
      */
     public static native double asDouble(Object receiver) throws UnsupportedMessageException;
 
+    /**
+     * Returns the receiver value as Java BigInteger primitive if the number fits without loss of
+     * precision. Invoking this message does not cause any observable side-effects.
+     *
+     * @throws UnsupportedMessageException if and only if the receiver is not a
+     *             {@link #isNumber(Object)} or it does not fit without loss of precision.
+     * @see #isNumber(Object)
+     * @see #fitsInBigInteger(Object)
+     * @since 24.0
+     */
+    public static native BigInteger asBigInteger(Object receiver) throws UnsupportedMessageException;
+
     // endregion Number Messages
 
     // region Exception Messages
@@ -352,7 +381,7 @@ public final class Interop {
      * Foreign exceptions thrown with this method can be caught as {@link ForeignException}. Note
      * that {@link ForeignException} can only catch foreign exceptions. Native guest Java exceptions
      * can also be thrown with this method.
-     * 
+     *
      * <pre>
      * assert Interop.isException(foreignException);
      * try {
@@ -524,16 +553,16 @@ public final class Interop {
      * <p>
      * The identity of the returned value is guaranteed to be preserved but it cannot be assumed
      * that the returned value will have a specific Java type.
-     * 
+     *
      * <p>
      * The user must convert the result to the expected type:
-     * 
+     *
      * <pre>
      * Object value = Interop.readArrayElement(new int[]{42}, 0);
      * assert Interop.fitsInInt(value);
      * int intValue = Interop.asInt(value);
      * </pre>
-     * 
+     *
      * @throws UnsupportedMessageException when the receiver does not support reading at all. An
      *             empty receiver with no readable array elements supports the read operation (even
      *             though there is nothing to read), therefore it throws
@@ -748,7 +777,7 @@ public final class Interop {
      * assert Interop.isString(maybeForeign);
      * String displayString = Interop.asString(maybeForeign);
      * </pre>
-     * 
+     *
      * @param allowSideEffects whether side-effects are allowed in the production of the string.
      * @since 21.0
      */
@@ -807,7 +836,7 @@ public final class Interop {
      * assert Interop.isString(maybeForeign);
      * String metaQualifiedName = Interop.asString(maybeForeign);
      * </pre>
-     * 
+     *
      * @throws UnsupportedMessageException if and only if {@link #isMetaObject(Object)} returns
      *             <code>false</code> for the same receiver.
      *
@@ -1133,6 +1162,27 @@ public final class Interop {
                     throws UnsupportedMessageException, ArityException, UnknownIdentifierException, UnsupportedTypeException;
 
     /**
+     * Invokes a member for a given receiver and arguments where the expected return target type is
+     * passed in to assist the runtime in converting the result of the invocation. Otherwise,
+     * equivalent to {@link #invokeMember(Object, String, Object...)}.
+     *
+     * @throws UnknownIdentifierException if the given member does not exist or is not
+     *             {@link #isMemberInvocable(Object, String) invocable}.
+     * @throws UnsupportedTypeException if one of the arguments is not compatible to the executable
+     *             signature. Also thrown if the return value is not compatible with the passed
+     *             targetType.The exception is thrown on best effort basis, dynamic languages may
+     *             throw their own exceptions if the arguments are wrong.
+     * @throws ArityException if the number of expected arguments does not match the number of
+     *             actual arguments.
+     * @throws UnsupportedMessageException when the receiver does not support invoking at all, e.g.
+     *             when storing executable members is not allowed.
+     * @see #isMemberInvocable(Object, String)
+     * @since 23.0
+     */
+    public static native <T> T invokeMemberWithCast(Class<T> targetType, Object receiver, String member, Object... arguments)
+                    throws UnsupportedMessageException, ArityException, UnknownIdentifierException, UnsupportedTypeException;
+
+    /**
      * Returns true if the member is {@link #isMemberModifiable(Object, String) modifiable} or
      * {@link #isMemberInsertable(Object, String) insertable}.
      *
@@ -1312,7 +1362,7 @@ public final class Interop {
      * Returns executable name of the receiver. Throws {@code UnsupportedMessageException} when the
      * receiver is has no {@link #hasExecutableName(Object) executable name}. The return value is an
      * interop value that is guaranteed to return <code>true</code> for {@link #isString(Object)}.
-     * 
+     *
      * <p>
      * The identity of the returned object is preserved, but its Java type is not necessarily
      * {@link String}. The returned value could be a string originated in a foreign language,
@@ -1320,7 +1370,7 @@ public final class Interop {
      *
      * <p>
      * To correctly convert to a Java {@link String} use {@link #asString(Object) Interop.asString}:
-     * 
+     *
      * <pre>
      * Object maybeForeign = Interop.getExecutableName(foreignObject);
      * assert Interop.isString(maybeForeign);
@@ -1360,4 +1410,560 @@ public final class Interop {
     public static native Object getDeclaringMetaObject(Object receiver) throws UnsupportedMessageException;
 
     // endregion StackFrame Messages
+
+    // region Buffer Messages
+
+    /**
+     * Returns {@code true} if the receiver may have buffer elements.
+     * <p>
+     * If this message returns {@code true}, then {@link #getBufferSize(Object)},
+     * {@link #readBufferByte(Object, long)}, {@link #readBufferShort(Object, ByteOrder, long)},
+     * {@link #readBufferInt(Object, ByteOrder, long)},
+     * {@link #readBufferLong(Object, ByteOrder, long)},
+     * {@link #readBufferFloat(Object, ByteOrder, long)} and
+     * {@link #readBufferDouble(Object, ByteOrder, long)} must not throw
+     * {@link UnsupportedMessageException}.
+     * <p>
+     * Invoking this message does not cause any observable side-effects.
+     * <p>
+     * By default, it returns {@code false}.
+     *
+     * @since 21.1
+     */
+    public static native boolean hasBufferElements(Object receiver);
+
+    /**
+     * Returns {@code true} if the receiver is a modifiable buffer.
+     * <p>
+     * If this message returns {@code true}, then {@link #getBufferSize(Object)},
+     * {@link #writeBufferByte(Object, long, byte)},
+     * {@link #writeBufferShort(Object, ByteOrder, long, short)},
+     * {@link #writeBufferInt(Object, ByteOrder, long, int)},
+     * {@link #writeBufferLong(Object, ByteOrder, long, long)},
+     * {@link #writeBufferFloat(Object, ByteOrder, long, float)} and
+     * {@link #writeBufferDouble(Object, ByteOrder, long, double)} must not throw
+     * {@link UnsupportedMessageException}.
+     * <p>
+     * Invoking this message does not cause any observable side-effects.
+     *
+     * @throws UnsupportedMessageException if and only if {@link #hasBufferElements(Object)} returns
+     *             {@code false}
+     * @since 21.1
+     */
+    public static native boolean isBufferWritable(Object receiver) throws UnsupportedMessageException;
+
+    /**
+     * Returns the buffer size of the receiver, in bytes.
+     * <p>
+     * Invoking this message does not cause any observable side-effects.
+     *
+     * @throws UnsupportedMessageException if and only if {@link #hasBufferElements(Object)} returns
+     *             {@code false}
+     * @since 21.1
+     */
+    public static native long getBufferSize(Object receiver) throws UnsupportedMessageException;
+
+    /**
+     * Reads bytes from the receiver object into the specified byte array.
+     * <p>
+     * The access is <em>not</em> guaranteed to be atomic. Therefore, this message is <em>not</em>
+     * thread-safe.
+     * <p>
+     * Invoking this message does not cause any observable side-effects.
+     *
+     * @param byteOffset offset in the buffer to start reading from.
+     * @param destination byte array to write the read bytes into.
+     * @param destinationOffset offset in the destination array to start writing from.
+     * @param length number of bytes to read.
+     * @throws InvalidBufferOffsetException if and only if
+     *             <code>byteOffset &lt; 0 || length &lt; 0 || byteOffset + length > </code>{@link #getBufferSize(Object)}
+     * @throws UnsupportedMessageException if and only if {@link #hasBufferElements(Object)} returns
+     *             {@code false}
+     * @since 24.0
+     */
+    public static native void readBuffer(Object receiver, long byteOffset, byte[] destination, int destinationOffset, int length) throws InvalidBufferOffsetException, UnsupportedMessageException;
+
+    /**
+     * Reads the byte from the receiver object at the given byte offset from the start of the
+     * buffer.
+     * <p>
+     * The access is <em>not</em> guaranteed to be atomic. Therefore, this message is <em>not</em>
+     * thread-safe.
+     * <p>
+     * Invoking this message does not cause any observable side-effects.
+     *
+     * @return the byte at the given index
+     * @throws InvalidBufferOffsetException if and only if
+     *             <code>byteOffset &lt; 0 || byteOffset >= </code>{@link #getBufferSize(Object)}
+     * @throws UnsupportedMessageException if and only if either {@link #hasBufferElements(Object)}
+     *             returns {@code false} returns {@code false}
+     * @since 21.1
+     */
+    public static native byte readBufferByte(Object receiver, long byteOffset) throws UnsupportedMessageException, InvalidBufferOffsetException;
+
+    /**
+     * Writes the given byte from the receiver object at the given byte offset from the start of the
+     * buffer.
+     * <p>
+     * The access is <em>not</em> guaranteed to be atomic. Therefore, this message is <em>not</em>
+     * thread-safe.
+     *
+     * @throws InvalidBufferOffsetException if and only if
+     *             <code>byteOffset &lt; 0 || byteOffset >= </code>{@link #getBufferSize(Object)}
+     * @throws UnsupportedMessageException if and only if either {@link #hasBufferElements(Object)}
+     *             or {@link #isBufferWritable} returns {@code false}
+     * @since 21.1
+     */
+    public static native void writeBufferByte(Object receiver, long byteOffset, byte value) throws UnsupportedMessageException, InvalidBufferOffsetException;
+
+    /**
+     * Reads the short from the receiver object in the given byte order at the given byte offset
+     * from the start of the buffer.
+     * <p>
+     * Unaligned accesses are supported.
+     * <p>
+     * The access is <em>not</em> guaranteed to be atomic. Therefore, this message is <em>not</em>
+     * thread-safe.
+     * <p>
+     * Invoking this message does not cause any observable side-effects.
+     *
+     * @return the short at the given byte offset from the start of the buffer
+     * @throws InvalidBufferOffsetException if and only if
+     *             <code>byteOffset &lt; 0 || byteOffset >= {@link #getBufferSize(Object)} - 1</code>
+     * @throws UnsupportedMessageException if and only if {@link #hasBufferElements(Object)} returns
+     *             {@code false}
+     * @since 21.1
+     */
+    public static native short readBufferShort(Object receiver, ByteOrder order, long byteOffset) throws UnsupportedMessageException, InvalidBufferOffsetException;
+
+    /**
+     * Writes the given short from the receiver object in the given byte order at the given byte
+     * offset from the start of the buffer.
+     * <p>
+     * Unaligned accesses are supported.
+     * <p>
+     * The access is <em>not</em> guaranteed to be atomic. Therefore, this message is <em>not</em>
+     * thread-safe.
+     *
+     * @throws InvalidBufferOffsetException if and only if
+     *             <code>byteOffset &lt; 0 || byteOffset >= {@link #getBufferSize(Object)} - 1</code>
+     * @throws UnsupportedMessageException if and only if either {@link #hasBufferElements(Object)}
+     *             or {@link #isBufferWritable} returns {@code false}
+     * @since 21.1
+     */
+    public static native void writeBufferShort(Object receiver, ByteOrder order, long byteOffset, short value) throws UnsupportedMessageException, InvalidBufferOffsetException;
+
+    /**
+     * Reads the int from the receiver object in the given byte order at the given byte offset from
+     * the start of the buffer.
+     * <p>
+     * Unaligned accesses are supported.
+     * <p>
+     * The access is <em>not</em> guaranteed to be atomic. Therefore, this message is <em>not</em>
+     * thread-safe.
+     * <p>
+     * Invoking this message does not cause any observable side-effects.
+     *
+     * @return the int at the given byte offset from the start of the buffer
+     * @throws InvalidBufferOffsetException if and only if
+     *             <code>byteOffset &lt; 0 || byteOffset >= {@link #getBufferSize(Object)} - 3</code>
+     * @throws UnsupportedMessageException if and only if {@link #hasBufferElements(Object)} returns
+     *             {@code false}
+     * @since 21.1
+     */
+    public static native int readBufferInt(Object receiver, ByteOrder order, long byteOffset) throws UnsupportedMessageException, InvalidBufferOffsetException;
+
+    /**
+     * Writes the given int from the receiver object in the given byte order at the given byte
+     * offset from the start of the buffer.
+     * <p>
+     * Unaligned accesses are supported.
+     * <p>
+     * The access is <em>not</em> guaranteed to be atomic. Therefore, this message is <em>not</em>
+     * thread-safe.
+     *
+     * @throws InvalidBufferOffsetException if and only if
+     *             <code>byteOffset &lt; 0 || byteOffset >= {@link #getBufferSize(Object)} - 3</code>
+     * @throws UnsupportedMessageException if and only if either {@link #hasBufferElements(Object)}
+     *             or {@link #isBufferWritable} returns {@code false}
+     * @since 21.1
+     */
+    public static native void writeBufferInt(Object receiver, ByteOrder order, long byteOffset, int value) throws UnsupportedMessageException, InvalidBufferOffsetException;
+
+    /**
+     * Reads the long from the receiver object in the given byte order at the given byte offset from
+     * the start of the buffer.
+     * <p>
+     * Unaligned accesses are supported.
+     * <p>
+     * The access is <em>not</em> guaranteed to be atomic. Therefore, this message is <em>not</em>
+     * thread-safe.
+     * <p>
+     * Invoking this message does not cause any observable side-effects.
+     *
+     * @return the int at the given byte offset from the start of the buffer
+     * @throws InvalidBufferOffsetException if and only if
+     *             <code>byteOffset &lt; 0 || byteOffset >= {@link #getBufferSize(Object)} - 7</code>
+     * @throws UnsupportedMessageException if and only if {@link #hasBufferElements(Object)} returns
+     *             {@code false}
+     * @since 21.1
+     */
+    public static native long readBufferLong(Object receiver, ByteOrder order, long byteOffset) throws UnsupportedMessageException, InvalidBufferOffsetException;
+
+    /**
+     * Writes the given long from the receiver object in the given byte order at the given byte
+     * offset from the start of the buffer.
+     * <p>
+     * Unaligned accesses are supported.
+     * <p>
+     * The access is <em>not</em> guaranteed to be atomic. Therefore, this message is <em>not</em>
+     * thread-safe.
+     *
+     * @throws InvalidBufferOffsetException if and only if
+     *             <code>byteOffset &lt; 0 || byteOffset >= {@link #getBufferSize(Object)} - 7</code>
+     * @throws UnsupportedMessageException if and only if either {@link #hasBufferElements(Object)}
+     *             or {@link #isBufferWritable} returns {@code false}
+     * @since 21.1
+     */
+    public static native void writeBufferLong(Object receiver, ByteOrder order, long byteOffset, long value) throws UnsupportedMessageException, InvalidBufferOffsetException;
+
+    /**
+     * Reads the float from the receiver object in the given byte order at the given byte offset
+     * from the start of the buffer.
+     * <p>
+     * Unaligned accesses are supported.
+     * <p>
+     * The access is <em>not</em> guaranteed to be atomic. Therefore, this message is <em>not</em>
+     * thread-safe.
+     * <p>
+     * Invoking this message does not cause any observable side-effects.
+     *
+     * @return the float at the given byte offset from the start of the buffer
+     * @throws InvalidBufferOffsetException if and only if
+     *             <code>byteOffset &lt; 0 || byteOffset >= {@link #getBufferSize(Object)} - 3</code>
+     * @throws UnsupportedMessageException if and only if {@link #hasBufferElements(Object)} returns
+     *             {@code false}
+     * @since 21.1
+     */
+    public static native float readBufferFloat(Object receiver, ByteOrder order, long byteOffset) throws UnsupportedMessageException, InvalidBufferOffsetException;
+
+    /**
+     * Writes the given float from the receiver object in the given byte order at the given byte
+     * offset from the start of the buffer.
+     * <p>
+     * Unaligned accesses are supported.
+     * <p>
+     * The access is <em>not</em> guaranteed to be atomic. Therefore, this message is <em>not</em>
+     * thread-safe.
+     *
+     * @throws InvalidBufferOffsetException if and only if
+     *             <code>byteOffset &lt; 0 || byteOffset >= {@link #getBufferSize(Object)} - 3</code>
+     * @throws UnsupportedMessageException if and only if either {@link #hasBufferElements(Object)}
+     *             or {@link #isBufferWritable} returns {@code false}
+     * @since 21.1
+     */
+    public static native void writeBufferFloat(Object receiver, ByteOrder order, long byteOffset, float value) throws UnsupportedMessageException, InvalidBufferOffsetException;
+
+    /**
+     * Reads the double from the receiver object in the given byte order at the given byte offset
+     * from the start of the buffer.
+     * <p>
+     * Unaligned accesses are supported.
+     * <p>
+     * The access is <em>not</em> guaranteed to be atomic. Therefore, this message is <em>not</em>
+     * thread-safe.
+     * <p>
+     * Invoking this message does not cause any observable side-effects.
+     *
+     * @return the double at the given byte offset from the start of the buffer
+     * @throws InvalidBufferOffsetException if and only if
+     *             <code>byteOffset &lt; 0 || byteOffset >= {@link #getBufferSize(Object)} - 7</code>
+     * @throws UnsupportedMessageException if and only if {@link #hasBufferElements(Object)} returns
+     *             {@code false}
+     * @since 21.1
+     */
+    public static native double readBufferDouble(Object receiver, ByteOrder order, long byteOffset) throws UnsupportedMessageException, InvalidBufferOffsetException;
+
+    /**
+     * Writes the given double from the receiver object in the given byte order at the given byte
+     * offset from the start of the buffer.
+     * <p>
+     * Unaligned accesses are supported.
+     * <p>
+     * The access is <em>not</em> guaranteed to be atomic. Therefore, this message is <em>not</em>
+     * thread-safe.
+     *
+     * @throws InvalidBufferOffsetException if and only if
+     *             <code>byteOffset &lt; 0 || byteOffset >= {@link #getBufferSize(Object)} - 7</code>
+     * @throws UnsupportedMessageException if and only if either {@link #hasBufferElements(Object)}
+     *             or {@link #isBufferWritable} returns {@code false}
+     * @since 21.1
+     */
+    public static native void writeBufferDouble(Object receiver, ByteOrder order, long byteOffset, double value) throws UnsupportedMessageException, InvalidBufferOffsetException;
+
+    // endregion Buffer Messages
+
+    // region Iterator Messages
+
+    /**
+     * Returns {@code true} if the receiver provides an iterator. For example, an array or a list
+     * provide an iterator over their content. Invoking this message does not cause any observable
+     * side-effects. By default returns {@code true} for receivers that have
+     * {@link #hasArrayElements(Object) array elements}.
+     *
+     * @see #getIterator(Object)
+     * @since 21.1
+     */
+    public static native boolean hasIterator(Object receiver);
+
+    /**
+     * Returns the iterator for the receiver. The return value is always an
+     * {@link #isIterator(Object) iterator}. Invoking this message does not cause any observable
+     * side-effects.
+     *
+     * @throws UnsupportedMessageException if and only if {@link #hasIterator(Object)} returns
+     *             {@code false} for the same receiver.
+     * @since 21.1
+     */
+    public static native Object getIterator(Object receiver) throws UnsupportedMessageException;
+
+    /**
+     * Returns {@code true} if the receiver represents an iterator. Invoking this message does not
+     * cause any observable side-effects. Returns {@code false} by default.
+     *
+     * @see #hasIterator(Object)
+     * @see #getIterator(Object)
+     * @since 21.1
+     */
+    public static native boolean isIterator(Object receiver);
+
+    /**
+     * Returns {@code true} if the receiver is an iterator which has more elements, else
+     * {@code false}. Multiple calls to the {@link #hasIteratorNextElement(Object)} might lead to
+     * different results if the underlying data structure is modified.
+     *
+     * @throws UnsupportedMessageException if and only if {@link #isIterator(Object)} returns
+     *             {@code false} for the same receiver.
+     * @see #isIterator(Object)
+     * @see #getIteratorNextElement(Object)
+     * @since 21.1
+     */
+    public static native boolean hasIteratorNextElement(Object receiver) throws UnsupportedMessageException;
+
+    /**
+     * Returns the next element in the iteration. When the underlying data structure is modified the
+     * {@link #getIteratorNextElement(Object)} may throw the {@link StopIterationException} despite
+     * the {@link #hasIteratorNextElement(Object)} returned {@code true}.
+     *
+     * @throws UnsupportedMessageException if {@link #isIterator(Object)} returns {@code false} for
+     *             the same receiver or when the underlying iterator element exists but is not
+     *             readable.
+     * @throws StopIterationException if the iteration has no more elements. Even if the
+     *             {@link StopIterationException} was thrown it might not be thrown again by a next
+     *             {@link #getIteratorNextElement(Object)} invocation on the same receiver due to a
+     *             modification of an underlying iterable.
+     *
+     * @see #isIterator(Object)
+     * @see #hasIteratorNextElement(Object)
+     * @since 21.1
+     */
+    public static native Object getIteratorNextElement(Object receiver) throws UnsupportedMessageException, StopIterationException;
+
+    // endregion Iterator Messages
+
+    // region Hash(Dictionary) Messages
+
+    /**
+     * Returns {@code true} if the receiver may have hash entries. Therefore, at least one of
+     * {@link #readHashValue(Object, Object)}, {@link #writeHashEntry(Object, Object, Object)},
+     * {@link #removeHashEntry(Object, Object)} must not throw {@link UnsupportedMessageException}.
+     * For example, the contents of a map data structure could be interpreted as hash elements.
+     * Invoking this message does not cause any observable side-effects. Returns {@code false} by
+     * default.
+     *
+     * @see #getHashEntriesIterator(Object)
+     * @see #getHashSize(Object)
+     * @see #isHashEntryReadable(Object, Object)
+     * @see #isHashEntryWritable(Object, Object)
+     * @see #isHashEntryInsertable(Object, Object)
+     * @see #isHashEntryRemovable(Object, Object)
+     * @see #readHashValue(Object, Object)
+     * @see #readHashValueOrDefault(Object, Object, Object)
+     * @see #writeHashEntry(Object, Object, Object)
+     * @see #removeHashEntry(Object, Object)
+     * @since 21.1
+     */
+    public static native boolean hasHashEntries(Object receiver);
+
+    /**
+     * Returns the number of receiver entries.
+     *
+     * @throws UnsupportedMessageException if and only if {@link #hasHashEntries(Object)} returns
+     *             {@code false}.
+     * @since 21.1
+     */
+    public static native long getHashSize(Object receiver) throws UnsupportedMessageException;
+
+    /**
+     * Returns {@code true} if mapping for the specified key exists and is
+     * {@link #readHashValue(Object, Object) readable}. This method may only return {@code true} if
+     * {@link #hasHashEntries(Object)} returns {@code true} as well and
+     * {@link #isHashEntryInsertable(Object, Object)} returns {@code false}. Invoking this message
+     * does not cause any observable side-effects. Returns {@code false} by default.
+     *
+     * @see #readHashValue(Object, Object)
+     * @since 21.1
+     */
+    public static native boolean isHashEntryReadable(Object receiver, Object key);
+
+    /**
+     * Reads the value for the specified key.
+     *
+     * @throws UnsupportedMessageException if the receiver does not support reading at all. An empty
+     *             receiver with no readable hash entries supports the read operation (even though
+     *             there is nothing to read), therefore it throws {@link UnknownKeyException} for
+     *             all arguments instead.
+     * @throws UnknownKeyException if mapping for the specified key is not
+     *             {@link #isHashEntryReadable(Object, Object) readable}, e.g. when the hash does
+     *             not contain specified key.
+     * @see #isHashEntryReadable(Object, Object)
+     * @see #readHashValueOrDefault(Object, Object, Object)
+     * @since 21.1
+     */
+    public static native Object readHashValue(Object receiver, Object key) throws UnsupportedMessageException, UnknownKeyException;
+
+    /**
+     * Reads the value for the specified key or returns the {@code defaultValue} when the mapping
+     * for the specified key does not exist or is not readable.
+     *
+     * @throws UnsupportedMessageException if the receiver does not support reading at all. An empty
+     *             receiver with no readable hash entries supports the read operation (even though
+     *             there is nothing to read), therefore it returns the {@code defaultValue} for all
+     *             arguments instead.
+     * @see #isHashEntryReadable(Object, Object)
+     * @see #readHashValue(Object, Object)
+     * @since 21.1
+     */
+    public static native Object readHashValueOrDefault(Object receiver, Object key, Object defaultValue) throws UnsupportedMessageException;
+
+    /**
+     * Returns {@code true} if mapping for the specified key exists and is
+     * {@link #writeHashEntry(Object, Object, Object) writable}. This method may only return
+     * {@code true} if {@link #hasHashEntries(Object)} returns {@code true} as well and
+     * {@link #isHashEntryInsertable(Object, Object)} returns {@code false}. Invoking this message
+     * does not cause any observable side-effects. Returns {@code false} by default.
+     *
+     * @see #writeHashEntry(Object, Object, Object)
+     * @since 21.1
+     */
+    public static native boolean isHashEntryModifiable(Object receiver, Object key);
+
+    /**
+     * Returns {@code true} if mapping for the specified key does not exist and is
+     * {@link #writeHashEntry(Object, Object, Object) writable}. This method may only return
+     * {@code true} if {@link #hasHashEntries(Object)} returns {@code true} as well and
+     * {@link #isHashEntryExisting(Object, Object)} returns {@code false}. Invoking this message
+     * does not cause any observable side-effects. Returns {@code false} by default.
+     *
+     * @see #writeHashEntry(Object, Object, Object)
+     * @since 21.1
+     */
+    public static native boolean isHashEntryInsertable(Object receiver, Object key);
+
+    /**
+     * Returns {@code true} if mapping for the specified key is
+     * {@link #isHashEntryModifiable(Object, Object) modifiable} or
+     * {@link #isHashEntryInsertable(Object, Object) insertable}.
+     *
+     * @since 21.1
+     */
+    public static native boolean isHashEntryWritable(Object receiver, Object key);
+
+    /**
+     * Associates the specified value with the specified key in the receiver. Writing the entry is
+     * allowed if is existing and {@link #isHashEntryModifiable(Object, Object) modifiable}, or not
+     * existing and {@link #isHashEntryInsertable(Object, Object) insertable}.
+     *
+     * @throws UnsupportedMessageException when the receiver does not support writing at all, e.g.
+     *             when it is immutable.
+     * @throws UnknownKeyException if mapping for the specified key is not
+     *             {@link #isHashEntryModifiable(Object, Object) modifiable} nor
+     *             {@link #isHashEntryInsertable(Object, Object) insertable}.
+     * @throws UnsupportedTypeException if the provided key type or value type is not allowed to be
+     *             written.
+     * @since 21.1
+     */
+    public static native void writeHashEntry(Object receiver, Object key, Object value) throws UnsupportedMessageException, UnknownKeyException, UnsupportedTypeException;
+
+    /**
+     * Returns {@code true} if mapping for the specified key exists and is removable. This method
+     * may only return {@code true} if {@link #hasHashEntries(Object)} returns {@code true} as well
+     * and {@link #isHashEntryInsertable(Object, Object)} returns {@code false}. Invoking this
+     * message does not cause any observable side-effects. Returns {@code false} by default.
+     *
+     * @see #removeHashEntry(Object, Object)
+     * @since 21.1
+     */
+    public static native boolean isHashEntryRemovable(Object receiver, Object key);
+
+    /**
+     * Removes the mapping for a given key from the receiver. Mapping removing is allowed if it is
+     * {@link #isHashEntryRemovable(Object, Object) removable}.
+     *
+     * @throws UnsupportedMessageException when the receiver does not support removing at all, e.g.
+     *             when it is immutable.
+     * @throws UnknownKeyException if the given mapping is not
+     *             {@link #isHashEntryRemovable(Object, Object) removable}, e.g. the receiver does
+     *             not have a mapping for given key.
+     * @see #isHashEntryRemovable(Object, Object)
+     * @since 21.1
+     */
+    public static native void removeHashEntry(Object receiver, Object key) throws UnsupportedMessageException, UnknownKeyException;
+
+    /**
+     * Returns {@code true} if mapping for a given key is existing. The mapping is existing if it is
+     * {@link #isHashEntryModifiable(Object, Object) modifiable},
+     * {@link #isHashEntryReadable(Object, Object) readable} or
+     * {@link #isHashEntryRemovable(Object, Object) removable}.
+     *
+     * @since 21.1
+     */
+    public static native boolean isHashEntryExisting(Object receiver, Object key);
+
+    /**
+     * Returns the hash entries iterator for the receiver. The return value is always an
+     * {@link #isIterator(Object) iterator} of {@link #hasArrayElements(Object) array} elements. The
+     * first array element is a key, the second array element is an associated value. Array returned
+     * by the iterator may be modifiable but detached from the hash, updating the array elements may
+     * not update the hash. So even if array elements are
+     * {@link #isArrayElementModifiable(Object, long) modifiable} always use
+     * {@link #writeHashEntry(Object, Object, Object)} to update the hash mapping.
+     *
+     * @throws UnsupportedMessageException if and only if {@link #hasHashEntries(Object)} returns
+     *             {@code false} for the same receiver.
+     * @since 21.1
+     */
+    public static native Object getHashEntriesIterator(Object receiver) throws UnsupportedMessageException;
+
+    /**
+     * Returns the hash keys iterator for the receiver. The return value is always an
+     * {@link #isIterator(Object) iterator}.
+     *
+     * @throws UnsupportedMessageException if and only if {@link #hasHashEntries(Object)} returns
+     *             {@code false} for the same receiver.
+     * @since 21.1
+     */
+    public static native Object getHashKeysIterator(Object receiver) throws UnsupportedMessageException;
+
+    /**
+     * Returns the hash values iterator for the receiver. The return value is always an
+     * {@link #isIterator(Object) iterator}.
+     *
+     * @throws UnsupportedMessageException if and only if {@link #hasHashEntries(Object)} returns
+     *             {@code false} for the same receiver.
+     * @since 21.1
+     */
+    public static native Object getHashValuesIterator(Object receiver) throws UnsupportedMessageException;
+
+    // endregion Hash(Dictionary) Messages
 }

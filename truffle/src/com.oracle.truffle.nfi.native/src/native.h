@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2017, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -39,7 +39,6 @@
  * SOFTWARE.
  */
 
-
 /*
  * This is the umbrella file to include all generated native header at once
  * Please use it instead of including individual files
@@ -52,5 +51,6 @@
 #include "com_oracle_truffle_nfi_backend_libffi_LibFFIContext.h"
 #include "com_oracle_truffle_nfi_backend_libffi_ClosureNativePointer.h"
 #include "com_oracle_truffle_nfi_backend_libffi_NativeString.h"
+#include "com_oracle_truffle_nfi_backend_libffi_NativeLibVersion.h"
 
 #endif

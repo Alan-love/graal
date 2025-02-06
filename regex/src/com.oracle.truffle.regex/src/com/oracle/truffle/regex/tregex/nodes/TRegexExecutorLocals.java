@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2022, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -41,39 +41,52 @@
 
 package com.oracle.truffle.regex.tregex.nodes;
 
+import com.oracle.truffle.api.nodes.LoopNode;
+import com.oracle.truffle.api.strings.TruffleString;
+import com.oracle.truffle.regex.RegexExecNode;
+
 /**
  * Base class for local variables used by an executor node called by a {@link TRegexExecNode}.
  */
 public abstract class TRegexExecutorLocals {
 
-    private final Object input;
+    private final TruffleString input;
     private final int fromIndex;
     private final int maxIndex;
+    private final int regionFrom;
+    private final int regionTo;
     private int index;
     private int nextIndex;
+    private int loopCount;
 
-    public TRegexExecutorLocals(Object input, int fromIndex, int maxIndex, int index) {
+    public TRegexExecutorLocals(TruffleString input, int fromIndex, int maxIndex, int regionFrom, int regionTo, int index) {
         this.input = input;
         this.fromIndex = fromIndex;
         this.maxIndex = maxIndex;
+        this.regionFrom = regionFrom;
+        this.regionTo = regionTo;
         this.index = index;
     }
 
     /**
-     * The {@code input} argument given to {@link TRegexExecNode#execute(Object, int)}.
+     * The {@code input} argument given to
+     * {@link RegexExecNode#execute(com.oracle.truffle.api.frame.VirtualFrame)}.
      *
-     * @return the {@code input} argument given to {@link TRegexExecNode#execute(Object, int)}.
+     * @return the {@code input} argument given to
+     *         {@link RegexExecNode#execute(com.oracle.truffle.api.frame.VirtualFrame)}.
      */
-    public Object getInput() {
+    public final TruffleString getInput() {
         return input;
     }
 
     /**
-     * The {@code fromIndex} argument given to {@link TRegexExecNode#execute(Object, int)}.
+     * The {@code fromIndex} argument given to
+     * {@link RegexExecNode#execute(com.oracle.truffle.api.frame.VirtualFrame)}.
      *
-     * @return the {@code fromIndex} argument given to {@link TRegexExecNode#execute(Object, int)}.
+     * @return the {@code fromIndex} argument given to
+     *         {@link RegexExecNode#execute(com.oracle.truffle.api.frame.VirtualFrame)}.
      */
-    public int getFromIndex() {
+    public final int getFromIndex() {
         return fromIndex;
     }
 
@@ -82,8 +95,16 @@ public abstract class TRegexExecutorLocals {
      *
      * @return the maximum index as given by the parent {@link TRegexExecNode}.
      */
-    public int getMaxIndex() {
+    public final int getMaxIndex() {
         return maxIndex;
+    }
+
+    public int getRegionFrom() {
+        return regionFrom;
+    }
+
+    public int getRegionTo() {
+        return regionTo;
     }
 
     /**
@@ -91,19 +112,25 @@ public abstract class TRegexExecutorLocals {
      *
      * @return the current index of {@link #getInput()} that is being processed.
      */
-    public int getIndex() {
+    public final int getIndex() {
         return index;
     }
 
-    public void setIndex(int index) {
+    public final void setIndex(int index) {
         this.index = index;
     }
 
-    public int getNextIndex() {
+    public final int getNextIndex() {
         return nextIndex;
     }
 
-    public void setNextIndex(int nextIndex) {
+    public final void setNextIndex(int nextIndex) {
         this.nextIndex = nextIndex;
+    }
+
+    public final void incLoopCount(TRegexExecutorNode executorNode) {
+        if (((++loopCount) & 0xffff) == 0) {
+            LoopNode.reportLoopCount(executorNode, 0x10000);
+        }
     }
 }

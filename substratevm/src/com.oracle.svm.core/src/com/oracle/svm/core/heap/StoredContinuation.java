@@ -24,10 +24,20 @@
  */
 package com.oracle.svm.core.heap;
 
+import org.graalvm.nativeimage.c.function.CodePointer;
+
+import com.oracle.svm.core.hub.Hybrid;
+
+import jdk.graal.compiler.word.Word;
+
 /**
- * This class is used for variably-sized objects that store continuation stack frames.
- *
- * For object layout and other implementation details, see {@link StoredContinuationImpl}.
+ * Persisted execution state of a yielded continuation, use via {@link StoredContinuationAccess}.
  */
+@Hybrid(componentType = Word.class)
 public final class StoredContinuation {
+    CodePointer ip;
+
+    /** Must be allocated via {@link StoredContinuationAccess}. */
+    private StoredContinuation() {
+    }
 }

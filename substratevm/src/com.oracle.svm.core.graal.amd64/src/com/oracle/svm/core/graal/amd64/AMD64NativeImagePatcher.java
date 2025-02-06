@@ -26,33 +26,24 @@ package com.oracle.svm.core.graal.amd64;
 
 import java.util.function.Consumer;
 
-import org.graalvm.compiler.asm.Assembler;
-import org.graalvm.compiler.asm.amd64.AMD64BaseAssembler.AddressDisplacementAnnotation;
-import org.graalvm.compiler.asm.amd64.AMD64BaseAssembler.OperandDataAnnotation;
-import org.graalvm.compiler.code.CompilationResult;
-import org.graalvm.nativeimage.ImageSingletons;
+import jdk.graal.compiler.asm.Assembler;
+import jdk.graal.compiler.asm.amd64.AMD64BaseAssembler.AddressDisplacementAnnotation;
+import jdk.graal.compiler.asm.amd64.AMD64BaseAssembler.OperandDataAnnotation;
+import jdk.graal.compiler.code.CompilationResult;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
-import org.graalvm.nativeimage.hosted.Feature;
 
-import com.oracle.svm.core.annotate.AutomaticFeature;
 import com.oracle.svm.core.graal.code.NativeImagePatcher;
 import com.oracle.svm.core.graal.code.PatchConsumerFactory;
+import com.oracle.svm.core.feature.AutomaticallyRegisteredImageSingleton;
 import com.oracle.svm.core.util.VMError;
 
-@AutomaticFeature
-@Platforms({Platform.AMD64.class})
-class AMD64NativeImagePatcherFeature implements Feature {
-    @Override
-    public void afterRegistration(AfterRegistrationAccess access) {
-        ImageSingletons.add(PatchConsumerFactory.NativePatchConsumerFactory.class, new AMD64NativePatchConsumerFactory());
-    }
-}
-
+@AutomaticallyRegisteredImageSingleton(PatchConsumerFactory.NativePatchConsumerFactory.class)
+@Platforms(Platform.AMD64.class)
 final class AMD64NativePatchConsumerFactory extends PatchConsumerFactory.NativePatchConsumerFactory {
     @Override
     public Consumer<Assembler.CodeAnnotation> newConsumer(CompilationResult compilationResult) {
-        return new Consumer<Assembler.CodeAnnotation>() {
+        return new Consumer<>() {
             @Override
             public void accept(Assembler.CodeAnnotation annotation) {
                 if (annotation instanceof OperandDataAnnotation) {
@@ -75,7 +66,7 @@ public class AMD64NativeImagePatcher extends CompilationResult.CodeAnnotation im
     }
 
     @Override
-    public void patchCode(int relative, byte[] code) {
+    public void patchCode(long methodStartAddress, int relative, byte[] code) {
         int curValue = relative - (annotation.nextInstructionPosition - annotation.instructionPosition);
 
         for (int i = 0; i < annotation.operandSize; i++) {

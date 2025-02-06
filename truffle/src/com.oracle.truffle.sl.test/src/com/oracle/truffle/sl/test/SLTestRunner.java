@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2012, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -65,6 +65,7 @@ import java.util.jar.JarEntry;
 import java.util.jar.JarFile;
 
 import org.graalvm.polyglot.Context;
+import org.graalvm.polyglot.HostAccess;
 import org.graalvm.polyglot.PolyglotException;
 import org.graalvm.polyglot.Source;
 import org.junit.Assert;
@@ -144,6 +145,11 @@ public class SLTestRunner extends ParentRunner<TestCase> {
         String[] optionsList = suite.options();
         for (int i = 0; i < optionsList.length; i += 2) {
             options.put(optionsList[i], optionsList[i + 1]);
+        }
+        if (TruffleTestAssumptions.isOptimizingRuntime() && c == SLTestSuiteBytecodeUncached.class) {
+            // The uncached interpreter compiles to a deopt. Disable compilation because compilation
+            // tests can time out due to lack of progress.
+            options.put("engine.Compilation", "false");
         }
 
         Class<?> testCaseDirectory = c;
@@ -301,9 +307,16 @@ public class SLTestRunner extends ParentRunner<TestCase> {
                 SLLanguage.installBuiltin(builtin);
             }
 
-            Context.Builder builder = Context.newBuilder().allowExperimentalOptions(true).in(new ByteArrayInputStream(testCase.testInput.getBytes("UTF-8"))).out(out);
+            Context.Builder builder = Context.newBuilder().allowExperimentalOptions(true).allowHostClassLookup((s) -> true).allowHostAccess(HostAccess.ALL).in(
+                            new ByteArrayInputStream(testCase.testInput.getBytes("UTF-8"))).out(out);
             for (Map.Entry<String, String> e : testCase.options.entrySet()) {
                 builder.option(e.getKey(), e.getValue());
+            }
+            boolean assertsOn = false;
+            assert !!(assertsOn = true);
+            if (!assertsOn) {
+                // Assertions are off, we need to turn off probe assertions.
+                builder.option("engine.AssertProbes", "false");
             }
             context = builder.build();
             PrintWriter printer = new PrintWriter(out);

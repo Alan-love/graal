@@ -24,12 +24,12 @@
  */
 package com.oracle.svm.core.graal.nodes;
 
-import org.graalvm.compiler.graph.NodeClass;
-import org.graalvm.compiler.nodeinfo.NodeInfo;
-import org.graalvm.compiler.replacements.nodes.ReflectionGetCallerClassNode;
-
 import com.oracle.svm.core.jdk.StackTraceUtils;
 
+import jdk.graal.compiler.graph.NodeClass;
+import jdk.graal.compiler.nodeinfo.NodeInfo;
+import jdk.graal.compiler.replacements.nodes.MacroNode.MacroParams;
+import jdk.graal.compiler.replacements.nodes.ReflectionGetCallerClassNode;
 import jdk.vm.ci.meta.MetaAccessProvider;
 import jdk.vm.ci.meta.ResolvedJavaMethod;
 
@@ -53,6 +53,6 @@ public final class SubstrateReflectionGetCallerClassNode extends ReflectionGetCa
 
     @Override
     protected boolean ignoredBySecurityStackWalk(MetaAccessProvider metaAccess, ResolvedJavaMethod method) {
-        return !StackTraceUtils.shouldShowFrame(metaAccess, method, true, false, false);
+        return StackTraceUtils.ignoredBySecurityStackWalk(metaAccess, method);
     }
 }

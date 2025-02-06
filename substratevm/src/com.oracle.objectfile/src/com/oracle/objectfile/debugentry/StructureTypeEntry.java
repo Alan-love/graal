@@ -26,14 +26,17 @@
 
 package com.oracle.objectfile.debugentry;
 
-import com.oracle.objectfile.debuginfo.DebugInfoProvider.DebugFieldInfo;
-import org.graalvm.compiler.debug.DebugContext;
-
 import java.lang.reflect.Modifier;
-import java.nio.file.Path;
-import java.util.LinkedList;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.stream.Stream;
+
+import com.oracle.objectfile.debuginfo.DebugInfoProvider;
+import com.oracle.objectfile.debuginfo.DebugInfoProvider.DebugFieldInfo;
+import com.oracle.objectfile.elf.dwarf.DwarfDebugInfo;
+
+import jdk.graal.compiler.debug.DebugContext;
+import jdk.vm.ci.meta.ResolvedJavaType;
 
 /**
  * An intermediate type that provides behaviour for managing fields. This unifies code for handling
@@ -43,15 +46,31 @@ public abstract class StructureTypeEntry extends TypeEntry {
     /**
      * Details of fields located in this instance.
      */
-    protected List<FieldEntry> fields;
+    protected final List<FieldEntry> fields;
+
+    /**
+     * The type signature of this types' layout. The layout of a type contains debug info of fields
+     * and methods of a type, which is needed for representing the class hierarchy. The super type
+     * entry in the debug info needs to directly contain the type info instead of a pointer.
+     */
+    protected long layoutTypeSignature;
 
     public StructureTypeEntry(String typeName, int size) {
         super(typeName, size);
-        this.fields = new LinkedList<>();
+        this.fields = new ArrayList<>();
+        this.layoutTypeSignature = 0;
+    }
+
+    public long getLayoutTypeSignature() {
+        return layoutTypeSignature;
     }
 
     public Stream<FieldEntry> fields() {
         return fields.stream();
+    }
+
+    public int fieldCount() {
+        return fields.size();
     }
 
     protected void processField(DebugFieldInfo debugFieldInfo, DebugInfoBase debugInfoBase, DebugContext debugContext) {
@@ -61,22 +80,23 @@ public abstract class StructureTypeEntry extends TypeEntry {
 
     protected FieldEntry addField(DebugFieldInfo debugFieldInfo, DebugInfoBase debugInfoBase, DebugContext debugContext) {
         String fieldName = debugInfoBase.uniqueDebugString(debugFieldInfo.name());
-        String valueTypeName = TypeEntry.canonicalize(debugFieldInfo.valueType());
+        ResolvedJavaType valueType = debugFieldInfo.valueType();
+        String valueTypeName = valueType.toJavaName();
         int fieldSize = debugFieldInfo.size();
         int fieldoffset = debugFieldInfo.offset();
+        boolean fieldIsEmbedded = debugFieldInfo.isEmbedded();
         int fieldModifiers = debugFieldInfo.modifiers();
-        debugContext.log("typename %s adding %s field %s type %s size %s at offset %d\n",
-                        typeName, memberModifiers(fieldModifiers), fieldName, valueTypeName, fieldSize, fieldoffset);
-        TypeEntry valueType = debugInfoBase.lookupTypeEntry(valueTypeName);
-        String fileName = debugFieldInfo.fileName();
-        Path filePath = debugFieldInfo.filePath();
-        Path cachePath = debugFieldInfo.cachePath();
+        if (debugContext.isLogEnabled()) {
+            debugContext.log("typename %s adding %s field %s type %s%s size %s at offset 0x%x%n",
+                            typeName, memberModifiers(fieldModifiers), fieldName, valueTypeName, (fieldIsEmbedded ? "(embedded)" : ""), fieldSize, fieldoffset);
+        }
+        TypeEntry valueTypeEntry = debugInfoBase.lookupTypeEntry(valueType);
         /*
          * n.b. the field file may differ from the owning class file when the field is a
          * substitution
          */
-        FileEntry fileEntry = debugInfoBase.ensureFileEntry(fileName, filePath, cachePath);
-        FieldEntry fieldEntry = new FieldEntry(fileEntry, fieldName, this, valueType, fieldSize, fieldoffset, fieldModifiers);
+        FileEntry fileEntry = debugInfoBase.ensureFileEntry(debugFieldInfo);
+        FieldEntry fieldEntry = new FieldEntry(fileEntry, fieldName, this, valueTypeEntry, fieldSize, fieldoffset, fieldIsEmbedded, fieldModifiers);
         fields.add(fieldEntry);
         return fieldEntry;
     }
@@ -112,5 +132,16 @@ public abstract class StructureTypeEntry extends TypeEntry {
         }
 
         return builder.toString();
+    }
+
+    @Override
+    public void addDebugInfo(@SuppressWarnings("unused") DebugInfoBase debugInfoBase, DebugInfoProvider.DebugTypeInfo debugTypeInfo, @SuppressWarnings("unused") DebugContext debugContext) {
+        super.addDebugInfo(debugInfoBase, debugTypeInfo, debugContext);
+        // header type does not have a separate layout type
+        if (this instanceof HeaderTypeEntry) {
+            this.layoutTypeSignature = typeSignature;
+        } else {
+            this.layoutTypeSignature = debugTypeInfo.typeSignature(DwarfDebugInfo.LAYOUT_PREFIX);
+        }
     }
 }

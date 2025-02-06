@@ -30,6 +30,7 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.function.BiConsumer;
 import java.util.function.Function;
@@ -38,8 +39,8 @@ import java.util.function.Supplier;
 import org.graalvm.polyglot.Context;
 import org.graalvm.polyglot.Engine;
 
-import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
 import com.oracle.truffle.api.CompilerDirectives;
+import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
 import com.oracle.truffle.api.TruffleLogger;
 import com.oracle.truffle.api.instrumentation.AllocationEvent;
 import com.oracle.truffle.api.instrumentation.AllocationEventFilter;
@@ -68,8 +69,8 @@ import com.oracle.truffle.tools.profiler.impl.ProfilerToolFactory;
  * <p>
  * NOTE: This profiler is still experimental with limited capabilities.
  * <p>
- * Usage example: {@codesnippet MemoryTracerSnippets#example}
- * </p>
+ * Usage example: {@snippet file = "com/oracle/truffle/tools/profiler/MemoryTracer.java" region =
+ * "MemoryTracerSnippets#example"}
  *
  * @since 0.30
  */
@@ -188,14 +189,14 @@ public final class MemoryTracer implements Closeable {
         return Collections.unmodifiableMap(returnValue);
     }
 
-    Supplier<Payload> payloadFactory = new Supplier<Payload>() {
+    Supplier<Payload> payloadFactory = new Supplier<>() {
         @Override
         public Payload get() {
             return new Payload();
         }
     };
 
-    Function<Payload, Payload> copyPayload = new Function<Payload, Payload>() {
+    Function<Payload, Payload> copyPayload = new Function<>() {
         @Override
         public Payload apply(Payload payload) {
             Payload copy = new Payload();
@@ -207,7 +208,7 @@ public final class MemoryTracer implements Closeable {
         }
     };
 
-    BiConsumer<Payload, Payload> mergePayload = new BiConsumer<Payload, Payload>() {
+    BiConsumer<Payload, Payload> mergePayload = new BiConsumer<>() {
         @Override
         public void accept(Payload source, Payload dest) {
             dest.totalAllocations += source.totalAllocations;
@@ -262,7 +263,7 @@ public final class MemoryTracer implements Closeable {
     public synchronized void setStackLimit(int stackLimit) {
         verifyConfigAllowed();
         if (stackLimit < 1) {
-            throw new ProfilerException(String.format("Invalid stack limit %s.", stackLimit));
+            throw new ProfilerException(String.format(Locale.ENGLISH, "Invalid stack limit %s.", stackLimit));
         }
         this.stackLimit = stackLimit;
     }
@@ -499,8 +500,8 @@ class MemoryTracerSnippets {
 
     @SuppressWarnings("unused")
     public void example() {
-        // @formatter:off
-        // BEGIN: MemoryTracerSnippets#example
+        // @formatter:off // @replace regex='.*' replacement=''
+        // @start region="MemoryTracerSnippets#example"
         Context context = Context.create();
 
         MemoryTracer tracer = MemoryTracer.find(context.getEngine());
@@ -515,7 +516,7 @@ class MemoryTracerSnippets {
             final String rootName = node.getRootName();
             final long allocCount = node.getPayload().getTotalAllocations();
         }
-        // END: MemoryTracerSnippets#example
-        // @formatter:on
+        // @end region="MemoryTracerSnippets#example"
+        // @formatter:on // @replace regex='.*' replacement=''
     }
 }

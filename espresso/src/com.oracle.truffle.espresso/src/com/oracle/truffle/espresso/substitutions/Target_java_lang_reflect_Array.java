@@ -27,13 +27,19 @@ import java.lang.reflect.Array;
 
 import com.oracle.truffle.api.CompilerDirectives;
 import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
-import com.oracle.truffle.espresso.descriptors.Types;
+import com.oracle.truffle.api.interop.InteropLibrary;
+import com.oracle.truffle.api.interop.InvalidArrayIndexException;
+import com.oracle.truffle.api.interop.UnsupportedMessageException;
+import com.oracle.truffle.api.interop.UnsupportedTypeException;
+import com.oracle.truffle.espresso.EspressoLanguage;
+import com.oracle.truffle.espresso.classfile.descriptors.TypeSymbols;
 import com.oracle.truffle.espresso.impl.ArrayKlass;
 import com.oracle.truffle.espresso.impl.Klass;
 import com.oracle.truffle.espresso.meta.EspressoError;
 import com.oracle.truffle.espresso.meta.Meta;
 import com.oracle.truffle.espresso.runtime.EspressoException;
-import com.oracle.truffle.espresso.runtime.StaticObject;
+import com.oracle.truffle.espresso.runtime.GuestAllocator.AllocationChecks;
+import com.oracle.truffle.espresso.runtime.staticobject.StaticObject;
 import com.oracle.truffle.espresso.vm.InterpreterToVM;
 
 @EspressoSubstitutions
@@ -63,7 +69,7 @@ public final class Target_java_lang_reflect_Array {
      * @exception NegativeArraySizeException if the specified {@code length} is negative
      */
     @Substitution
-    public static Object newArray(@Host(Class.class) StaticObject componentType, int length, @InjectMeta Meta meta) {
+    public static @JavaType(Object.class) StaticObject newArray(@JavaType(Class.class) StaticObject componentType, int length, @Inject Meta meta) {
         if (CompilerDirectives.isPartialEvaluationConstant(componentType)) {
             // PE-through.
             return newArrayImpl(componentType, length, meta);
@@ -72,23 +78,23 @@ public final class Target_java_lang_reflect_Array {
     }
 
     @TruffleBoundary(allowInlining = true)
-    static Object newArrayBoundary(@Host(Class.class) StaticObject componentType, int length, @InjectMeta Meta meta) {
+    static StaticObject newArrayBoundary(@JavaType(Class.class) StaticObject componentType, int length, @Inject Meta meta) {
         return newArrayImpl(componentType, length, meta);
     }
 
-    static Object newArrayImpl(@Host(Class.class) StaticObject componentType, int length, @InjectMeta Meta meta) {
+    static StaticObject newArrayImpl(@JavaType(Class.class) StaticObject componentType, int length, @Inject Meta meta) {
         if (StaticObject.isNull(componentType)) {
             throw meta.throwNullPointerException();
         }
-        Klass component = componentType.getMirrorKlass();
-        if (component == meta._void || Types.getArrayDimensions(component.getType()) >= 255) {
+        Klass component = componentType.getMirrorKlass(meta);
+        if (component == meta._void || TypeSymbols.getArrayDimensions(component.getType()) >= 255) {
             throw meta.throwException(meta.java_lang_IllegalArgumentException);
         }
+        AllocationChecks.checkCanAllocateArray(meta, length);
         if (component.isPrimitive()) {
-            byte jvmPrimitiveType = (byte) component.getJavaKind().getBasicType();
-            return InterpreterToVM.allocatePrimitiveArray(jvmPrimitiveType, length, meta);
+            return meta.getAllocator().createNewPrimitiveArray(component, length);
         }
-        return InterpreterToVM.newReferenceArray(component, length);
+        return meta.getAllocator().createNewReferenceArray(component, length);
     }
 
     /**
@@ -116,136 +122,244 @@ public final class Target_java_lang_reflect_Array {
      */
     @TruffleBoundary
     @Substitution
-    public static @Host(Object.class) StaticObject multiNewArray(@Host(Class.class) StaticObject componentType, @Host(int[].class) StaticObject dimensionsArray, @InjectMeta Meta meta) {
+    public static @JavaType(Object.class) StaticObject multiNewArray(@JavaType(Class.class) StaticObject componentType, @JavaType(int[].class) StaticObject dimensionsArray,
+                    @Inject EspressoLanguage language,
+                    @Inject Meta meta) {
         if (StaticObject.isNull(componentType) || StaticObject.isNull(dimensionsArray)) {
             throw meta.throwNullPointerException();
         }
-        Klass component = componentType.getMirrorKlass();
+        Klass component = componentType.getMirrorKlass(meta);
         if (component == meta._void || StaticObject.isNull(dimensionsArray)) {
             throw meta.throwException(meta.java_lang_IllegalArgumentException);
         }
-        final int[] dimensions = dimensionsArray.unwrap();
+        final int[] dimensions = dimensionsArray.unwrap(language);
         int finalDimensions = dimensions.length;
         if (component.isArray()) {
-            finalDimensions += Types.getArrayDimensions(component.getType());
+            finalDimensions += TypeSymbols.getArrayDimensions(component.getType());
         }
         if (dimensions.length == 0 || finalDimensions > 255) {
             throw meta.throwException(meta.java_lang_IllegalArgumentException);
         }
-        for (int d : dimensions) {
-            if (d < 0) {
-                throw meta.throwException(meta.java_lang_NegativeArraySizeException);
-            }
-        }
+        AllocationChecks.checkCanAllocateMultiArray(meta, component, dimensions);
         if (dimensions.length == 1) {
-            // getArrayClass(0) is undefined.
-            return meta.getInterpreterToVM().newMultiArray(component, dimensions);
+            return meta.getAllocator().createNewMultiArray(component, dimensions);
         }
-        return meta.getInterpreterToVM().newMultiArray(component.getArrayClass(dimensions.length - 1), dimensions);
+        return meta.getAllocator().createNewMultiArray(component.getArrayClass(dimensions.length - 1), dimensions);
     }
 
     @Substitution
-    public static boolean getBoolean(@Host(Object.class) StaticObject array, int index, @InjectMeta Meta meta,
-                    @InjectProfile SubstitutionProfiler profiler) {
+    public static boolean getBoolean(@JavaType(Object.class) StaticObject array, int index,
+                    @Inject EspressoLanguage language,
+                    @Inject Meta meta,
+                    @Inject SubstitutionProfiler profiler) {
         if (StaticObject.isNull(array)) {
             profiler.profile(0);
             throw meta.throwNullPointerException();
         }
         // `getBoolean` should only access boolean arrays
         Klass arrayKlass = array.getKlass();
-        if (arrayKlass != arrayKlass.getMeta()._boolean_array) {
+        if (arrayKlass != meta._boolean_array) {
             profiler.profile(1);
             throw meta.throwException(meta.java_lang_IllegalArgumentException);
         }
-        try {
-            return Array.getByte(array.unwrap(), index) != 0;
-        } catch (ArrayIndexOutOfBoundsException e) {
-            profiler.profile(5);
-            throw rethrowAsGuestException(e, meta, profiler);
+        if (array.isForeignObject()) {
+            try {
+                InteropLibrary library = InteropLibrary.getUncached();
+                return library.asBoolean(library.readArrayElement(array.rawForeignObject(language), index));
+            } catch (UnsupportedMessageException e) {
+                throw meta.throwException(meta.java_lang_IllegalArgumentException);
+            } catch (InvalidArrayIndexException e) {
+                throw meta.throwException(meta.java_lang_ArrayIndexOutOfBoundsException);
+            }
+        } else {
+            try {
+                return Array.getByte(array.unwrap(language), index) != 0;
+            } catch (ArrayIndexOutOfBoundsException e) {
+                profiler.profile(5);
+                throw rethrowAsGuestException(e, meta, profiler);
+            }
         }
     }
 
     @Substitution
-    public static byte getByte(@Host(Object.class) StaticObject array, int index, @InjectMeta Meta meta,
-                    @InjectProfile SubstitutionProfiler profiler) {
+    public static byte getByte(@JavaType(Object.class) StaticObject array, int index,
+                    @Inject EspressoLanguage language,
+                    @Inject Meta meta,
+                    @Inject SubstitutionProfiler profiler) {
         checkNonNullArray(array, meta, profiler);
-        try {
-            return Array.getByte(array.unwrap(), index);
-        } catch (NullPointerException | ArrayIndexOutOfBoundsException | IllegalArgumentException e) {
-            profiler.profile(5);
-            throw rethrowAsGuestException(e, meta, profiler);
+        if (array.isForeignObject()) {
+            try {
+                InteropLibrary library = InteropLibrary.getUncached();
+                return library.asByte(library.readArrayElement(array.rawForeignObject(language), index));
+            } catch (UnsupportedMessageException e) {
+                throw meta.throwException(meta.java_lang_IllegalArgumentException);
+            } catch (InvalidArrayIndexException e) {
+                throw meta.throwException(meta.java_lang_ArrayIndexOutOfBoundsException);
+            }
+        } else {
+            try {
+                return Array.getByte(array.unwrap(language), index);
+            } catch (NullPointerException | ArrayIndexOutOfBoundsException | IllegalArgumentException e) {
+                profiler.profile(5);
+                throw rethrowAsGuestException(e, meta, profiler);
+            }
         }
     }
 
     @Substitution
-    public static char getChar(@Host(Object.class) StaticObject array, int index, @InjectMeta Meta meta,
-                    @InjectProfile SubstitutionProfiler profiler) {
+    public static char getChar(@JavaType(Object.class) StaticObject array, int index,
+                    @Inject EspressoLanguage language,
+                    @Inject Meta meta,
+                    @Inject SubstitutionProfiler profiler) {
         checkNonNullArray(array, meta, profiler);
-        try {
-            return Array.getChar(array.unwrap(), index);
-        } catch (NullPointerException | ArrayIndexOutOfBoundsException | IllegalArgumentException e) {
-            profiler.profile(5);
-            throw rethrowAsGuestException(e, meta, profiler);
+        if (array.isForeignObject()) {
+            try {
+                InteropLibrary library = InteropLibrary.getUncached();
+                String str = library.asString(library.readArrayElement(array.rawForeignObject(language), index));
+                if (str.isEmpty()) {
+                    return '\u0000';
+                } else if (str.length() > 1) {
+                    throw meta.throwException(meta.java_lang_IllegalArgumentException);
+                } else {
+                    return str.charAt(0);
+                }
+            } catch (UnsupportedMessageException e) {
+                throw meta.throwException(meta.java_lang_IllegalArgumentException);
+            } catch (InvalidArrayIndexException e) {
+                throw meta.throwException(meta.java_lang_ArrayIndexOutOfBoundsException);
+            }
+        } else {
+            try {
+                return Array.getChar(array.unwrap(language), index);
+            } catch (NullPointerException | ArrayIndexOutOfBoundsException | IllegalArgumentException e) {
+                profiler.profile(5);
+                throw rethrowAsGuestException(e, meta, profiler);
+            }
         }
     }
 
     @Substitution
-    public static short getShort(@Host(Object.class) StaticObject array, int index, @InjectMeta Meta meta,
-                    @InjectProfile SubstitutionProfiler profiler) {
+    public static short getShort(@JavaType(Object.class) StaticObject array, int index,
+                    @Inject EspressoLanguage language,
+                    @Inject Meta meta,
+                    @Inject SubstitutionProfiler profiler) {
         checkNonNullArray(array, meta, profiler);
-        try {
-            return Array.getShort(array.unwrap(), index);
-        } catch (NullPointerException | ArrayIndexOutOfBoundsException | IllegalArgumentException e) {
-            profiler.profile(5);
-            throw rethrowAsGuestException(e, meta, profiler);
+        if (array.isForeignObject()) {
+            try {
+                InteropLibrary library = InteropLibrary.getUncached();
+                return library.asShort(library.readArrayElement(array.rawForeignObject(language), index));
+            } catch (UnsupportedMessageException e) {
+                throw meta.throwException(meta.java_lang_IllegalArgumentException);
+            } catch (InvalidArrayIndexException e) {
+                throw meta.throwException(meta.java_lang_ArrayIndexOutOfBoundsException);
+            }
+        } else {
+            try {
+                return Array.getShort(array.unwrap(language), index);
+            } catch (NullPointerException | ArrayIndexOutOfBoundsException | IllegalArgumentException e) {
+                profiler.profile(5);
+                throw rethrowAsGuestException(e, meta, profiler);
+            }
         }
     }
 
     @Substitution
-    public static int getInt(@Host(Object.class) StaticObject array, int index, @InjectMeta Meta meta,
-                    @InjectProfile SubstitutionProfiler profiler) {
+    public static int getInt(@JavaType(Object.class) StaticObject array, int index,
+                    @Inject EspressoLanguage language,
+                    @Inject Meta meta,
+                    @Inject SubstitutionProfiler profiler) {
         checkNonNullArray(array, meta, profiler);
-        try {
-            return Array.getInt(array.unwrap(), index);
-        } catch (NullPointerException | ArrayIndexOutOfBoundsException | IllegalArgumentException e) {
-            profiler.profile(5);
-            throw rethrowAsGuestException(e, meta, profiler);
+        if (array.isForeignObject()) {
+            try {
+                InteropLibrary library = InteropLibrary.getUncached();
+                return library.asInt(library.readArrayElement(array.rawForeignObject(language), index));
+            } catch (UnsupportedMessageException e) {
+                throw meta.throwException(meta.java_lang_IllegalArgumentException);
+            } catch (InvalidArrayIndexException e) {
+                throw meta.throwException(meta.java_lang_ArrayIndexOutOfBoundsException);
+            }
+        } else {
+            try {
+                return Array.getInt(array.unwrap(language), index);
+            } catch (NullPointerException | ArrayIndexOutOfBoundsException | IllegalArgumentException e) {
+                profiler.profile(5);
+                throw rethrowAsGuestException(e, meta, profiler);
+            }
         }
     }
 
     @Substitution
-    public static float getFloat(@Host(Object.class) StaticObject array, int index, @InjectMeta Meta meta,
-                    @InjectProfile SubstitutionProfiler profiler) {
+    public static float getFloat(@JavaType(Object.class) StaticObject array, int index,
+                    @Inject EspressoLanguage language,
+                    @Inject Meta meta,
+                    @Inject SubstitutionProfiler profiler) {
         checkNonNullArray(array, meta, profiler);
-        try {
-            return Array.getFloat(array.unwrap(), index);
-        } catch (NullPointerException | ArrayIndexOutOfBoundsException | IllegalArgumentException e) {
-            profiler.profile(5);
-            throw rethrowAsGuestException(e, meta, profiler);
+        if (array.isForeignObject()) {
+            try {
+                InteropLibrary library = InteropLibrary.getUncached();
+                return library.asFloat(library.readArrayElement(array.rawForeignObject(language), index));
+            } catch (UnsupportedMessageException e) {
+                throw meta.throwException(meta.java_lang_IllegalArgumentException);
+            } catch (InvalidArrayIndexException e) {
+                throw meta.throwException(meta.java_lang_ArrayIndexOutOfBoundsException);
+            }
+        } else {
+            try {
+                return Array.getFloat(array.unwrap(language), index);
+            } catch (NullPointerException | ArrayIndexOutOfBoundsException | IllegalArgumentException e) {
+                profiler.profile(5);
+                throw rethrowAsGuestException(e, meta, profiler);
+            }
         }
     }
 
     @Substitution
-    public static double getDouble(@Host(Object.class) StaticObject array, int index, @InjectMeta Meta meta,
-                    @InjectProfile SubstitutionProfiler profiler) {
+    public static double getDouble(@JavaType(Object.class) StaticObject array, int index,
+                    @Inject EspressoLanguage language,
+                    @Inject Meta meta,
+                    @Inject SubstitutionProfiler profiler) {
         checkNonNullArray(array, meta, profiler);
-        try {
-            return Array.getDouble(array.unwrap(), index);
-        } catch (NullPointerException | ArrayIndexOutOfBoundsException | IllegalArgumentException e) {
-            profiler.profile(5);
-            throw rethrowAsGuestException(e, meta, profiler);
+        if (array.isForeignObject()) {
+            try {
+                InteropLibrary library = InteropLibrary.getUncached();
+                return library.asDouble(library.readArrayElement(array.rawForeignObject(language), index));
+            } catch (UnsupportedMessageException e) {
+                throw meta.throwException(meta.java_lang_IllegalArgumentException);
+            } catch (InvalidArrayIndexException e) {
+                throw meta.throwException(meta.java_lang_ArrayIndexOutOfBoundsException);
+            }
+        } else {
+            try {
+                return Array.getDouble(array.unwrap(language), index);
+            } catch (NullPointerException | ArrayIndexOutOfBoundsException | IllegalArgumentException e) {
+                profiler.profile(5);
+                throw rethrowAsGuestException(e, meta, profiler);
+            }
         }
     }
 
     @Substitution
-    public static long getLong(@Host(Object.class) StaticObject array, int index, @InjectMeta Meta meta,
-                    @InjectProfile SubstitutionProfiler profiler) {
+    public static long getLong(@JavaType(Object.class) StaticObject array, int index,
+                    @Inject EspressoLanguage language,
+                    @Inject Meta meta,
+                    @Inject SubstitutionProfiler profiler) {
         checkNonNullArray(array, meta, profiler);
-        try {
-            return Array.getLong(array.unwrap(), index);
-        } catch (NullPointerException | ArrayIndexOutOfBoundsException | IllegalArgumentException e) {
-            profiler.profile(5);
-            throw rethrowAsGuestException(e, meta, profiler);
+        if (array.isForeignObject()) {
+            try {
+                InteropLibrary library = InteropLibrary.getUncached();
+                return library.asLong(library.readArrayElement(array.rawForeignObject(language), index));
+            } catch (UnsupportedMessageException e) {
+                throw meta.throwException(meta.java_lang_IllegalArgumentException);
+            } catch (InvalidArrayIndexException e) {
+                throw meta.throwException(meta.java_lang_ArrayIndexOutOfBoundsException);
+            }
+        } else {
+            try {
+                return Array.getLong(array.unwrap(language), index);
+            } catch (NullPointerException | ArrayIndexOutOfBoundsException | IllegalArgumentException e) {
+                profiler.profile(5);
+                throw rethrowAsGuestException(e, meta, profiler);
+            }
         }
     }
 
@@ -263,6 +377,7 @@ public final class Target_java_lang_reflect_Array {
             profiler.profile(4);
             throw meta.throwExceptionWithMessage(meta.java_lang_IllegalArgumentException, getMessageBoundary(e));
         }
+        CompilerDirectives.transferToInterpreterAndInvalidate();
         throw EspressoError.shouldNotReachHere(e);
     }
 
@@ -284,8 +399,10 @@ public final class Target_java_lang_reflect_Array {
     }
 
     @Substitution
-    public static void setBoolean(@Host(Object.class) StaticObject array, int index, boolean value, @InjectMeta Meta meta,
-                    @InjectProfile SubstitutionProfiler profiler) {
+    public static void setBoolean(@JavaType(Object.class) StaticObject array, int index, boolean value,
+                    @Inject EspressoLanguage language,
+                    @Inject Meta meta,
+                    @Inject SubstitutionProfiler profiler) {
         if (StaticObject.isNull(array)) {
             profiler.profile(0);
             throw meta.throwNullPointerException();
@@ -293,99 +410,156 @@ public final class Target_java_lang_reflect_Array {
         // host `setByte` can write in all primitive arrays beside boolean array
         // `setBoolean` should only access boolean arrays
         Klass arrayKlass = array.getKlass();
-        if (arrayKlass != arrayKlass.getMeta()._boolean_array) {
+        if (arrayKlass != meta._boolean_array) {
             profiler.profile(1);
             throw meta.throwException(meta.java_lang_IllegalArgumentException);
         }
-        try {
-            Array.setByte(array.unwrap(), index, value ? (byte) 1 : (byte) 0);
-        } catch (ArrayIndexOutOfBoundsException e) {
-            profiler.profile(5);
-            throw rethrowAsGuestException(e, meta, profiler);
+        if (array.isForeignObject()) {
+            writeForeignArrayElement(array, language, index, value, meta);
+        } else {
+            try {
+                Array.setByte(array.unwrap(language), index, value ? (byte) 1 : (byte) 0);
+            } catch (ArrayIndexOutOfBoundsException e) {
+                profiler.profile(5);
+                throw rethrowAsGuestException(e, meta, profiler);
+            }
         }
     }
 
     @Substitution
-    public static void setByte(@Host(Object.class) StaticObject array, int index, byte value, @InjectMeta Meta meta,
-                    @InjectProfile SubstitutionProfiler profiler) {
+    public static void setByte(@JavaType(Object.class) StaticObject array, int index, byte value,
+                    @Inject EspressoLanguage language,
+                    @Inject Meta meta,
+                    @Inject SubstitutionProfiler profiler) {
         checkNonNullArray(array, meta, profiler);
-        try {
-            Array.setByte(array.unwrap(), index, value);
-        } catch (NullPointerException | ArrayIndexOutOfBoundsException | IllegalArgumentException e) {
-            profiler.profile(5);
-            throw rethrowAsGuestException(e, meta, profiler);
+        if (array.isForeignObject()) {
+            writeForeignArrayElement(array, language, index, value, meta);
+        } else {
+            try {
+                Array.setByte(array.unwrap(language), index, value);
+            } catch (NullPointerException | ArrayIndexOutOfBoundsException | IllegalArgumentException e) {
+                profiler.profile(5);
+                throw rethrowAsGuestException(e, meta, profiler);
+            }
         }
     }
 
     @Substitution
-    public static void setChar(@Host(Object.class) StaticObject array, int index, char value, @InjectMeta Meta meta,
-                    @InjectProfile SubstitutionProfiler profiler) {
+    public static void setChar(@JavaType(Object.class) StaticObject array, int index, char value,
+                    @Inject EspressoLanguage language,
+                    @Inject Meta meta,
+                    @Inject SubstitutionProfiler profiler) {
         checkNonNullArray(array, meta, profiler);
-        try {
-            Array.setChar(array.unwrap(), index, value);
-        } catch (NullPointerException | ArrayIndexOutOfBoundsException | IllegalArgumentException e) {
-            profiler.profile(5);
-            throw rethrowAsGuestException(e, meta, profiler);
+        if (array.isForeignObject()) {
+            writeForeignArrayElement(array, language, index, value, meta);
+        } else {
+            try {
+                Array.setChar(array.unwrap(language), index, value);
+            } catch (NullPointerException | ArrayIndexOutOfBoundsException | IllegalArgumentException e) {
+                profiler.profile(5);
+                throw rethrowAsGuestException(e, meta, profiler);
+            }
         }
     }
 
     @Substitution
-    public static void setShort(@Host(Object.class) StaticObject array, int index, short value, @InjectMeta Meta meta,
-                    @InjectProfile SubstitutionProfiler profiler) {
+    public static void setShort(@JavaType(Object.class) StaticObject array, int index, short value,
+                    @Inject EspressoLanguage language,
+                    @Inject Meta meta,
+                    @Inject SubstitutionProfiler profiler) {
         checkNonNullArray(array, meta, profiler);
-        try {
-            Array.setShort(array.unwrap(), index, value);
-        } catch (NullPointerException | ArrayIndexOutOfBoundsException | IllegalArgumentException e) {
-            profiler.profile(5);
-            throw rethrowAsGuestException(e, meta, profiler);
+        if (array.isForeignObject()) {
+            writeForeignArrayElement(array, language, index, value, meta);
+        } else {
+            try {
+                Array.setShort(array.unwrap(language), index, value);
+            } catch (NullPointerException | ArrayIndexOutOfBoundsException | IllegalArgumentException e) {
+                profiler.profile(5);
+                throw rethrowAsGuestException(e, meta, profiler);
+            }
         }
     }
 
     @Substitution
-    public static void setInt(@Host(Object.class) StaticObject array, int index, int value, @InjectMeta Meta meta,
-                    @InjectProfile SubstitutionProfiler profiler) {
+    public static void setInt(@JavaType(Object.class) StaticObject array, int index, int value,
+                    @Inject EspressoLanguage language,
+                    @Inject Meta meta,
+                    @Inject SubstitutionProfiler profiler) {
         checkNonNullArray(array, meta, profiler);
-        try {
-            Array.setInt(array.unwrap(), index, value);
-        } catch (NullPointerException | ArrayIndexOutOfBoundsException | IllegalArgumentException e) {
-            profiler.profile(5);
-            throw rethrowAsGuestException(e, meta, profiler);
+        if (array.isForeignObject()) {
+            writeForeignArrayElement(array, language, index, value, meta);
+        } else {
+            try {
+                Array.setInt(array.unwrap(language), index, value);
+            } catch (NullPointerException | ArrayIndexOutOfBoundsException | IllegalArgumentException e) {
+                profiler.profile(5);
+                throw rethrowAsGuestException(e, meta, profiler);
+            }
         }
     }
 
     @Substitution
-    public static void setFloat(@Host(Object.class) StaticObject array, int index, float value, @InjectMeta Meta meta,
-                    @InjectProfile SubstitutionProfiler profiler) {
+    public static void setFloat(@JavaType(Object.class) StaticObject array, int index, float value,
+                    @Inject EspressoLanguage language,
+                    @Inject Meta meta,
+                    @Inject SubstitutionProfiler profiler) {
         checkNonNullArray(array, meta, profiler);
-        try {
-            Array.setFloat(array.unwrap(), index, value);
-        } catch (NullPointerException | ArrayIndexOutOfBoundsException | IllegalArgumentException e) {
-            profiler.profile(5);
-            throw rethrowAsGuestException(e, meta, profiler);
+        if (array.isForeignObject()) {
+            writeForeignArrayElement(array, language, index, value, meta);
+        } else {
+            try {
+                Array.setFloat(array.unwrap(language), index, value);
+            } catch (NullPointerException | ArrayIndexOutOfBoundsException | IllegalArgumentException e) {
+                profiler.profile(5);
+                throw rethrowAsGuestException(e, meta, profiler);
+            }
         }
     }
 
     @Substitution
-    public static void setDouble(@Host(Object.class) StaticObject array, int index, double value, @InjectMeta Meta meta,
-                    @InjectProfile SubstitutionProfiler profiler) {
+    public static void setDouble(@JavaType(Object.class) StaticObject array, int index, double value,
+                    @Inject EspressoLanguage language,
+                    @Inject Meta meta,
+                    @Inject SubstitutionProfiler profiler) {
         checkNonNullArray(array, meta, profiler);
-        try {
-            Array.setDouble(array.unwrap(), index, value);
-        } catch (NullPointerException | ArrayIndexOutOfBoundsException | IllegalArgumentException e) {
-            profiler.profile(5);
-            throw rethrowAsGuestException(e, meta, profiler);
+        if (array.isForeignObject()) {
+            writeForeignArrayElement(array, language, index, value, meta);
+        } else {
+            try {
+                Array.setDouble(array.unwrap(language), index, value);
+            } catch (NullPointerException | ArrayIndexOutOfBoundsException | IllegalArgumentException e) {
+                profiler.profile(5);
+                throw rethrowAsGuestException(e, meta, profiler);
+            }
         }
     }
 
     @Substitution
-    public static void setLong(@Host(Object.class) StaticObject array, int index, long value, @InjectMeta Meta meta,
-                    @InjectProfile SubstitutionProfiler profiler) {
+    public static void setLong(@JavaType(Object.class) StaticObject array, int index, long value,
+                    @Inject EspressoLanguage language,
+                    @Inject Meta meta,
+                    @Inject SubstitutionProfiler profiler) {
         checkNonNullArray(array, meta, profiler);
+        if (array.isForeignObject()) {
+            writeForeignArrayElement(array, language, index, value, meta);
+        } else {
+            try {
+                Array.setLong(array.unwrap(language), index, value);
+            } catch (NullPointerException | ArrayIndexOutOfBoundsException | IllegalArgumentException e) {
+                profiler.profile(5);
+                throw rethrowAsGuestException(e, meta, profiler);
+            }
+        }
+    }
+
+    private static void writeForeignArrayElement(StaticObject array, EspressoLanguage language, int index, Object value, Meta meta) {
         try {
-            Array.setLong(array.unwrap(), index, value);
-        } catch (NullPointerException | ArrayIndexOutOfBoundsException | IllegalArgumentException e) {
-            profiler.profile(5);
-            throw rethrowAsGuestException(e, meta, profiler);
+            InteropLibrary library = InteropLibrary.getUncached();
+            library.writeArrayElement(array.rawForeignObject(language), index, value);
+        } catch (UnsupportedMessageException | UnsupportedTypeException e) {
+            throw meta.throwException(meta.java_lang_IllegalArgumentException);
+        } catch (InvalidArrayIndexException e) {
+            throw meta.throwException(meta.java_lang_ArrayIndexOutOfBoundsException);
         }
     }
 
@@ -405,24 +579,37 @@ public final class Target_java_lang_reflect_Array {
      *                array
      */
     @Substitution
-    public static void set(@Host(Object.class) StaticObject array, int index, @Host(Object.class) StaticObject value, @InjectMeta Meta meta) {
+    public static void set(@JavaType(Object.class) StaticObject array, int index, @JavaType(Object.class) StaticObject value,
+                    @Inject EspressoLanguage language,
+                    @Inject Meta meta) {
         InterpreterToVM vm = meta.getInterpreterToVM();
         if (StaticObject.isNull(array)) {
             throw meta.throwNullPointerException();
         }
         if (array.isArray()) {
-            // @formatter:off
             Object widenValue = Target_sun_reflect_NativeMethodAccessorImpl.checkAndWiden(meta, value, ((ArrayKlass) array.getKlass()).getComponentType());
+            if (array.isForeignObject()) {
+                try {
+                    InteropLibrary library = InteropLibrary.getUncached();
+                    library.writeArrayElement(array.rawForeignObject(language), index, widenValue);
+                    return;
+                } catch (UnsupportedMessageException | UnsupportedTypeException e) {
+                    throw meta.throwException(meta.java_lang_IllegalArgumentException);
+                } catch (InvalidArrayIndexException e) {
+                    throw meta.throwException(meta.java_lang_ArrayIndexOutOfBoundsException);
+                }
+            }
+            // @formatter:off
             switch (((ArrayKlass) array.getKlass()).getComponentType().getJavaKind()) {
-                case Boolean : vm.setArrayByte(((boolean) widenValue) ? (byte) 1 : (byte) 0, index, array); break;
-                case Byte    : vm.setArrayByte(((byte) widenValue), index, array);       break;
-                case Short   : vm.setArrayShort(((short) widenValue), index, array);     break;
-                case Char    : vm.setArrayChar(((char) widenValue), index, array);  break;
-                case Int     : vm.setArrayInt(((int) widenValue), index, array);     break;
-                case Float   : vm.setArrayFloat(((float) widenValue), index, array);     break;
-                case Long    : vm.setArrayLong(((long) widenValue), index, array);       break;
-                case Double  : vm.setArrayDouble(((double) widenValue), index, array);   break;
-                case Object  : vm.setArrayObject(value, index, array); break;
+                case Boolean : vm.setArrayByte(language, ((boolean) widenValue) ? (byte) 1 : (byte) 0, index, array); break;
+                case Byte    : vm.setArrayByte(language, ((byte) widenValue), index, array); break;
+                case Short   : vm.setArrayShort(language, ((short) widenValue), index, array); break;
+                case Char    : vm.setArrayChar(language, ((char) widenValue), index, array); break;
+                case Int     : vm.setArrayInt(language, ((int) widenValue), index, array); break;
+                case Float   : vm.setArrayFloat(language, ((float) widenValue), index, array); break;
+                case Long    : vm.setArrayLong(language, ((long) widenValue), index, array); break;
+                case Double  : vm.setArrayDouble(language, ((double) widenValue), index, array); break;
+                case Object  : vm.setArrayObject(language, value, index, array); break;
                 default      :
                     CompilerDirectives.transferToInterpreter();
                     throw EspressoError.shouldNotReachHere("invalid array type: " + array);
@@ -447,31 +634,139 @@ public final class Target_java_lang_reflect_Array {
      *                array
      */
     @Substitution
-    public static @Host(Object.class) StaticObject get(@Host(Object.class) StaticObject array, int index, @InjectMeta Meta meta) {
+    public static @JavaType(Object.class) StaticObject get(@JavaType(Object.class) StaticObject array, int index,
+                    @Inject EspressoLanguage language,
+                    @Inject Meta meta) {
         InterpreterToVM vm = meta.getInterpreterToVM();
         if (StaticObject.isNull(array)) {
             throw meta.throwNullPointerException();
         }
         if (array.isArray()) {
-            // @formatter:off
-            switch (((ArrayKlass) array.getKlass()).getComponentType().getJavaKind()) {
-                case Boolean : return meta.boxBoolean(vm.getArrayByte(index, array) != 0);
-                case Byte    : return meta.boxByte(vm.getArrayByte(index, array));
-                case Short   : return meta.boxShort(vm.getArrayShort(index, array));
-                case Char    : return meta.boxCharacter(vm.getArrayChar(index, array));
-                case Int     : return meta.boxInteger(vm.getArrayInt(index, array));
-                case Float   : return meta.boxFloat(vm.getArrayFloat(index, array));
-                case Long    : return meta.boxLong(vm.getArrayLong(index, array));
-                case Double  : return meta.boxDouble(vm.getArrayDouble(index, array));
-                case Object  : return vm.getArrayObject(index, array);
-                default      :
-                    CompilerDirectives.transferToInterpreter();
-                    throw EspressoError.shouldNotReachHere("invalid array type: " + array);
+            try {
+                switch (((ArrayKlass) array.getKlass()).getComponentType().getJavaKind()) {
+                    case Boolean: {
+                        boolean result;
+                        if (array.isForeignObject()) {
+                            InteropLibrary library = InteropLibrary.getUncached();
+                            result = library.asBoolean(library.readArrayElement(array.rawForeignObject(language), index));
+                        } else {
+                            result = vm.getArrayByte(language, index, array) != 0;
+                        }
+                        return meta.boxBoolean(result);
+                    }
+                    case Byte: {
+                        byte result;
+                        if (array.isForeignObject()) {
+                            InteropLibrary library = InteropLibrary.getUncached();
+                            result = library.asByte(library.readArrayElement(array.rawForeignObject(language), index));
+                        } else {
+                            result = vm.getArrayByte(language, index, array);
+                        }
+                        return meta.boxByte(result);
+                    }
+                    case Short: {
+                        short result;
+                        if (array.isForeignObject()) {
+                            InteropLibrary library = InteropLibrary.getUncached();
+                            result = library.asShort(library.readArrayElement(array.rawForeignObject(language), index));
+                        } else {
+                            result = vm.getArrayShort(language, index, array);
+                        }
+                        return meta.boxShort(result);
+                    }
+                    case Char: {
+                        char result;
+                        if (array.isForeignObject()) {
+                            InteropLibrary library = InteropLibrary.getUncached();
+                            String str = library.asString(library.readArrayElement(array.rawForeignObject(language), index));
+                            if (str.isEmpty()) {
+                                result = '\u0000';
+                            } else if (str.length() > 1) {
+                                throw meta.throwException(meta.java_lang_IllegalArgumentException);
+                            } else {
+                                result = str.charAt(0);
+                            }
+                        } else {
+                            result = vm.getArrayChar(language, index, array);
+                        }
+                        return meta.boxCharacter(result);
+                    }
+                    case Int: {
+                        int result;
+                        if (array.isForeignObject()) {
+                            InteropLibrary library = InteropLibrary.getUncached();
+                            result = library.asInt(library.readArrayElement(array.rawForeignObject(language), index));
+                        } else {
+                            result = vm.getArrayInt(language, index, array);
+                        }
+                        return meta.boxInteger(result);
+                    }
+                    case Float: {
+                        float result;
+                        if (array.isForeignObject()) {
+                            InteropLibrary library = InteropLibrary.getUncached();
+                            result = library.asFloat(library.readArrayElement(array.rawForeignObject(language), index));
+                        } else {
+                            result = vm.getArrayFloat(language, index, array);
+                        }
+                        return meta.boxFloat(result);
+                    }
+                    case Long: {
+                        long result;
+                        if (array.isForeignObject()) {
+                            InteropLibrary library = InteropLibrary.getUncached();
+                            result = library.asLong(library.readArrayElement(array.rawForeignObject(language), index));
+                        } else {
+                            result = vm.getArrayLong(language, index, array);
+                        }
+                        return meta.boxLong(result);
+                    }
+                    case Double: {
+                        double result;
+                        if (array.isForeignObject()) {
+                            InteropLibrary library = InteropLibrary.getUncached();
+                            result = library.asDouble(library.readArrayElement(array.rawForeignObject(language), index));
+                        } else {
+                            result = vm.getArrayDouble(language, index, array);
+                        }
+                        return meta.boxDouble(result);
+                    }
+                    case Object: {
+                        if (array.isForeignObject()) {
+                            InteropLibrary library = InteropLibrary.getUncached();
+                            Object result = library.readArrayElement(array.rawForeignObject(language), index);
+                            return StaticObject.createForeign(language, meta.java_lang_Object, result, InteropLibrary.getUncached(result));
+                        } else {
+                            return vm.getArrayObject(language, index, array);
+                        }
+                    }
+                    default:
+                        CompilerDirectives.transferToInterpreter();
+                        throw EspressoError.shouldNotReachHere("invalid array type: " + array);
+                }
+            } catch (UnsupportedMessageException e) {
+                throw meta.throwException(meta.java_lang_IllegalArgumentException);
+            } catch (InvalidArrayIndexException e) {
+                int length = getForeignArrayLength(array, language, meta);
+                throw meta.throwExceptionWithMessage(meta.java_lang_ArrayIndexOutOfBoundsException, InterpreterToVM.outOfBoundsMessage(index, length));
             }
-            // @formatter:on
         } else {
             throw meta.throwException(meta.java_lang_IllegalArgumentException);
         }
     }
 
+    private static int getForeignArrayLength(StaticObject array, EspressoLanguage language, Meta meta) {
+        assert array.isForeignObject();
+        try {
+            Object foreignObject = array.rawForeignObject(language);
+            InteropLibrary library = InteropLibrary.getUncached(foreignObject);
+            long arrayLength = library.getArraySize(foreignObject);
+            if (arrayLength > Integer.MAX_VALUE) {
+                return Integer.MAX_VALUE;
+            }
+            return (int) arrayLength;
+        } catch (UnsupportedMessageException e) {
+            throw meta.throwExceptionWithMessage(meta.java_lang_IllegalArgumentException, "can't get array length because foreign object is not an array");
+        }
+    }
 }

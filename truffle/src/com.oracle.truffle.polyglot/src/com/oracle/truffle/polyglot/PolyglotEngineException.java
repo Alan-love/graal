@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2020, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -40,12 +40,11 @@
  */
 package com.oracle.truffle.polyglot;
 
-import com.oracle.truffle.api.TruffleLanguage;
-import com.oracle.truffle.api.TruffleLanguage.Env;
-import org.graalvm.polyglot.Context;
-
 import java.util.ConcurrentModificationException;
 import java.util.NoSuchElementException;
+
+import com.oracle.truffle.api.TruffleLanguage;
+import com.oracle.truffle.api.TruffleLanguage.Env;
 
 /**
  * Represents an expected user exception caused by the polyglot engine. It is wrapped such that it
@@ -98,16 +97,16 @@ import java.util.NoSuchElementException;
 final class PolyglotEngineException extends RuntimeException {
 
     final RuntimeException e;
-    final boolean closingContext;
+    final boolean closedException;
 
-    private PolyglotEngineException(RuntimeException e) {
+    PolyglotEngineException(RuntimeException e) {
         this(e, false);
     }
 
-    private PolyglotEngineException(RuntimeException e, boolean closingContext) {
+    PolyglotEngineException(RuntimeException e, boolean closedException) {
         super(null, e);
         this.e = e;
-        this.closingContext = closingContext;
+        this.closedException = closedException;
     }
 
     @SuppressWarnings("sync-override")
@@ -130,12 +129,16 @@ final class PolyglotEngineException extends RuntimeException {
         return new PolyglotEngineException(new IllegalArgumentException(message));
     }
 
+    static PolyglotEngineException illegalArgument(String message, RuntimeException e) {
+        return new PolyglotEngineException(new IllegalArgumentException(message, e));
+    }
+
     static PolyglotEngineException illegalState(String message) {
         return new PolyglotEngineException(new IllegalStateException(message));
     }
 
-    static PolyglotEngineException illegalState(String message, boolean closingContext) {
-        return new PolyglotEngineException(new IllegalStateException(message), closingContext);
+    static PolyglotEngineException closedException(String message) {
+        return new PolyglotEngineException(new IllegalStateException(message), true);
     }
 
     static PolyglotEngineException nullPointer(String message) {

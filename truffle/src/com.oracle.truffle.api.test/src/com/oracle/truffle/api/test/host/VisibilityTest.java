@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2017, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -41,12 +41,14 @@
 package com.oracle.truffle.api.test.host;
 
 import org.junit.Assert;
+import org.junit.BeforeClass;
 import org.junit.Test;
 
 import com.oracle.truffle.api.interop.InteropException;
 import com.oracle.truffle.api.interop.InteropLibrary;
 import com.oracle.truffle.api.interop.TruffleObject;
 import com.oracle.truffle.api.interop.UnknownIdentifierException;
+import com.oracle.truffle.tck.tests.TruffleTestAssumptions;
 
 public class VisibilityTest extends ProxyLanguageEnvTest {
     private static Class<?> run;
@@ -229,6 +231,11 @@ public class VisibilityTest extends ProxyLanguageEnvTest {
         // may or may not have public bridge method
     }
 
+    @BeforeClass
+    public static void runWithWeakEncapsulationOnly() {
+        TruffleTestAssumptions.assumeWeakEncapsulation();
+    }
+
     @Test
     public void testNonPublicClassPublicSuper() throws InteropException {
         invokeRun(new NP1(), NP1.class);
@@ -249,8 +256,10 @@ public class VisibilityTest extends ProxyLanguageEnvTest {
     }
 
     @Test
-    public void testPublicClassBridgeMethod() throws InteropException {
-        invokeRun(new B1(), A3.class);
+    public void testPublicClassBridgeMethod() {
+        // GR-42882: public bridge method B1.run() for A3.run() no longer exposed.
+        // invokeRun(new B1(), A3.class);
+        Assert.assertFalse(INTEROP.isMemberExisting(asTruffleObject(new B1()), "run"));
     }
 
     @Test

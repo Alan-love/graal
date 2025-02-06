@@ -27,8 +27,9 @@ package com.oracle.svm.hosted.meta;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
 
+import com.oracle.graal.pointsto.meta.AnalysisField;
+import com.oracle.svm.hosted.SVMHost;
 import com.oracle.svm.hosted.ameta.AnalysisConstantFieldProvider;
-import com.oracle.svm.hosted.classinitialization.ClassInitializationSupport;
 
 import jdk.vm.ci.meta.MetaAccessProvider;
 import jdk.vm.ci.meta.ResolvedJavaField;
@@ -36,8 +37,8 @@ import jdk.vm.ci.meta.ResolvedJavaField;
 @Platforms(Platform.HOSTED_ONLY.class)
 public class HostedConstantFieldProvider extends SharedConstantFieldProvider {
 
-    public HostedConstantFieldProvider(MetaAccessProvider metaAccess, ClassInitializationSupport classInitializationSupport) {
-        super(metaAccess, classInitializationSupport);
+    public HostedConstantFieldProvider(MetaAccessProvider metaAccess, SVMHost hostVM) {
+        super(metaAccess, hostVM);
     }
 
     /**
@@ -48,12 +49,23 @@ public class HostedConstantFieldProvider extends SharedConstantFieldProvider {
     @Override
     public boolean isFinalField(ResolvedJavaField f, ConstantFieldTool<?> tool) {
         HostedField field = (HostedField) f;
-
-        if (field.location == HostedField.LOC_UNMATERIALIZED_STATIC_CONSTANT) {
-            return true;
-        } else if (!field.wrapped.isWritten()) {
+        if (isFinalField(field)) {
             return true;
         }
         return super.isFinalField(field, tool);
+    }
+
+    public static boolean isFinalField(HostedField field) {
+        if (field.location == HostedField.LOC_UNMATERIALIZED_STATIC_CONSTANT) {
+            return true;
+        } else if (!field.isWritten() && field.isValueAvailable()) {
+            return true;
+        }
+        return false;
+    }
+
+    @Override
+    protected AnalysisField asAnalysisField(ResolvedJavaField field) {
+        return ((HostedField) field).getWrapped();
     }
 }

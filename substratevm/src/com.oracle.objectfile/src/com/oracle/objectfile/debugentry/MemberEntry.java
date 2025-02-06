@@ -32,13 +32,20 @@ package com.oracle.objectfile.debugentry;
  */
 public abstract class MemberEntry {
     protected FileEntry fileEntry;
+    protected final int line;
     protected final String memberName;
     protected final StructureTypeEntry ownerType;
     protected final TypeEntry valueType;
     protected final int modifiers;
 
     public MemberEntry(FileEntry fileEntry, String memberName, StructureTypeEntry ownerType, TypeEntry valueType, int modifiers) {
+        this(fileEntry, 0, memberName, ownerType, valueType, modifiers);
+    }
+
+    public MemberEntry(FileEntry fileEntry, int line, String memberName, StructureTypeEntry ownerType, TypeEntry valueType, int modifiers) {
+        assert line >= 0;
         this.fileEntry = fileEntry;
+        this.line = line;
         this.memberName = memberName;
         this.ownerType = ownerType;
         this.valueType = valueType;
@@ -53,8 +60,7 @@ public abstract class MemberEntry {
         }
     }
 
-    @SuppressWarnings("unused")
-    String getFullFileName() {
+    public String getFullFileName() {
         if (fileEntry != null) {
             return fileEntry.getFullName();
         } else {
@@ -75,8 +81,17 @@ public abstract class MemberEntry {
         return fileEntry;
     }
 
-    public String fieldName() {
-        return memberName;
+    public int getFileIdx() {
+        if (ownerType instanceof ClassEntry) {
+            return ((ClassEntry) ownerType).getFileIdx(fileEntry);
+        }
+        // should not be asking for a file for header fields
+        assert false : "not expecting a file lookup for header fields";
+        return 1;
+    }
+
+    public int getLine() {
+        return line;
     }
 
     public StructureTypeEntry ownerType() {

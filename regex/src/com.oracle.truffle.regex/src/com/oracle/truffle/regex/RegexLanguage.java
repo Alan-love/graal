@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -40,24 +40,28 @@
  */
 package com.oracle.truffle.regex;
 
+import org.graalvm.polyglot.SandboxPolicy;
+
 import com.oracle.truffle.api.CallTarget;
 import com.oracle.truffle.api.CompilerDirectives;
 import com.oracle.truffle.api.CompilerDirectives.CompilationFinal;
-import com.oracle.truffle.api.Truffle;
 import com.oracle.truffle.api.TruffleLanguage;
 import com.oracle.truffle.api.exception.AbstractTruffleException;
 import com.oracle.truffle.api.instrumentation.ProvidedTags;
 import com.oracle.truffle.api.instrumentation.StandardTags;
 import com.oracle.truffle.api.interop.ExceptionType;
+import com.oracle.truffle.api.nodes.Node;
 import com.oracle.truffle.api.nodes.RootNode;
 import com.oracle.truffle.api.source.Source;
+import com.oracle.truffle.regex.analysis.InputStringGenerator;
 import com.oracle.truffle.regex.tregex.TRegexCompiler;
-import com.oracle.truffle.regex.tregex.nfa.PureNFAIndex;
+import com.oracle.truffle.regex.tregex.buffer.CompilationBuffer;
+import com.oracle.truffle.regex.tregex.parser.RegexParser;
 import com.oracle.truffle.regex.tregex.parser.RegexParserGlobals;
 import com.oracle.truffle.regex.tregex.parser.RegexValidator;
 import com.oracle.truffle.regex.tregex.parser.ast.GroupBoundaries;
+import com.oracle.truffle.regex.tregex.parser.flavors.ECMAScriptFlavor;
 import com.oracle.truffle.regex.tregex.parser.flavors.RegexFlavor;
-import com.oracle.truffle.regex.tregex.parser.flavors.RegexFlavorProcessor;
 import com.oracle.truffle.regex.tregex.string.Encodings;
 import com.oracle.truffle.regex.util.TruffleNull;
 
@@ -80,7 +84,7 @@ import com.oracle.truffle.regex.util.TruffleNull;
  * </ul>
  *
  * An example of how to parse a regular expression:
- * 
+ *
  * <pre>
  * Object regex;
  * try {
@@ -98,7 +102,7 @@ import com.oracle.truffle.regex.util.TruffleNull;
  * </pre>
  *
  * Regex matcher usage example in pseudocode:
- * 
+ *
  * <pre>
  * {@code
  * regex = <matcher from previous example>
@@ -118,10 +122,21 @@ import com.oracle.truffle.regex.util.TruffleNull;
  * }
  * </pre>
  *
+ * Debug loggers: {@link com.oracle.truffle.regex.tregex.util.Loggers}.
+ *
  * @see RegexOptions
  * @see RegexObject
+ * @see com.oracle.truffle.regex.tregex.util.Loggers
  */
-@TruffleLanguage.Registration(name = RegexLanguage.NAME, id = RegexLanguage.ID, characterMimeTypes = RegexLanguage.MIME_TYPE, version = "0.1", contextPolicy = TruffleLanguage.ContextPolicy.SHARED, internal = true, interactive = false)
+@TruffleLanguage.Registration(name = RegexLanguage.NAME, //
+                id = RegexLanguage.ID, //
+                characterMimeTypes = RegexLanguage.MIME_TYPE, //
+                version = "0.1", //
+                contextPolicy = TruffleLanguage.ContextPolicy.SHARED, //
+                internal = true, //
+                interactive = false, //
+                sandbox = SandboxPolicy.UNTRUSTED, //
+                website = "https://github.com/oracle/graal/tree/master/regex")
 @ProvidedTags(StandardTags.RootTag.class)
 public final class RegexLanguage extends TruffleLanguage<RegexLanguage.RegexContext> {
 
@@ -131,12 +146,10 @@ public final class RegexLanguage extends TruffleLanguage<RegexLanguage.RegexCont
 
     private final GroupBoundaries[] cachedGroupBoundaries;
     public final RegexParserGlobals parserGlobals;
-    public final PureNFAIndex emptyNFAIndex;
 
     public RegexLanguage() {
         this.cachedGroupBoundaries = GroupBoundaries.createCachedGroupBoundaries();
         this.parserGlobals = new RegexParserGlobals(this);
-        this.emptyNFAIndex = new PureNFAIndex(0);
     }
 
     public GroupBoundaries[] getCachedGroupBoundaries() {
@@ -145,10 +158,16 @@ public final class RegexLanguage extends TruffleLanguage<RegexLanguage.RegexCont
 
     @Override
     protected CallTarget parse(ParsingRequest parsingRequest) {
-        return Truffle.getRuntime().createCallTarget(RootNode.createConstantNode(createRegexObject(createRegexSource(parsingRequest.getSource()))));
+        RegexSource source = createRegexSource(parsingRequest.getSource());
+        if (source.getOptions().isGenerateInput()) {
+            RegexFlavor flavor = source.getOptions().getFlavor();
+            RegexParser parser = flavor.createParser(this, source, new CompilationBuffer(source.getEncoding()));
+            return InputStringGenerator.generateRootNode(this, parser.parse()).getCallTarget();
+        }
+        return RootNode.createConstantNode(createRegexObject(source)).getCallTarget();
     }
 
-    private static RegexSource createRegexSource(Source source) {
+    public static RegexSource createRegexSource(Source source) {
         String srcStr = source.getCharacters().toString();
         if (srcStr.length() < 2) {
             throw CompilerDirectives.shouldNotReachHere("malformed regex");
@@ -162,9 +181,17 @@ public final class RegexLanguage extends TruffleLanguage<RegexLanguage.RegexCont
         }
         String pattern = srcStr.substring(firstSlash + 1, lastSlash);
         String flags = srcStr.substring(lastSlash + 1);
-        // ECMAScript-specific: the 'u' flag changes the encoding
-        if (optBuilder.getFlavor() == null && !optBuilder.isUtf16ExplodeAstralSymbols() && optBuilder.getEncoding() == Encodings.UTF_16_RAW && flags.indexOf('u') >= 0) {
-            optBuilder.encoding(Encodings.UTF_16);
+        // ECMAScript-specific: the 'u' and 'v' flags change the encoding
+        if (optBuilder.getFlavor() == ECMAScriptFlavor.INSTANCE) {
+            if (flags.indexOf('u') >= 0 || flags.indexOf('v') >= 0) {
+                if (!optBuilder.isUtf16ExplodeAstralSymbols() && optBuilder.getEncoding() == Encodings.UTF_16_RAW) {
+                    optBuilder.encoding(Encodings.UTF_16);
+                }
+            } else {
+                if (optBuilder.getEncoding() == Encodings.UTF_16) {
+                    optBuilder.encoding(Encodings.UTF_16_RAW);
+                }
+            }
         }
         return new RegexSource(pattern, flags, optBuilder.build(), source);
     }
@@ -172,13 +199,8 @@ public final class RegexLanguage extends TruffleLanguage<RegexLanguage.RegexCont
     private Object createRegexObject(RegexSource source) {
         if (source.getOptions().isValidate()) {
             RegexFlavor flavor = source.getOptions().getFlavor();
-            if (flavor != null) {
-                RegexFlavorProcessor flavorProcessor = flavor.forRegex(source);
-                flavorProcessor.validate();
-            } else {
-                RegexValidator validator = new RegexValidator(source);
-                validator.validate();
-            }
+            RegexValidator validator = flavor.createValidator(this, source, new CompilationBuffer(source.getEncoding()));
+            validator.validate();
             return TruffleNull.INSTANCE;
         }
         try {
@@ -207,7 +229,7 @@ public final class RegexLanguage extends TruffleLanguage<RegexLanguage.RegexCont
     /**
      * {@link RegexLanguage} is thread-safe - it supports parallel parsing requests as well as
      * parallel access to all {@link AbstractRegexObject}s. Parallel access to
-     * {@link com.oracle.truffle.regex.result.LazyResult}s objects may lead to duplicate execution
+     * {@link com.oracle.truffle.regex.result.RegexResult}s objects may lead to duplicate execution
      * of code, but no wrong results.
      *
      * @param thread the thread that accesses the context for the first time.
@@ -218,10 +240,6 @@ public final class RegexLanguage extends TruffleLanguage<RegexLanguage.RegexCont
     @Override
     protected boolean isThreadAccessAllowed(Thread thread, boolean singleThreaded) {
         return true;
-    }
-
-    public static RegexContext getCurrentContext() {
-        return getCurrentContext(RegexLanguage.class);
     }
 
     public static final class RegexContext {
@@ -238,6 +256,12 @@ public final class RegexLanguage extends TruffleLanguage<RegexLanguage.RegexCont
 
         public Env getEnv() {
             return env;
+        }
+
+        private static final ContextReference<RegexContext> REFERENCE = ContextReference.create(RegexLanguage.class);
+
+        public static RegexContext get(Node node) {
+            return REFERENCE.get(node);
         }
     }
 }

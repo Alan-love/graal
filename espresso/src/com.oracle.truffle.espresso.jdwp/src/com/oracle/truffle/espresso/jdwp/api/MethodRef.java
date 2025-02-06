@@ -23,6 +23,8 @@
 package com.oracle.truffle.espresso.jdwp.api;
 
 import com.oracle.truffle.api.source.Source;
+import com.oracle.truffle.espresso.classfile.attributes.LineNumberTableRef;
+import com.oracle.truffle.espresso.classfile.attributes.LocalVariableTableRef;
 
 /**
  * A representation of a method.
@@ -108,13 +110,6 @@ public interface MethodRef {
     byte[] getOriginalCode();
 
     /**
-     * Returns all declared parameter types of the method.
-     *
-     * @return an array of parameter types
-     */
-    KlassRef[] getParameters();
-
-    /**
      * @return the local variable table of the method
      */
     LocalVariableTableRef getLocalVariableTable();
@@ -130,13 +125,48 @@ public interface MethodRef {
     LineNumberTableRef getLineNumberTable();
 
     /**
-     * Invokes the method on the input callee object with input arguments.
+     * Invokes a non-private, non-constructor instance method on the input callee object with input
+     * arguments. The first argument must be the self object.
      *
-     * @param callee guest-language object on which to execute the method
      * @param args guest-language arguments used when calling the method
      * @return the guest-language return value
      */
-    Object invokeMethod(Object callee, Object[] args);
+    Object invokeMethodVirtual(Object... args);
+
+    /**
+     * Invokes a static method with input arguments.
+     *
+     * @param args guest-language arguments used when calling the method
+     * @return the guest-language return value
+     */
+    Object invokeMethodStatic(Object... args);
+
+    /**
+     * Invokes a constructor or private instance method with input arguments. The first argument
+     * must be the self object.
+     *
+     * @param args guest-language arguments used when calling the method
+     * @return the guest-language return value
+     */
+    Object invokeMethodSpecial(Object... args);
+
+    /**
+     * Invokes an interface method with input arguments. The first argument must be the self object.
+     *
+     * @param args guest-language arguments used when calling the method
+     * @return the guest-language return value
+     */
+    Object invokeMethodInterface(Object... args);
+
+    /**
+     * Invokes an instance method in a non-virtual fashion with input arguments. Overridden methods
+     * that would normally be called when invoking from Java source code using the self object is
+     * not invoked. The first argument must be the self object.
+     *
+     * @param args guest-language arguments used when calling the method
+     * @return the guest-language return value
+     */
+    Object invokeMethodNonVirtual(Object... args);
 
     /**
      * Determines if the declaring class has a source file attribute.
@@ -158,14 +188,7 @@ public interface MethodRef {
      *
      * @return the declaring klass
      */
-    KlassRef getDeclaringKlass();
-
-    /**
-     * Returns the first line number for the method, or -1 if unknown.
-     *
-     * @return first line
-     */
-    int getFirstLine();
+    KlassRef getDeclaringKlassRef();
 
     /**
      * Returns the last line number for the method, or -1 if unknown.
@@ -179,28 +202,37 @@ public interface MethodRef {
      *
      * @return array of method breakpoint info
      */
-    MethodBreakpoint[] getMethodBreakpointInfos();
+    MethodHook[] getMethodHooks();
 
     /**
      * Add a new method breakpoint with the given info on this method.
      *
      * @param info the info that describes the breakpoint
      */
-    void addMethodBreakpointInfo(MethodBreakpoint info);
+    void addMethodHook(MethodHook info);
 
     /**
-     * Remove a method breakpoint with the given info on this method.
+     * Remove a method hook with the given info on this method.
      *
      * @param requestId the ID for the request that set the breakpoint
      */
-    void removeMethodBreakpointInfo(int requestId);
+    void removedMethodHook(int requestId);
+
+    /**
+     * Remove a method hook with the given hook on this method.
+     *
+     * @param hook the method hook
+     */
+    void removedMethodHook(MethodHook hook);
 
     /**
      * Determines if there are any breakpoints set on this method.
      *
      * @return true if this method has any breakpoints, false otherwise
      */
-    boolean hasActiveBreakpoint();
+    boolean hasActiveHook();
+
+    void disposeHooks();
 
     /**
      * Determine if this method is obsolete. A method is obsolete if it has been replaced by a
@@ -220,9 +252,16 @@ public interface MethodRef {
     long getLastBCI();
 
     /**
-     * Determines if the method was compiled with a variable table.
+     * Determines if the method is a constructor.
      *
-     * @return true if the method has a variable table
+     * @return true if the method is a constructor
      */
-    boolean hasVariableTable();
+    boolean isConstructor();
+
+    /**
+     * Determines if the method is a static initializer.
+     *
+     * @return true if the method is a static initializer
+     */
+    boolean isClassInitializer();
 }

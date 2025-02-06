@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2021, 2021, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,70 +24,78 @@
  */
 package com.oracle.svm.core.jdk;
 
-import java.io.ByteArrayInputStream;
-import java.io.InputStream;
-import java.util.List;
-
-import com.oracle.svm.core.annotate.Delete;
+import com.oracle.svm.core.annotate.Alias;
+import com.oracle.svm.core.annotate.RecomputeFieldValue;
 import com.oracle.svm.core.annotate.Substitute;
 import com.oracle.svm.core.annotate.TargetClass;
 import com.oracle.svm.core.annotate.TargetElement;
+import com.oracle.svm.core.util.BasedOnJDKFile;
 
-@TargetClass(className = "java.lang.Module", onlyWith = JDK11OrLater.class)
+/**
+ * Substitution class for {@link java.lang.Module}. We need to substitute native methods
+ * particularly, because original methods in the JDK contain VM state updates and perform additional
+ * bookkeeping. We implement all the data structures we need to answer module system queries in Java
+ * (see {@link ModuleNative}. In order to preserve JCK compatibility, we need to perform all the
+ * checks performed by original methods and throw the exact same exception types and messages.
+ */
+@SuppressWarnings("unused")
+@TargetClass(value = java.lang.Module.class)
 public final class Target_java_lang_Module {
-    @SuppressWarnings("static-method")
-    @Substitute
-    @TargetElement(name = "getResourceAsStream")
-    public InputStream getResourceAsStream(String name) {
-        List<byte[]> arr = Resources.get(name);
-        return arr == null ? null : new ByteArrayInputStream(arr.get(0));
-    }
 
-    /*
-     * All implementations of these stubs are completely empty no-op. This seems appropriate as
-     * DynamicHub only references a singleton Module implementation anyhow, effectively neutering
-     * the module system within JDK11.
+    /**
+     * {@link Alias} to make {@code Module.layer} non-final. The actual run-time value is set via
+     * reflection in {@code ModuleLayerFeatureUtils#patchModuleLayerField}, which is called after
+     * analysis. Thus, we cannot leave it {@code final}, because the analysis might otherwise
+     * constant-fold the initial {@code null} value. Ideally, we would make it {@code @Stable}, but
+     * our substitution system currently does not allow this (GR-60154).
      */
+    @Alias //
+    @RecomputeFieldValue(isFinal = false, kind = RecomputeFieldValue.Kind.None)
+    // @Stable (no effect currently GR-60154)
+    private ModuleLayer layer;
 
-    @SuppressWarnings({"unused", "static-method"})
     @Substitute
-    public boolean isReflectivelyExportedOrOpen(String pn, Target_java_lang_Module other, boolean open) {
-        return true;
+    @TargetElement(onlyWith = ForeignDisabled.class)
+    @SuppressWarnings("static-method")
+    public boolean isNativeAccessEnabled() {
+        throw ForeignDisabledSubstitutions.fail();
     }
 
-    @SuppressWarnings({"unused", "static-method"})
+    @Alias
+    @TargetElement(onlyWith = JDK21OrEarlier.class)
+    public native void ensureNativeAccess(Class<?> owner, String methodName);
+
+    @Alias
+    @TargetElement(onlyWith = JDKLatest.class)
+    public native void ensureNativeAccess(Class<?> owner, String methodName, Class<?> currentClass, boolean jni);
+
     @Substitute
-    private void implAddReads(Target_java_lang_Module other, boolean syncVM) {
+    @BasedOnJDKFile("https://github.com/openjdk/jdk/blob/jdk-24+22/src/hotspot/share/classfile/modules.cpp#L279-L478")
+    private static void defineModule0(Module module, boolean isOpen, String version, String location, Object[] pns) {
+        ModuleNative.defineModule(module, isOpen, pns);
     }
 
-    @SuppressWarnings({"unused", "static-method"})
     @Substitute
-    private void implAddExportsOrOpens(String pn,
-                    Target_java_lang_Module other,
-                    boolean open,
-                    boolean syncVM) {
+    @BasedOnJDKFile("https://github.com/openjdk/jdk/blob/jdk-23+10/src/hotspot/share/classfile/modules.cpp#L763-L799")
+    private static void addReads0(Module from, Module to) {
+        ModuleNative.addReads(from, to);
     }
 
-    @SuppressWarnings({"unused", "static-method"})
     @Substitute
-    void implAddUses(Class<?> service) {
+    @BasedOnJDKFile("https://github.com/openjdk/jdk/blob/jdk-23+10/src/hotspot/share/classfile/modules.cpp#L753-L761")
+    private static void addExports0(Module from, String pn, Module to) {
+        ModuleNative.addExports(from, pn, to);
     }
 
-    @SuppressWarnings({"unused", "static-method"})
     @Substitute
-    public boolean canUse(Class<?> service) {
-        return true;
+    @BasedOnJDKFile("https://github.com/openjdk/jdk/blob/jdk-23+10/src/hotspot/share/classfile/modules.cpp#L686-L750")
+    private static void addExportsToAll0(Module from, String pn) {
+        ModuleNative.addExportsToAll(from, pn);
     }
 
-    @SuppressWarnings({"unused", "static-method"})
     @Substitute
-    public boolean canRead(Target_java_lang_Module other) {
-        return true;
+    @BasedOnJDKFile("https://github.com/openjdk/jdk/blob/jdk-23+10/src/hotspot/share/classfile/modules.cpp#L869-L918")
+    private static void addExportsToAllUnnamed0(Module from, String pn) {
+        ModuleNative.addExportsToAllUnnamed(from, pn);
     }
-
-    @Delete
-    @TargetClass(className = "java.lang.Module", innerClass = "ReflectionData", onlyWith = JDK11OrLater.class)
-    public static final class ReflectionData {
-    }
-
 }

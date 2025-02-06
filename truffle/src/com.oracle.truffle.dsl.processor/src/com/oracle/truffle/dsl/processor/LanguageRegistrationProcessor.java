@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2012, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -42,12 +42,9 @@ package com.oracle.truffle.dsl.processor;
 
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
-import java.util.Properties;
 import java.util.Set;
-import java.util.function.Predicate;
 
 import javax.annotation.processing.SupportedAnnotationTypes;
 import javax.lang.model.element.AnnotationMirror;
@@ -56,15 +53,17 @@ import javax.lang.model.element.Element;
 import javax.lang.model.element.ElementKind;
 import javax.lang.model.element.ExecutableElement;
 import javax.lang.model.element.Modifier;
+import javax.lang.model.element.PackageElement;
 import javax.lang.model.element.TypeElement;
 import javax.lang.model.element.TypeParameterElement;
 import javax.lang.model.type.DeclaredType;
 import javax.lang.model.type.TypeMirror;
 import javax.lang.model.util.ElementFilter;
 import javax.lang.model.util.Elements;
-import javax.lang.model.util.Types;
 
 import com.oracle.truffle.dsl.processor.java.ElementUtils;
+import com.oracle.truffle.dsl.processor.java.model.CodeAnnotationMirror;
+import com.oracle.truffle.dsl.processor.java.model.CodeAnnotationValue;
 import com.oracle.truffle.dsl.processor.java.model.CodeExecutableElement;
 import com.oracle.truffle.dsl.processor.java.model.CodeTreeBuilder;
 
@@ -76,20 +75,37 @@ public final class LanguageRegistrationProcessor extends AbstractRegistrationPro
                     Arrays.asList("host", "graal", "truffle", "language", "instrument", "graalvm", "context", "polyglot", "compiler", "vm", "file",
                                     "engine", "log", "image-build-time"));
 
-    @SuppressWarnings("deprecation")
+    private static final Set<String> IGNORED_ATTRIBUTES = Set.of("services", "fileTypeDetectors", "internalResources");
+
+    static String resolveLanguageId(Element annotatedElement, AnnotationMirror registration) {
+        String id = ElementUtils.getAnnotationValue(String.class, registration, "id");
+        if (id.isEmpty()) {
+            return getDefaultLanguageId(annotatedElement);
+        } else {
+            return id;
+        }
+    }
+
+    private static String getDefaultLanguageId(Element annotatedElement) {
+        String className = annotatedElement.toString();
+        assert TruffleTypes.TEST_PACKAGES.stream().anyMatch(className::startsWith);
+        return className.replaceAll("[.$]", "_").toLowerCase();
+    }
+
     @Override
     boolean validateRegistration(Element annotatedElement, AnnotationMirror registrationMirror) {
-        if (!annotatedElement.getModifiers().contains(Modifier.PUBLIC)) {
-            emitError("Registered language class must be public", annotatedElement);
+        if (annotatedElement.getModifiers().contains(Modifier.PRIVATE)) {
+            emitError("Registered language class must be at least package protected", annotatedElement);
             return false;
         }
         if (annotatedElement.getEnclosingElement().getKind() != ElementKind.PACKAGE && !annotatedElement.getModifiers().contains(Modifier.STATIC)) {
             emitError("Registered language inner-class must be static", annotatedElement);
             return false;
         }
-        TruffleTypes types = ProcessorContext.getInstance().getTypes();
+        ProcessorContext context = ProcessorContext.getInstance();
+        TruffleTypes types = context.getTypes();
         TypeMirror truffleLang = processingEnv.getTypeUtils().erasure(types.TruffleLanguage);
-        TypeMirror truffleLangProvider = types.TruffleLanguage_Provider;
+        TypeMirror truffleLangProvider = types.TruffleLanguageProvider;
         boolean processingTruffleLanguage;
         if (processingEnv.getTypeUtils().isAssignable(annotatedElement.asType(), truffleLang)) {
             processingTruffleLanguage = true;
@@ -101,7 +117,7 @@ public final class LanguageRegistrationProcessor extends AbstractRegistrationPro
         }
         boolean foundConstructor = false;
         for (ExecutableElement constructor : ElementFilter.constructorsIn(annotatedElement.getEnclosedElements())) {
-            if (!constructor.getModifiers().contains(Modifier.PUBLIC)) {
+            if (constructor.getModifiers().contains(Modifier.PRIVATE)) {
                 continue;
             }
             if (!constructor.getParameters().isEmpty()) {
@@ -137,7 +153,7 @@ public final class LanguageRegistrationProcessor extends AbstractRegistrationPro
             valid = false;
         } else {
             if (!foundConstructor) {
-                emitError("A TruffleLanguage subclass must have a public no argument constructor.", annotatedElement);
+                emitError("A TruffleLanguage subclass must have at least package protected no argument constructor.", annotatedElement);
                 return false;
             }
         }
@@ -167,21 +183,25 @@ public final class LanguageRegistrationProcessor extends AbstractRegistrationPro
             return false;
         }
 
-        List<String> legacyMimeTypes = ElementUtils.getAnnotationValueList(String.class, registrationMirror, "mimeType");
-        if (legacyMimeTypes.isEmpty()) {
-            String id = ElementUtils.getAnnotationValue(String.class, registrationMirror, "id");
-            if (id.isEmpty()) {
+        String id = ElementUtils.getAnnotationValue(String.class, registrationMirror, "id");
+        if (id.isEmpty()) {
+            String className = annotatedElement.toString();
+            if (TruffleTypes.TEST_PACKAGES.stream().noneMatch(className::startsWith)) {
                 emitError("The attribute id is mandatory.", annotatedElement, registrationMirror, null);
                 return false;
             }
-            if (RESERVED_IDS.contains(id)) {
-                emitError(String.format("Id '%s' is reserved for other use and must not be used as id.", id), annotatedElement, registrationMirror,
-                                ElementUtils.getAnnotationValue(registrationMirror, "id"));
-                return false;
-            }
+        }
+        if (RESERVED_IDS.contains(id)) {
+            emitError(String.format("Id '%s' is reserved for other use and must not be used as id.", id), annotatedElement, registrationMirror,
+                            ElementUtils.getAnnotationValue(registrationMirror, "id"));
+            return false;
         }
 
         if (!validateFileTypeDetectors(annotatedElement, registrationMirror)) {
+            return false;
+        }
+
+        if (!validateInternalResources(annotatedElement, registrationMirror, context)) {
             return false;
         }
 
@@ -194,7 +214,7 @@ public final class LanguageRegistrationProcessor extends AbstractRegistrationPro
     @Override
     DeclaredType getProviderClass() {
         TruffleTypes types = ProcessorContext.getInstance().getTypes();
-        return types.TruffleLanguage_Provider;
+        return types.TruffleLanguageProvider;
     }
 
     @Override
@@ -202,13 +222,11 @@ public final class LanguageRegistrationProcessor extends AbstractRegistrationPro
         List<AnnotationMirror> result = new ArrayList<>(2);
         TruffleTypes types = ProcessorContext.getInstance().getTypes();
         DeclaredType registrationType = types.TruffleLanguage_Registration;
-        AnnotationMirror registration = copyAnnotations(ElementUtils.findAnnotationMirror(annotatedElement.getAnnotationMirrors(), registrationType),
-                        new Predicate<ExecutableElement>() {
-                            @Override
-                            public boolean test(ExecutableElement t) {
-                                return !"services".contentEquals(t.getSimpleName()) && !"fileTypeDetectors".contentEquals(t.getSimpleName());
-                            }
-                        });
+        CodeAnnotationMirror registration = copyAnnotations(ElementUtils.findAnnotationMirror(annotatedElement.getAnnotationMirrors(), registrationType),
+                        (t) -> !IGNORED_ATTRIBUTES.contains(t.getSimpleName().toString()));
+        if (ElementUtils.getAnnotationValue(String.class, registration, "id").isEmpty()) {
+            registration.setElementValue(registration.findExecutableElement("id"), new CodeAnnotationValue(getDefaultLanguageId(annotatedElement)));
+        }
         result.add(registration);
         AnnotationMirror providedTags = ElementUtils.findAnnotationMirror(annotatedElement.getAnnotationMirrors(), types.ProvidedTags);
         if (providedTags != null) {
@@ -232,22 +250,6 @@ public final class LanguageRegistrationProcessor extends AbstractRegistrationPro
                     builder.startReturn().startNew(languageType).end(2);
                 }
                 break;
-            case "createFileTypeDetectors": {
-                AnnotationMirror registration = ElementUtils.findAnnotationMirror(annotatedElement.getAnnotationMirrors(),
-                                types.TruffleLanguage_Registration);
-                List<TypeMirror> detectors = ElementUtils.getAnnotationValueList(TypeMirror.class, registration, "fileTypeDetectors");
-                if (detectors.isEmpty()) {
-                    builder.startReturn().startStaticCall(context.getType(Collections.class), "emptyList").end().end();
-                } else {
-                    builder.startReturn();
-                    builder.startStaticCall(context.getType(Arrays.class), "asList");
-                    for (TypeMirror detector : detectors) {
-                        builder.startGroup().startNew(detector).end(2);
-                    }
-                    builder.end(2);
-                }
-                break;
-            }
             case "getLanguageClassName": {
                 Elements elements = context.getEnvironment().getElementUtils();
                 builder.startReturn().doubleQuote(elements.getBinaryName(annotatedElement).toString()).end();
@@ -256,19 +258,25 @@ public final class LanguageRegistrationProcessor extends AbstractRegistrationPro
             case "getServicesClassNames": {
                 AnnotationMirror registration = ElementUtils.findAnnotationMirror(annotatedElement.getAnnotationMirrors(),
                                 types.TruffleLanguage_Registration);
-                List<TypeMirror> services = ElementUtils.getAnnotationValueList(TypeMirror.class, registration, "services");
-                if (services.isEmpty()) {
-                    builder.startReturn().startStaticCall(context.getType(Collections.class), "emptySet").end().end();
-                } else {
-                    builder.startReturn();
-                    builder.startStaticCall(context.getType(Arrays.class), "asList");
-                    for (TypeMirror service : services) {
-                        Elements elements = context.getEnvironment().getElementUtils();
-                        Types typeUtils = context.getEnvironment().getTypeUtils();
-                        builder.startGroup().doubleQuote(elements.getBinaryName((TypeElement) ((DeclaredType) typeUtils.erasure(service)).asElement()).toString()).end();
-                    }
-                    builder.end(2);
-                }
+                generateGetServicesClassNames(registration, builder, context);
+                break;
+            }
+            case "getInternalResourceIds": {
+                AnnotationMirror registration = ElementUtils.findAnnotationMirror(annotatedElement.getAnnotationMirrors(),
+                                types.TruffleLanguage_Registration);
+                generateGetInternalResourceIds(registration, builder, context);
+                break;
+            }
+            case "createInternalResource": {
+                AnnotationMirror registration = ElementUtils.findAnnotationMirror(annotatedElement.getAnnotationMirrors(),
+                                types.TruffleLanguage_Registration);
+                generateCreateInternalResource(registration, methodToImplement.getParameters().get(0), builder, context);
+                break;
+            }
+            case "createFileTypeDetectors": {
+                AnnotationMirror registration = ElementUtils.findAnnotationMirror(annotatedElement.getAnnotationMirrors(),
+                                types.TruffleLanguage_Registration);
+                generateCreateFileTypeDetectors(registration, builder, context);
                 break;
             }
             default:
@@ -276,69 +284,17 @@ public final class LanguageRegistrationProcessor extends AbstractRegistrationPro
         }
     }
 
-    @Override
-    String getRegistrationFileName() {
-        return "META-INF/truffle/language";
-    }
-
-    @Override
-    @SuppressWarnings("deprecation")
-    void storeRegistrations(Properties into, Iterable<? extends TypeElement> annotatedElements) {
-        int cnt = 0;
-        TruffleTypes types = ProcessorContext.getInstance().getTypes();
-        for (TypeElement annotatedElement : annotatedElements) {
-            String prefix = "language" + ++cnt + ".";
-            AnnotationMirror annotation = ElementUtils.findAnnotationMirror(annotatedElement, types.TruffleLanguage_Registration);
-            if (annotation == null) {
-                return;
+    private static void generateCreateFileTypeDetectors(AnnotationMirror registration, CodeTreeBuilder builder, ProcessorContext context) {
+        List<TypeMirror> detectors = ElementUtils.getAnnotationValueList(TypeMirror.class, registration, "fileTypeDetectors");
+        if (detectors.isEmpty()) {
+            builder.startReturn().startStaticCall(context.getType(List.class), "of").end().end();
+        } else {
+            builder.startReturn();
+            builder.startStaticCall(context.getType(List.class), "of");
+            for (TypeMirror detector : detectors) {
+                builder.startGroup().startNew(detector).end(2);
             }
-            String className = processingEnv.getElementUtils().getBinaryName(annotatedElement).toString();
-            String id = ElementUtils.getAnnotationValue(String.class, annotation, "id");
-            if (id != null && !id.isEmpty()) {
-                into.setProperty(prefix + "id", id);
-            }
-            into.setProperty(prefix + "name", ElementUtils.getAnnotationValue(String.class, annotation, "name"));
-            into.setProperty(prefix + "implementationName", ElementUtils.getAnnotationValue(String.class, annotation, "implementationName"));
-            into.setProperty(prefix + "version", ElementUtils.getAnnotationValue(String.class, annotation, "version"));
-            into.setProperty(prefix + "className", className);
-
-            String defaultMimeType = ElementUtils.getAnnotationValue(String.class, annotation, "defaultMimeType");
-            if (!defaultMimeType.equals("")) {
-                into.setProperty(prefix + "defaultMimeType", defaultMimeType);
-            }
-
-            List<String> mimes = ElementUtils.getAnnotationValueList(String.class, annotation, "mimeType");
-            for (int i = 0; i < mimes.size(); i++) {
-                into.setProperty(prefix + "mimeType." + i, mimes.get(i));
-            }
-            List<String> charMimes = ElementUtils.getAnnotationValueList(String.class, annotation, "characterMimeTypes");
-            Collections.sort(charMimes);
-            for (int i = 0; i < charMimes.size(); i++) {
-                into.setProperty(prefix + "characterMimeType." + i, charMimes.get(i));
-            }
-            List<String> byteMimes = ElementUtils.getAnnotationValueList(String.class, annotation, "byteMimeTypes");
-            Collections.sort(byteMimes);
-            for (int i = 0; i < byteMimes.size(); i++) {
-                into.setProperty(prefix + "byteMimeType." + i, byteMimes.get(i));
-            }
-
-            List<String> dependencies = ElementUtils.getAnnotationValueList(String.class, annotation, "dependentLanguages");
-            Collections.sort(dependencies);
-            for (int i = 0; i < dependencies.size(); i++) {
-                into.setProperty(prefix + "dependentLanguage." + i, dependencies.get(i));
-            }
-            into.setProperty(prefix + "interactive", Boolean.toString(ElementUtils.getAnnotationValue(Boolean.class, annotation, "interactive")));
-            into.setProperty(prefix + "internal", Boolean.toString(ElementUtils.getAnnotationValue(Boolean.class, annotation, "internal")));
-
-            int serviceCounter = 0;
-            for (TypeMirror serviceTypeMirror : ElementUtils.getAnnotationValueList(TypeMirror.class, annotation, "services")) {
-                into.setProperty(prefix + "service" + serviceCounter++, processingEnv.getElementUtils().getBinaryName(ElementUtils.fromTypeMirror(serviceTypeMirror)).toString());
-            }
-            int fileTypeDetectorCounter = 0;
-            for (TypeMirror fileTypeDetectorTypeMirror : ElementUtils.getAnnotationValueList(TypeMirror.class, annotation, "fileTypeDetectors")) {
-                into.setProperty(prefix + "fileTypeDetector" + fileTypeDetectorCounter++,
-                                processingEnv.getElementUtils().getBinaryName(ElementUtils.fromTypeMirror(fileTypeDetectorTypeMirror)).toString());
-            }
+            builder.end(2);
         }
     }
 
@@ -372,19 +328,26 @@ public final class LanguageRegistrationProcessor extends AbstractRegistrationPro
 
     private boolean validateFileTypeDetectors(Element annotatedElement, AnnotationMirror mirror) {
         AnnotationValue value = ElementUtils.getAnnotationValue(mirror, "fileTypeDetectors", true);
-        for (TypeMirror fileTypeDetectorType : ElementUtils.getAnnotationValueList(TypeMirror.class, mirror, "fileTypeDetectors")) {
-            TypeElement fileTypeDetectorElement = ElementUtils.fromTypeMirror(fileTypeDetectorType);
-            if (!fileTypeDetectorElement.getModifiers().contains(Modifier.PUBLIC)) {
-                emitError("Registered FileTypeDetector class must be public.", annotatedElement, mirror, value);
+        for (TypeMirror fileTypeDetectorImpl : ElementUtils.getAnnotationValueList(TypeMirror.class, mirror, "fileTypeDetectors")) {
+            TypeElement fileTypeDetectorImplElement = ElementUtils.fromTypeMirror(fileTypeDetectorImpl);
+            PackageElement targetPackage = ElementUtils.findPackageElement(annotatedElement);
+            boolean samePackage = targetPackage.equals(ElementUtils.findPackageElement(fileTypeDetectorImplElement));
+            Set<Modifier> modifiers = fileTypeDetectorImplElement.getModifiers();
+            if (samePackage ? modifiers.contains(Modifier.PRIVATE) : !modifiers.contains(Modifier.PUBLIC)) {
+                emitError(String.format("The class %s must be public or package protected in the %s package. To resolve this, make the %s public or move it to the %s package.",
+                                getScopedName(fileTypeDetectorImplElement), targetPackage.getQualifiedName(), getScopedName(fileTypeDetectorImplElement), targetPackage.getQualifiedName()),
+                                annotatedElement, mirror, value);
                 return false;
             }
-            if (fileTypeDetectorElement.getEnclosingElement().getKind() != ElementKind.PACKAGE && !fileTypeDetectorElement.getModifiers().contains(Modifier.STATIC)) {
-                emitError("Registered FileTypeDetector inner-class must be static.", annotatedElement, mirror, value);
+            if (fileTypeDetectorImplElement.getEnclosingElement().getKind() != ElementKind.PACKAGE && !modifiers.contains(Modifier.STATIC)) {
+                emitError(String.format("The class %s must be a static inner-class or a top-level class. To resolve this, make the %s static or top-level class.",
+                                getScopedName(fileTypeDetectorImplElement), fileTypeDetectorImplElement.getSimpleName()), annotatedElement, mirror, value);
                 return false;
             }
             boolean foundConstructor = false;
-            for (ExecutableElement constructor : ElementFilter.constructorsIn(fileTypeDetectorElement.getEnclosedElements())) {
-                if (!constructor.getModifiers().contains(Modifier.PUBLIC)) {
+            for (ExecutableElement constructor : ElementFilter.constructorsIn(fileTypeDetectorImplElement.getEnclosedElements())) {
+                modifiers = constructor.getModifiers();
+                if (samePackage ? modifiers.contains(Modifier.PRIVATE) : !modifiers.contains(Modifier.PUBLIC)) {
                     continue;
                 }
                 if (!constructor.getParameters().isEmpty()) {
@@ -394,7 +357,8 @@ public final class LanguageRegistrationProcessor extends AbstractRegistrationPro
                 break;
             }
             if (!foundConstructor) {
-                emitError("A FileTypeDetector subclass must have a public no argument constructor.", annotatedElement, mirror, value);
+                emitError(String.format("The class %s must have a no argument public constructor. To resolve this, add public %s() constructor.",
+                                getScopedName(fileTypeDetectorImplElement), ElementUtils.getSimpleName(fileTypeDetectorImplElement)), annotatedElement, mirror, value);
                 return false;
             }
         }

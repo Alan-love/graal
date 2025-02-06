@@ -1,2 +1,0 @@
-org.graalvm.libgraal.jni.processor.JNIFromLibGraalProcessor
-org.graalvm.libgraal.jni.processor.FromLibGraalEntryPointsResolverProcessor

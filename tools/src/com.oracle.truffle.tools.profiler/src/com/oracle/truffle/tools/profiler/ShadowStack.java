@@ -46,7 +46,6 @@ import com.oracle.truffle.api.instrumentation.Instrumenter;
 import com.oracle.truffle.api.instrumentation.SourceSectionFilter;
 import com.oracle.truffle.api.instrumentation.StandardTags;
 import com.oracle.truffle.api.nodes.Node;
-import com.oracle.truffle.api.nodes.NodeCost;
 
 /**
  * Custom more efficient stack representations for profilers.
@@ -111,7 +110,7 @@ final class ShadowStack {
         Node current = node.getParent();
         while (current != null) {
             if (sourceSectionFilter.includes(current) && current.getSourceSection() != null) {
-                sourceLocations.add(new StackTraceEntry(instrumenter, current, StackTraceEntry.STATE_INTERPRETED));
+                sourceLocations.add(new StackTraceEntry(instrumenter, current, 0, true));
             }
             current = current.getParent();
         }
@@ -135,9 +134,9 @@ final class ShadowStack {
         StackPushPopNode(ShadowStack profilerStack, Instrumenter instrumenter, EventContext context, boolean ignoreInlinedRoots) {
             this.profilerStack = profilerStack;
             this.cachedThread = Thread.currentThread();
-            this.interpretedLocation = new StackTraceEntry(instrumenter, context, StackTraceEntry.STATE_INTERPRETED);
-            this.compiledLocation = new StackTraceEntry(interpretedLocation, StackTraceEntry.STATE_COMPILED);
-            this.compilationRootLocation = new StackTraceEntry(interpretedLocation, StackTraceEntry.STATE_COMPILATION_ROOT);
+            this.interpretedLocation = new StackTraceEntry(instrumenter, context, 0, true);
+            this.compiledLocation = new StackTraceEntry(interpretedLocation, 2, false);
+            this.compilationRootLocation = new StackTraceEntry(interpretedLocation, 2, true);
             this.isAttachedToRootTag = context.hasTag(StandardTags.RootTag.class);
             this.ignoreInlinedRoots = ignoreInlinedRoots;
             this.cachedStack = getStack();
@@ -224,11 +223,6 @@ final class ShadowStack {
                 }
             }
             return stack;
-        }
-
-        @Override
-        public NodeCost getCost() {
-            return NodeCost.NONE;
         }
 
     }

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017, 2021, Oracle and/or its affiliates.
+ * Copyright (c) 2017, 2024, Oracle and/or its affiliates.
  *
  * All rights reserved.
  *
@@ -32,8 +32,11 @@ package com.oracle.truffle.llvm.runtime.interop.convert;
 import com.oracle.truffle.api.CompilerDirectives;
 import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
 import com.oracle.truffle.api.interop.UnsupportedTypeException;
-import com.oracle.truffle.api.nodes.NodeCost;
+import com.oracle.truffle.api.nodes.UnadoptableNode;
+import com.oracle.truffle.api.profiles.BranchProfile;
 import com.oracle.truffle.llvm.runtime.except.LLVMPolyglotException;
+import com.oracle.truffle.llvm.runtime.floating.LLVM128BitFloat;
+import com.oracle.truffle.llvm.runtime.floating.LLVM80BitFloat;
 import com.oracle.truffle.llvm.runtime.interop.access.LLVMInteropType;
 import com.oracle.truffle.llvm.runtime.nodes.api.LLVMNode;
 import com.oracle.truffle.llvm.runtime.types.ArrayType;
@@ -52,11 +55,11 @@ public abstract class ForeignToLLVM extends LLVMNode {
 
     public abstract Object executeWithForeignToLLVMType(Object value, LLVMInteropType.Structured type, ForeignToLLVMType ftlType);
 
-    protected char getSingleStringCharacter(String value) {
+    protected char getSingleStringCharacter(String value, BranchProfile exception) {
         if (value.length() == 1) {
             return value.charAt(0);
         } else {
-            CompilerDirectives.transferToInterpreter();
+            exception.enter();
             throw new LLVMPolyglotException(this, "Expected number but got string.");
         }
     }
@@ -69,6 +72,8 @@ public abstract class ForeignToLLVM extends LLVMNode {
         I64(8),
         FLOAT(4),
         DOUBLE(8),
+        FP80(10),
+        FP128(16),
         POINTER(8),
         VECTOR(-1),
         ARRAY(-1),
@@ -95,8 +100,8 @@ public abstract class ForeignToLLVM extends LLVMNode {
                 case 64:
                     return ForeignToLLVMType.I64;
                 default:
-                    CompilerDirectives.transferToInterpreter();
-                    throw new IllegalStateException("There is no integer type with " + bitWidth + " bits defined");
+                    CompilerDirectives.transferToInterpreterAndInvalidate();
+                    throw CompilerDirectives.shouldNotReachHere("There is no integer type with " + bitWidth + " bits defined");
             }
         }
 
@@ -137,6 +142,10 @@ public abstract class ForeignToLLVM extends LLVMNode {
             return this == ForeignToLLVMType.POINTER;
         }
 
+        public boolean isFP128() {
+            return this == ForeignToLLVMType.FP128;
+        }
+
         public static Object getDefaultValue(ForeignToLLVMType type) {
             switch (type) {
                 case I1:
@@ -154,9 +163,13 @@ public abstract class ForeignToLLVM extends LLVMNode {
                     return 0f;
                 case DOUBLE:
                     return 0d;
+                case FP80:
+                    return LLVM80BitFloat.createPositiveZero();
+                case FP128:
+                    return LLVM128BitFloat.createPositiveZero();
                 default:
-                    CompilerDirectives.transferToInterpreter();
-                    throw new IllegalStateException("Unexpected value: " + type);
+                    CompilerDirectives.transferToInterpreterAndInvalidate();
+                    throw CompilerDirectives.shouldNotReachHere("unexpected type " + type);
             }
         }
     }
@@ -178,6 +191,10 @@ public abstract class ForeignToLLVM extends LLVMNode {
                     return ForeignToLLVMType.FLOAT;
                 case DOUBLE:
                     return ForeignToLLVMType.DOUBLE;
+                case X86_FP80:
+                    return ForeignToLLVMType.FP80;
+                case F128:
+                    return ForeignToLLVMType.FP128;
                 default:
                     throw new IllegalStateException("unexpected primitive kind " + ((PrimitiveType) type).getPrimitiveKind());
             }
@@ -200,7 +217,7 @@ public abstract class ForeignToLLVM extends LLVMNode {
         return SlowPathForeignToLLVM.INSTANCE;
     }
 
-    public static final class SlowPathForeignToLLVM extends ForeignToLLVM {
+    public static final class SlowPathForeignToLLVM extends ForeignToLLVM implements UnadoptableNode {
 
         private static final SlowPathForeignToLLVM INSTANCE = new SlowPathForeignToLLVM();
 
@@ -231,6 +248,10 @@ public abstract class ForeignToLLVM extends LLVMNode {
                         return ToI64.slowPathPrimitiveConvert(this, value);
                     case I8:
                         return ToI8.slowPathPrimitiveConvert(this, value);
+                    case FP80:
+                        return ToFP80.slowPathPrimitiveConvert(value);
+                    case FP128:
+                        return ToFP128.slowPathPrimitiveConvert(value);
                     default:
                         throw new IllegalStateException(type.toString());
                 }
@@ -239,14 +260,12 @@ public abstract class ForeignToLLVM extends LLVMNode {
 
         @Override
         public Object executeWithTarget(Object value) {
-            CompilerDirectives.transferToInterpreter();
-            throw new IllegalStateException("Use convert method.");
+            throw CompilerDirectives.shouldNotReachHere("Use convert method.");
         }
 
         @Override
         public Object executeWithType(Object value, LLVMInteropType.Structured type) {
-            CompilerDirectives.transferToInterpreter();
-            throw new IllegalStateException("Use convert method.");
+            throw CompilerDirectives.shouldNotReachHere("Use convert method.");
         }
 
         @Override
@@ -254,19 +273,9 @@ public abstract class ForeignToLLVM extends LLVMNode {
             try {
                 return convert(ftlType, value, type);
             } catch (UnsupportedTypeException ex) {
-                CompilerDirectives.transferToInterpreter();
                 throw new LLVMPolyglotException(this, "Unexpected foreign object type.");
             }
         }
 
-        @Override
-        public boolean isAdoptable() {
-            return false;
-        }
-
-        @Override
-        public NodeCost getCost() {
-            return NodeCost.MEGAMORPHIC;
-        }
     }
 }

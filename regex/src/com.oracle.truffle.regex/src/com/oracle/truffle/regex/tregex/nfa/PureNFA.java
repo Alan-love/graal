@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2020, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -42,9 +42,13 @@ package com.oracle.truffle.regex.tregex.nfa;
 
 import java.util.Arrays;
 
+import com.oracle.truffle.api.CompilerDirectives;
 import com.oracle.truffle.api.CompilerDirectives.CompilationFinal;
 import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
+import com.oracle.truffle.regex.charset.CodePointSet;
+import com.oracle.truffle.regex.charset.CodePointSetAccumulator;
 import com.oracle.truffle.regex.tregex.automaton.StateIndex;
+import com.oracle.truffle.regex.tregex.buffer.CompilationBuffer;
 import com.oracle.truffle.regex.tregex.dfa.DFAGenerator;
 import com.oracle.truffle.regex.tregex.parser.Counter;
 import com.oracle.truffle.regex.tregex.parser.ast.RegexAST;
@@ -56,18 +60,28 @@ import com.oracle.truffle.regex.tregex.util.json.JsonValue;
  * A NFA that corresponds to the subtree of one {@link RegexASTSubtreeRootNode}.
  */
 public final class PureNFA implements StateIndex<PureNFAState> {
-
+    private static final PureNFA[] NO_SUBTREES = {};
+    private final int globalSubTreeId;
     private final int subTreeId;
+    private final int fixedWidth;
     @CompilationFinal(dimensions = 1) private final PureNFAState[] states;
     @CompilationFinal(dimensions = 1) private final PureNFATransition[] transitions;
+    @CompilationFinal(dimensions = 1) private final PureNFA[] subtrees;
 
     public PureNFA(RegexASTSubtreeRootNode astSubRoot,
                     PureNFAState[] states,
                     Counter.ThresholdCounter stateIDCounter,
                     Counter.ThresholdCounter transitionIDCounter) {
+        this.globalSubTreeId = astSubRoot.getGlobalSubTreeId();
         this.subTreeId = astSubRoot.getSubTreeId();
+        if (astSubRoot.isFixedWidth()) {
+            this.fixedWidth = astSubRoot.getGroup().getMinPath();
+        } else {
+            this.fixedWidth = -1;
+        }
         this.states = new PureNFAState[stateIDCounter.getCount()];
         this.transitions = new PureNFATransition[transitionIDCounter.getCount()];
+        this.subtrees = astSubRoot.getSubtrees().isEmpty() ? NO_SUBTREES : new PureNFA[astSubRoot.getSubtrees().size()];
         for (PureNFAState s : states) {
             if (s == null) {
                 continue;
@@ -75,10 +89,6 @@ public final class PureNFA implements StateIndex<PureNFAState> {
             assert this.states[s.getId()] == null;
             this.states[s.getId()] = s;
             for (PureNFATransition t : s.getSuccessors()) {
-                if (s.getId() != 0) {
-                    // don't link the dummy initial state as predecessor of initial states.
-                    t.getTarget().addPredecessor(t);
-                }
                 assert this.transitions[t.getId()] == null || (s.getId() == 0 && this.transitions[t.getId()] == t);
                 this.transitions[t.getId()] = t;
             }
@@ -93,22 +103,36 @@ public final class PureNFA implements StateIndex<PureNFAState> {
         return subTreeId;
     }
 
+    public int getGlobalSubTreeId() {
+        return globalSubTreeId;
+    }
+
+    public boolean isRoot() {
+        return subTreeId < 0;
+    }
+
+    public RegexASTSubtreeRootNode getASTSubtree(RegexAST ast) {
+        return isRoot() ? ast.getRoot().getSubTreeParent() : ast.getSubtrees().get(globalSubTreeId);
+    }
+
+    public boolean isFixedWidth() {
+        return fixedWidth >= 0;
+    }
+
+    public int getFixedWidth() {
+        return fixedWidth;
+    }
+
     /**
      * Get this NFA's "dummy initial state". Since {@link DFAGenerator} works on sets of NFA
      * transitions, we need pseudo-transitions to the NFA's initial states as entry points for the
      * DFA generator. The dummy initial state provides these transitions, in a fixed layout: The
      * first half of its {@link PureNFAState#getSuccessors() successors} lead to the NFA's anchored
-     * initial states, and the second half leads to the unanchored initial states. The dummy initial
-     * state's {@link PureNFAState#getPredecessors() predecessors} are the NFA's anchored and
-     * unanchored final state, in that order. They serve as entry points for reverse DFAs.
+     * initial states, and the second half leads to the unanchored initial states.
      */
     public PureNFAState getDummyInitialState() {
-        assert states[0].getSuccessors().length == 2 && states[0].getPredecessors().length == 2;
+        assert states[0].getSuccessors().length == 2;
         return states[0];
-    }
-
-    public int getNumberOfEntryPoints() {
-        return getDummyInitialState().getSuccessors().length / 2;
     }
 
     public PureNFATransition getAnchoredEntry() {
@@ -127,30 +151,6 @@ public final class PureNFA implements StateIndex<PureNFAState> {
         return getAnchoredEntry().getTarget();
     }
 
-    public PureNFATransition getReverseAnchoredEntry() {
-        return getDummyInitialState().getPredecessors()[0];
-    }
-
-    public PureNFATransition getReverseUnAnchoredEntry() {
-        return getDummyInitialState().getPredecessors()[1];
-    }
-
-    public PureNFAState getUnAnchoredFinalState() {
-        return getReverseUnAnchoredEntry().getSource();
-    }
-
-    public PureNFAState getAnchoredFinalState() {
-        return getReverseAnchoredEntry().getSource();
-    }
-
-    public PureNFAState getUnAnchoredInitialState(boolean forward) {
-        return forward ? getUnAnchoredInitialState() : getUnAnchoredFinalState();
-    }
-
-    public PureNFAState getAnchoredInitialState(boolean forward) {
-        return forward ? getAnchoredInitialState() : getAnchoredFinalState();
-    }
-
     public PureNFAState[] getStates() {
         return states;
     }
@@ -159,9 +159,17 @@ public final class PureNFA implements StateIndex<PureNFAState> {
         return transitions;
     }
 
+    public PureNFA[] getSubtrees() {
+        return subtrees;
+    }
+
     @Override
     public int getNumberOfStates() {
         return states.length;
+    }
+
+    public int getNumberOfTransitions() {
+        return transitions.length;
     }
 
     @Override
@@ -183,11 +191,50 @@ public final class PureNFA implements StateIndex<PureNFAState> {
         }
     }
 
+    /**
+     * Creates a {@link CodePointSet} that matches the union of all code point sets of
+     * {@link PureNFAState#isCharacterClass() character class successor states} of the root NFA's
+     * {@link PureNFA#getUnAnchoredInitialState() unanchored initial state}. If this can not be
+     * calculated, e.g. because one of the successors is an {@link PureNFAState#isEmptyMatch() empty
+     * match state}, {@code null} is returned.
+     */
+    public CodePointSet getMergedInitialStateCharSet(RegexAST ast, CompilationBuffer compilationBuffer) {
+        CodePointSetAccumulator acc = compilationBuffer.getCodePointSetAccumulator1();
+        if (mergeInitialStateMatcher(ast, this, acc)) {
+            return acc.toCodePointSet();
+        }
+        return null;
+    }
+
+    private static boolean mergeInitialStateMatcher(RegexAST ast, PureNFA nfa, CodePointSetAccumulator acc) {
+        for (PureNFATransition t : nfa.getUnAnchoredInitialState().getSuccessors()) {
+            PureNFAState target = t.getTarget();
+            switch (target.getKind()) {
+                case PureNFAState.KIND_INITIAL_OR_FINAL_STATE:
+                case PureNFAState.KIND_BACK_REFERENCE:
+                case PureNFAState.KIND_EMPTY_MATCH:
+                    return false;
+                case PureNFAState.KIND_SUB_MATCHER:
+                    if (target.isSubMatcherNegated() || target.isLookBehind(ast) || !mergeInitialStateMatcher(ast, nfa.getSubtrees()[target.getSubtreeId()], acc)) {
+                        return false;
+                    }
+                    break;
+                case PureNFAState.KIND_CHARACTER_CLASS:
+                    acc.addSet(target.getCharSet());
+                    break;
+                default:
+                    throw CompilerDirectives.shouldNotReachHere();
+            }
+        }
+        return true;
+    }
+
     @TruffleBoundary
     public JsonValue toJson(RegexAST ast) {
         return Json.obj(Json.prop("states",
-                        Arrays.stream(states).map(x -> x == null || x == getDummyInitialState() || (x.isAnchoredFinalState() && !x.hasPredecessors()) ? Json.nullValue() : x.toJson(ast))),
+                        Arrays.stream(states).map(x -> x == null || x == getDummyInitialState() ? Json.nullValue() : x.toJson(ast))),
                         Json.prop("transitions", Arrays.stream(transitions).map(x -> x == null || x.getSource() == getDummyInitialState() ? Json.nullValue() : x.toJson(ast))),
+                        Json.prop("subtrees", Arrays.stream(subtrees).map(x -> x == null ? Json.nullValue() : x.toJson(ast))),
                         Json.prop("anchoredEntry", Json.array(Json.val(getAnchoredInitialState().getId()))),
                         Json.prop("unAnchoredEntry", Json.array(Json.val(getUnAnchoredInitialState().getId()))));
     }

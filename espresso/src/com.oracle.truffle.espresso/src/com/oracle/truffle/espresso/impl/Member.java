@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2017, 2021, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -22,28 +22,48 @@
  */
 package com.oracle.truffle.espresso.impl;
 
-import com.oracle.truffle.espresso.descriptors.Symbol;
-import com.oracle.truffle.espresso.descriptors.Symbol.Descriptor;
-import com.oracle.truffle.espresso.descriptors.Symbol.Name;
-import com.oracle.truffle.espresso.meta.ModifiersProvider;
+import java.util.function.Function;
 
-public abstract class Member<T extends Descriptor> implements ModifiersProvider {
+import com.oracle.truffle.api.dsl.Idempotent;
+import com.oracle.truffle.espresso.classfile.descriptors.Descriptor;
+import com.oracle.truffle.espresso.classfile.descriptors.Name;
+import com.oracle.truffle.espresso.classfile.descriptors.Symbol;
+import com.oracle.truffle.espresso.constantpool.Resolution;
+import com.oracle.truffle.espresso.runtime.staticobject.StaticObject;
+import com.oracle.truffle.espresso.shared.meta.MemberAccess;
 
-    protected final Symbol<Name> name;
-    protected final Symbol<T> descriptor;
+public abstract class Member<T extends Descriptor> implements MemberAccess<Klass, Method, Field> {
 
-    protected Member(Symbol<T> descriptor, Symbol<Name> name) {
-        this.name = name;
-        this.descriptor = descriptor;
-    }
+    public abstract Symbol<Name> getName();
 
-    public Symbol<Name> getName() {
-        return name;
-    }
-
-    public final Symbol<T> getDescriptor() {
-        return descriptor;
+    @Override
+    public final Symbol<Name> getSymbolicName() {
+        return getName();
     }
 
     public abstract ObjectKlass getDeclaringKlass();
+
+    @Override
+    public final ObjectKlass getDeclaringClass() {
+        return getDeclaringKlass();
+    }
+
+    @Override
+    public final boolean accessChecks(Klass accessingClass, Klass holderClass) {
+        return Resolution.memberCheckAccess(accessingClass, holderClass, this);
+    }
+
+    @Override
+    @Idempotent
+    // Re-implement here for indempotent annotation. Some of our nodes benefit from it.
+    public boolean isAbstract() {
+        return MemberAccess.super.isAbstract();
+    }
+
+    @Override
+    public final void loadingConstraints(Klass accessingClass, Function<String, RuntimeException> errorHandler) {
+        checkLoadingConstraints(accessingClass.getDefiningClassLoader(), getDeclaringKlass().getDefiningClassLoader(), errorHandler);
+    }
+
+    public abstract void checkLoadingConstraints(StaticObject loader1, StaticObject loader2, Function<String, RuntimeException> errorHandler);
 }

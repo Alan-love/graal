@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -61,10 +61,11 @@ import com.oracle.truffle.regex.tregex.util.json.JsonValue;
 
 public final class DFAStateNodeBuilder extends BasicState<DFAStateNodeBuilder, DFAStateTransitionBuilder> implements JsonConvertible {
 
-    private static final byte FLAG_OVERRIDE_FINAL_STATE = 1 << (N_FLAGS + 0);
-    private static final byte FLAG_FINAL_STATE_SUCCESSOR = 1 << (N_FLAGS + 1);
-    private static final byte FLAG_BACKWARD_PREFIX_STATE = 1 << (N_FLAGS + 2);
-    private static final byte FLAG_FORWARD = (byte) (1 << (N_FLAGS + 3));
+    private static final short FLAG_OVERRIDE_FINAL_STATE = 1 << (N_FLAGS + 0);
+    private static final short FLAG_FINAL_STATE_SUCCESSOR = 1 << (N_FLAGS + 1);
+    private static final short FLAG_BACKWARD_PREFIX_STATE = 1 << (N_FLAGS + 2);
+    private static final short FLAG_FORWARD = 1 << (N_FLAGS + 3);
+    private static final short FLAG_PRIORITY_SENSITIVE = 1 << (N_FLAGS + 4);
 
     private static final DFAStateTransitionBuilder[] EMPTY_TRANSITIONS = new DFAStateTransitionBuilder[0];
     private static final DFAStateTransitionBuilder[] NODE_SPLIT_TAINTED = new DFAStateTransitionBuilder[0];
@@ -77,12 +78,13 @@ public final class DFAStateNodeBuilder extends BasicState<DFAStateNodeBuilder, D
     private byte preCalculatedUnAnchoredResult = TraceFinderDFAStateNode.NO_PRE_CALC_RESULT;
     private byte preCalculatedAnchoredResult = TraceFinderDFAStateNode.NO_PRE_CALC_RESULT;
 
-    DFAStateNodeBuilder(int id, TransitionSet<NFA, NFAState, NFAStateTransition> nfaStateSet, boolean isBackwardPrefixState, boolean isInitialState, boolean forward) {
+    DFAStateNodeBuilder(int id, TransitionSet<NFA, NFAState, NFAStateTransition> nfaStateSet, boolean isBackwardPrefixState, boolean isInitialState, boolean forward, boolean prioritySensitive) {
         super(id, EMPTY_TRANSITIONS);
         assert id <= Short.MAX_VALUE;
         this.nfaTransitionSet = nfaStateSet;
         setFlag(FLAG_BACKWARD_PREFIX_STATE, isBackwardPrefixState);
         setFlag(FLAG_FORWARD, forward);
+        setFlag(FLAG_PRIORITY_SENSITIVE, prioritySensitive);
         setUnAnchoredInitialState(isInitialState);
         if (isBackwardPrefixState) {
             this.backwardPrefixState = (short) id;
@@ -169,7 +171,7 @@ public final class DFAStateNodeBuilder extends BasicState<DFAStateNodeBuilder, D
     }
 
     public boolean isPrioritySensitive() {
-        return getFlag(FLAG_FORWARD);
+        return getFlag(FLAG_PRIORITY_SENSITIVE);
     }
 
     public int getNumberOfSuccessors() {
@@ -283,37 +285,52 @@ public final class DFAStateNodeBuilder extends BasicState<DFAStateNodeBuilder, D
         preCalculatedAnchoredResult = TraceFinderDFAStateNode.NO_PRE_CALC_RESULT;
     }
 
-    public void updateFinalStateData(DFAGenerator dfaGenerator) {
+    public DFAStateNodeBuilder updateFinalStateData(DFAGenerator dfaGenerator) {
         boolean forward = dfaGenerator.isForward();
-        for (NFAStateTransition t : nfaTransitionSet.getTransitions()) {
-            NFAState target = t.getTarget(forward);
-            if (target.hasTransitionToAnchoredFinalState(forward)) {
-                if (anchoredFinalStateTransition == null) {
+        boolean traceFinder = dfaGenerator.getNfa().isTraceFinderNFA();
+        if (forward) {
+            for (NFAStateTransition t : nfaTransitionSet.getTransitions()) {
+                // In forward mode, a state is final if it contains a NFA transition to a NFA state
+                // that has a subsequent transition to a final state
+                NFAState target = t.getTarget(true);
+                if (target.hasTransitionToAnchoredFinalState(true) && anchoredFinalStateTransition == null) {
                     setAnchoredFinalState();
-                    setAnchoredFinalStateTransition(target.getTransitionToAnchoredFinalState(forward));
+                    setAnchoredFinalStateTransition(target.getFirstTransitionToFinalState(true));
+                }
+                if (target.hasTransitionToUnAnchoredFinalState(true)) {
+                    setUnAnchoredFinalState();
+                    setUnAnchoredFinalStateTransition(target.getTransitionToUnAnchoredFinalState(true));
+                    return this;
                 }
             }
-            if (target.hasTransitionToUnAnchoredFinalState(forward)) {
-                setUnAnchoredFinalState();
-                setUnAnchoredFinalStateTransition(target.getTransitionToUnAnchoredFinalState(forward));
-                if (forward) {
-                    return;
-                }
-            }
-            if (dfaGenerator.getNfa().isTraceFinderNFA()) {
-                for (NFAStateTransition t2 : target.getSuccessors(forward)) {
-                    NFAState target2 = t2.getTarget(forward);
-                    if (target2.isAnchoredFinalState(forward)) {
-                        assert target2.hasPossibleResults() && target2.getPossibleResults().numberOfSetBits() == 1;
-                        updatePreCalcAnchoredResult(target2.getPossibleResults().iterator().nextInt());
+        } else {
+            for (NFAStateTransition t : nfaTransitionSet.getTransitions()) {
+                // In backward mode, a state is final if it contains a NFA transition to a NFA final
+                // state
+                NFAState target = t.getTarget(false);
+                if (target.isAnchoredFinalState(false)) {
+                    if (!(traceFinder && isBackwardPrefixState()) || target.hasPrefixStates()) {
+                        if (traceFinder) {
+                            assert target.hasPossibleResults() && target.getPossibleResults().numberOfSetBits() == 1;
+                            updatePreCalcAnchoredResult(target.getPossibleResults().iterator().nextInt());
+                        }
+                        setAnchoredFinalState();
+                        setAnchoredFinalStateTransition(t);
                     }
-                    if (target2.isUnAnchoredFinalState(forward)) {
-                        assert target2.hasPossibleResults() && target2.getPossibleResults().numberOfSetBits() == 1;
-                        updatePreCalcUnAnchoredResult(target2.getPossibleResults().iterator().nextInt());
+                }
+                if (target.isUnAnchoredFinalState(false)) {
+                    if (!(traceFinder && isBackwardPrefixState()) || target.hasPrefixStates()) {
+                        if (traceFinder) {
+                            assert target.hasPossibleResults() && target.getPossibleResults().numberOfSetBits() == 1;
+                            updatePreCalcUnAnchoredResult(target.getPossibleResults().iterator().nextInt());
+                        }
+                        setUnAnchoredFinalState();
+                        setUnAnchoredFinalStateTransition(t);
                     }
                 }
             }
         }
+        return this;
     }
 
     public String stateSetToString() {
@@ -388,7 +405,7 @@ public final class DFAStateNodeBuilder extends BasicState<DFAStateNodeBuilder, D
     @Override
     public JsonValue toJson() {
         return Json.obj(Json.prop("id", getId()),
-                        Json.prop("stateSet", Json.array(Arrays.stream(nfaTransitionSet.getTransitions()).map(x -> Json.val(x.getTarget().getId())))),
+                        Json.prop("stateSet", Json.array(Arrays.stream(nfaTransitionSet.getTransitions()).map(x -> Json.val(x.getTarget(isForward()).getId())))),
                         Json.prop("finalState", isUnAnchoredFinalState()),
                         Json.prop("anchoredFinalState", isAnchoredFinalState()),
                         Json.prop("transitions", Arrays.stream(getSuccessors()).map(x -> Json.val(x.getId()))));

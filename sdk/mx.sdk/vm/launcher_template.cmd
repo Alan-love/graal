@@ -75,20 +75,21 @@ for %%a in (%args%) do (
 )
 
 set "module_launcher=<module_launcher>"
+:: The list of --add-exports can easily exceed the 8191 command
+:: line character limit so pass them in a command line arguments file.
 if "%module_launcher%"=="True" (
+  set "main_class=--module <main_module>/<main_class>"
   set "app_path_arg=--module-path"
-  call :escape_args <add_exports>
-  for %%v in (!args!) do (
-    call :unescape_arg %%v
-    set "jvm_args=!jvm_args! !arg!"
-  )
+  set exports_file="%location%!basename!.export-list"
+  set "jvm_args=!jvm_args! @!exports_file!"
 ) else (
+  set "main_class=<main_class>"
   set "app_path_arg=-cp"
 )
 
 if "%VERBOSE_GRAALVM_LAUNCHERS%"=="true" echo on
 
-"%location%<jre_bin>\java" <extra_jvm_args> %jvm_args% %app_path_arg% "%absolute_cp%" <main_class> %launcher_args%
+"%location%<jre_bin>\java" <extra_jvm_args> %jvm_args% %app_path_arg% "%absolute_cp%" %main_class% %launcher_args%
 
 exit /b %errorlevel%
 :: Function are defined via labels, so have to be defined at the end of the file and skipped
@@ -98,16 +99,16 @@ exit /b %errorlevel%
     set "args=%*"
     :: Without early exit on empty contents, substitutions fail.
     if "!args!"=="" exit /b 0
-    set "args=%args:,=##GRAAL_ESCAPE_COMMA##%"
-    set "args=%args:;=##GRAAL_ESCAPE_SEMI##%"
+    set "args=%args:,=##GR_ESC_COMMA##%"
+    set "args=%args:;=##GR_ESC_SEMI##%"
     :: Temporarily, so that args are split on '=' only.
-    set "args=%args: =##GRAAL_ESCAPE_SPACE##%"
+    set "args=%args: =##GR_ESC_SPACE##%"
     :: Temporarily, otherwise we won't split on '=' inside quotes.
-    set "args=%args:"=##GRAAL_ESCAPE_QUOTE##%"
+    set "args=%args:"=##GR_ESC_QUOTE##%"
     :: We can't replace equal using the variable substitution syntax.
     call :replace_equals %args%
-    set "args=%args:##GRAAL_ESCAPE_SPACE##= %"
-    set "args=%args:##GRAAL_ESCAPE_QUOTE##="%"
+    set "args=%args:##GR_ESC_SPACE##= %"
+    set "args=%args:##GR_ESC_QUOTE##="%"
     exit /b 0
 
 :replace_equals
@@ -121,7 +122,7 @@ exit /b %errorlevel%
     :loop_replace_equals
         set "arg=%1"
         if "!arg!"=="" goto :end_replace_equals
-        set "args=%args%##GRAAL_ESCAPE_EQUAL##%arg%"
+        set "args=%args%##GR_ESC_EQUAL##%arg%"
         shift
         goto :loop_replace_equals
     :end_replace_equals
@@ -130,9 +131,9 @@ exit /b %errorlevel%
 
 :unescape_arg
     set "arg=%*"
-    set "arg=%arg:##GRAAL_ESCAPE_COMMA##=,%"
-    set "arg=%arg:##GRAAL_ESCAPE_SEMI##=;%"
-    set "arg=%arg:##GRAAL_ESCAPE_EQUAL##==%"
+    set "arg=%arg:##GR_ESC_COMMA##=,%"
+    set "arg=%arg:##GR_ESC_SEMI##=;%"
+    set "arg=%arg:##GR_ESC_EQUAL##==%"
     exit /b 0
 
 :is_quoted
@@ -186,6 +187,9 @@ exit /b %errorlevel%
     ) else if "!vm_arg:~0,10!"=="classpath=" (
         call :unquote_arg %vm_arg:~10%
         set "absolute_cp=%absolute_cp%;!arg!"
+    ) else if "!vm_arg:~0,1!"=="@" (
+        if %arg_quoted%==true ( set "arg="%vm_arg%"" ) else ( set "arg=%vm_arg%" )
+        set "jvm_args=%jvm_args% !arg!"
     ) else (
         if %arg_quoted%==true ( set "arg="-%vm_arg%"" ) else ( set "arg=-%vm_arg%" )
         set "jvm_args=%jvm_args% !arg!"

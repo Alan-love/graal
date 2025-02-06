@@ -23,18 +23,16 @@
 
 package com.oracle.truffle.espresso.impl;
 
-import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
-
-import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
-import com.oracle.truffle.espresso.descriptors.Symbol;
-import com.oracle.truffle.espresso.descriptors.Symbol.Type;
-import com.oracle.truffle.espresso.descriptors.Types;
-import com.oracle.truffle.espresso.runtime.ClasspathFile;
+import com.oracle.truffle.espresso.classfile.ClasspathFile;
+import com.oracle.truffle.espresso.classfile.descriptors.Symbol;
+import com.oracle.truffle.espresso.classfile.descriptors.Type;
+import com.oracle.truffle.espresso.classfile.descriptors.TypeSymbols;
+import com.oracle.truffle.espresso.classfile.perf.DebugCloseable;
+import com.oracle.truffle.espresso.classfile.perf.DebugCounter;
+import com.oracle.truffle.espresso.classfile.perf.DebugTimer;
 import com.oracle.truffle.espresso.runtime.EspressoContext;
-import com.oracle.truffle.espresso.runtime.StaticObject;
-import com.oracle.truffle.espresso.substitutions.Host;
-import com.oracle.truffle.espresso.perf.DebugCounter;
+import com.oracle.truffle.espresso.runtime.staticobject.StaticObject;
+import com.oracle.truffle.espresso.substitutions.JavaType;
 
 /**
  * A {@link BootClassRegistry} maps type names to resolved {@link Klass} instances loaded by the
@@ -44,6 +42,7 @@ public final class BootClassRegistry extends ClassRegistry {
 
     static final DebugCounter loadKlassCount = DebugCounter.create("BCL loadKlassCount");
     static final DebugCounter loadKlassCacheHits = DebugCounter.create("BCL loadKlassCacheHits");
+    private static final DebugTimer BOOT_KLASS_READ = DebugTimer.create("boot klass read");
 
     @Override
     protected void loadKlassCountInc() {
@@ -55,42 +54,34 @@ public final class BootClassRegistry extends ClassRegistry {
         loadKlassCacheHits.inc();
     }
 
-    private final Map<String, String> packageMap = new ConcurrentHashMap<>();
-
-    public BootClassRegistry(EspressoContext context) {
-        super(context);
+    public BootClassRegistry(long loaderID) {
+        super(loaderID);
     }
 
     @Override
-    public Klass loadKlassImpl(Symbol<Type> type) {
-        if (Types.isPrimitive(type)) {
+    @SuppressWarnings("try")
+    public Klass loadKlassImpl(EspressoContext context, Symbol<Type> type) throws EspressoClassLoadingException {
+        ClassLoadingEnv env = context.getClassLoadingEnv();
+        if (TypeSymbols.isPrimitive(type)) {
             return null;
         }
-        ClasspathFile classpathFile = getContext().getBootClasspath().readClassFile(type);
-        if (classpathFile == null) {
-            return null;
+        ClasspathFile classpathFile;
+        try (DebugCloseable scope = BOOT_KLASS_READ.scope(env.getTimers())) {
+            classpathFile = context.getBootClasspath().readClassFile(type);
+            if (classpathFile == null) {
+                return null;
+            }
         }
         // Defining a class also loads the superclass and the superinterfaces which excludes the
         // use of computeIfAbsent to insert the class since the map is modified.
-        ObjectKlass result = defineKlass(type, classpathFile.contents);
-        getRegistries().recordConstraint(type, result, getClassLoader());
-        packageMap.put(result.getRuntimePackage().toString(), classpathFile.classpathEntry.path());
+        ObjectKlass result = defineKlass(context, type, classpathFile.contents);
+        context.getRegistries().recordConstraint(type, result, getClassLoader());
+        result.packageEntry().setBootClasspathLocation(classpathFile.classpathEntry.path());
         return result;
-    }
-
-    @TruffleBoundary
-    public String getPackagePath(String pkgName) {
-        String result = packageMap.get(pkgName);
-        return result;
-    }
-
-    @TruffleBoundary
-    public String[] getPackages() {
-        return packageMap.keySet().toArray(new String[0]);
     }
 
     @Override
-    public @Host(ClassLoader.class) StaticObject getClassLoader() {
+    public @JavaType(ClassLoader.class) StaticObject getClassLoader() {
         return StaticObject.NULL;
     }
 }

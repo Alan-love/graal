@@ -26,18 +26,16 @@ package com.oracle.svm.core.graal.meta;
 
 import java.util.Map;
 
-import org.graalvm.compiler.api.replacements.SnippetReflectionProvider;
-import org.graalvm.compiler.core.common.spi.ForeignCallsProvider;
-import org.graalvm.compiler.core.common.spi.MetaAccessExtensionProvider;
-import org.graalvm.compiler.core.common.type.Stamp;
-import org.graalvm.compiler.debug.DebugHandlersFactory;
-import org.graalvm.compiler.graph.Node;
-import org.graalvm.compiler.nodes.StructuredGraph;
-import org.graalvm.compiler.nodes.ValueNode;
-import org.graalvm.compiler.nodes.spi.LoweringProvider;
-import org.graalvm.compiler.nodes.spi.PlatformConfigurationProvider;
-import org.graalvm.compiler.options.OptionValues;
-import org.graalvm.compiler.phases.util.Providers;
+import jdk.graal.compiler.core.common.spi.ForeignCallsProvider;
+import jdk.graal.compiler.core.common.spi.MetaAccessExtensionProvider;
+import jdk.graal.compiler.core.common.type.Stamp;
+import jdk.graal.compiler.graph.Node;
+import jdk.graal.compiler.nodes.StructuredGraph;
+import jdk.graal.compiler.nodes.ValueNode;
+import jdk.graal.compiler.nodes.spi.LoweringProvider;
+import jdk.graal.compiler.nodes.spi.PlatformConfigurationProvider;
+import jdk.graal.compiler.options.OptionValues;
+import jdk.graal.compiler.phases.util.Providers;
 
 import com.oracle.svm.core.graal.GraalConfiguration;
 import com.oracle.svm.core.graal.snippets.NodeLoweringProvider;
@@ -47,7 +45,7 @@ import jdk.vm.ci.meta.MetaAccessProvider;
 
 public interface SubstrateLoweringProvider extends LoweringProvider {
 
-    void setConfiguration(RuntimeConfiguration runtimeConfig, OptionValues options, Iterable<DebugHandlersFactory> factories, Providers providers, SnippetReflectionProvider snippetReflection);
+    void setConfiguration(RuntimeConfiguration runtimeConfig, OptionValues options, Providers providers);
 
     Map<Class<? extends Node>, NodeLoweringProvider<?>> getLowerings();
 
@@ -55,10 +53,18 @@ public interface SubstrateLoweringProvider extends LoweringProvider {
 
     Stamp loadStamp(Stamp stamp, JavaKind kind);
 
-    static LoweringProvider create(MetaAccessProvider metaAccess, ForeignCallsProvider foreignCalls, PlatformConfigurationProvider platformConfig,
+    static LoweringProvider createForHosted(MetaAccessProvider metaAccess, ForeignCallsProvider foreignCalls, PlatformConfigurationProvider platformConfig,
                     MetaAccessExtensionProvider metaAccessExtensionProvider) {
-        return GraalConfiguration.instance().createLoweringProvider(metaAccess, foreignCalls, platformConfig, metaAccessExtensionProvider);
-
+        return GraalConfiguration.hostedInstance().createLoweringProvider(metaAccess, foreignCalls, platformConfig, metaAccessExtensionProvider);
     }
 
+    static LoweringProvider createForRuntime(MetaAccessProvider metaAccess, ForeignCallsProvider foreignCalls, PlatformConfigurationProvider platformConfig,
+                    MetaAccessExtensionProvider metaAccessExtensionProvider) {
+        return GraalConfiguration.runtimeInstance().createLoweringProvider(metaAccess, foreignCalls, platformConfig, metaAccessExtensionProvider);
+    }
+
+    @Override
+    default boolean supportsImplicitNullChecks() {
+        return false;
+    }
 }

@@ -27,7 +27,6 @@ package com.oracle.svm.truffle.isolated;
 import java.net.URI;
 import java.net.URISyntaxException;
 
-import org.graalvm.compiler.truffle.common.TruffleSourceLanguagePosition;
 import org.graalvm.nativeimage.c.function.CEntryPoint;
 
 import com.oracle.svm.core.c.function.CEntryPointOptions;
@@ -39,6 +38,7 @@ import com.oracle.svm.graal.isolated.IsolatedCompileClient;
 import com.oracle.svm.graal.isolated.IsolatedCompileContext;
 import com.oracle.svm.graal.isolated.IsolatedHandles;
 import com.oracle.svm.graal.isolated.IsolatedObjectProxy;
+import com.oracle.truffle.compiler.TruffleSourceLanguagePosition;
 
 final class IsolatedTruffleSourceLanguagePosition extends IsolatedObjectProxy<TruffleSourceLanguagePosition> implements TruffleSourceLanguagePosition {
     private final int lineNumber;
@@ -103,29 +103,29 @@ final class IsolatedTruffleSourceLanguagePosition extends IsolatedObjectProxy<Tr
         return nodeId;
     }
 
-    @CEntryPoint
-    @CEntryPointOptions(include = CEntryPointOptions.NotIncludedAutomatically.class, publishAs = CEntryPointOptions.Publish.NotPublished)
+    @CEntryPoint(exceptionHandler = IsolatedCompileClient.WordExceptionHandler.class, include = CEntryPoint.NotIncludedAutomatically.class, publishAs = CEntryPoint.Publish.NotPublished)
+    @CEntryPointOptions(callerEpilogue = IsolatedCompileClient.ExceptionRethrowCallerEpilogue.class)
     private static CompilerHandle<String> getDescription0(@SuppressWarnings("unused") ClientIsolateThread client, ClientHandle<TruffleSourceLanguagePosition> positionHandle) {
         String description = IsolatedCompileClient.get().unhand(positionHandle).getDescription();
         return IsolatedCompileClient.get().createStringInCompiler(description);
     }
 
-    @CEntryPoint
-    @CEntryPointOptions(include = CEntryPointOptions.NotIncludedAutomatically.class, publishAs = CEntryPointOptions.Publish.NotPublished)
+    @CEntryPoint(exceptionHandler = IsolatedCompileClient.WordExceptionHandler.class, include = CEntryPoint.NotIncludedAutomatically.class, publishAs = CEntryPoint.Publish.NotPublished)
+    @CEntryPointOptions(callerEpilogue = IsolatedCompileClient.ExceptionRethrowCallerEpilogue.class)
     private static CompilerHandle<String> getURIString0(@SuppressWarnings("unused") ClientIsolateThread client, ClientHandle<TruffleSourceLanguagePosition> positionHandle) {
         URI uri = IsolatedCompileClient.get().unhand(positionHandle).getURI();
         return (uri != null) ? IsolatedCompileClient.get().createStringInCompiler(uri.toString()) : IsolatedHandles.nullHandle();
     }
 
-    @CEntryPoint
-    @CEntryPointOptions(include = CEntryPointOptions.NotIncludedAutomatically.class, publishAs = CEntryPointOptions.Publish.NotPublished)
+    @CEntryPoint(exceptionHandler = IsolatedCompileClient.WordExceptionHandler.class, include = CEntryPoint.NotIncludedAutomatically.class, publishAs = CEntryPoint.Publish.NotPublished)
+    @CEntryPointOptions(callerEpilogue = IsolatedCompileClient.ExceptionRethrowCallerEpilogue.class)
     private static CompilerHandle<String> getLanguage0(@SuppressWarnings("unused") ClientIsolateThread client, ClientHandle<TruffleSourceLanguagePosition> positionHandle) {
         String language = IsolatedCompileClient.get().unhand(positionHandle).getLanguage();
         return IsolatedCompileClient.get().createStringInCompiler(language);
     }
 
-    @CEntryPoint
-    @CEntryPointOptions(include = CEntryPointOptions.NotIncludedAutomatically.class, publishAs = CEntryPointOptions.Publish.NotPublished)
+    @CEntryPoint(exceptionHandler = IsolatedCompileClient.WordExceptionHandler.class, include = CEntryPoint.NotIncludedAutomatically.class, publishAs = CEntryPoint.Publish.NotPublished)
+    @CEntryPointOptions(callerEpilogue = IsolatedCompileClient.ExceptionRethrowCallerEpilogue.class)
     private static CompilerHandle<String> getNodeClassName0(@SuppressWarnings("unused") ClientIsolateThread client, ClientHandle<TruffleSourceLanguagePosition> positionHandle) {
         String language = IsolatedCompileClient.get().unhand(positionHandle).getNodeClassName();
         return IsolatedCompileClient.get().createStringInCompiler(language);

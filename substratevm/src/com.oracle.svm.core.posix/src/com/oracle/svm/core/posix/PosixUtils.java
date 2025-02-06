@@ -24,49 +24,63 @@
  */
 package com.oracle.svm.core.posix;
 
-import java.io.FileDescriptor;
-import java.io.IOException;
-import java.util.function.Function;
+import static com.oracle.svm.core.Uninterruptible.CALLED_FROM_UNINTERRUPTIBLE_CODE;
+import static com.oracle.svm.core.posix.headers.Unistd._SC_GETPW_R_SIZE_MAX;
 
-import com.oracle.svm.core.posix.linux.libc.GLibC;
-import com.oracle.svm.core.c.libc.LibCBase;
-import org.graalvm.compiler.serviceprovider.JavaVersionUtil;
-import org.graalvm.nativeimage.ImageSingletons;
+import java.io.FileDescriptor;
+
 import org.graalvm.nativeimage.Platform;
-import org.graalvm.nativeimage.Platforms;
-import org.graalvm.nativeimage.StackValue;
+import org.graalvm.nativeimage.c.struct.SizeOf;
 import org.graalvm.nativeimage.c.type.CCharPointer;
 import org.graalvm.nativeimage.c.type.CIntPointer;
 import org.graalvm.nativeimage.c.type.CTypeConversion;
 import org.graalvm.nativeimage.c.type.CTypeConversion.CCharPointerHolder;
+import org.graalvm.word.Pointer;
 import org.graalvm.word.PointerBase;
 import org.graalvm.word.SignedWord;
 import org.graalvm.word.UnsignedWord;
-import org.graalvm.word.WordFactory;
 
-import com.oracle.svm.core.CErrorNumber;
 import com.oracle.svm.core.SubstrateUtil;
+import com.oracle.svm.core.Uninterruptible;
 import com.oracle.svm.core.annotate.Alias;
 import com.oracle.svm.core.annotate.TargetClass;
-import com.oracle.svm.core.annotate.Uninterruptible;
+import com.oracle.svm.core.c.libc.GLibC;
+import com.oracle.svm.core.c.libc.LibCBase;
+import com.oracle.svm.core.c.locale.LocaleSupport;
+import com.oracle.svm.core.graal.stackvalue.UnsafeStackValue;
+import com.oracle.svm.core.headers.LibC;
+import com.oracle.svm.core.hub.DynamicHub;
+import com.oracle.svm.core.hub.LayoutEncoding;
+import com.oracle.svm.core.memory.NullableNativeMemory;
+import com.oracle.svm.core.nmt.NmtCategory;
 import com.oracle.svm.core.posix.headers.Dlfcn;
 import com.oracle.svm.core.posix.headers.Errno;
 import com.oracle.svm.core.posix.headers.Locale;
+import com.oracle.svm.core.posix.headers.Pwd;
+import com.oracle.svm.core.posix.headers.Pwd.passwd;
+import com.oracle.svm.core.posix.headers.Pwd.passwdPointer;
+import com.oracle.svm.core.posix.headers.Time;
 import com.oracle.svm.core.posix.headers.Unistd;
 import com.oracle.svm.core.posix.headers.Wait;
+import com.oracle.svm.core.posix.headers.darwin.DarwinTime;
+import com.oracle.svm.core.posix.headers.linux.LinuxTime;
+import com.oracle.svm.core.snippets.KnownIntrinsics;
+import com.oracle.svm.core.util.BasedOnJDKFile;
 import com.oracle.svm.core.util.VMError;
 
-public class PosixUtils {
+import jdk.graal.compiler.word.Word;
 
+public class PosixUtils {
+    /** This method is unsafe and should not be used, see {@link LocaleSupport}. */
     static String setLocale(String category, String locale) {
         int intCategory = getCategory(category);
-
         return setLocale(intCategory, locale);
     }
 
+    /** This method is unsafe and should not be used, see {@link LocaleSupport}. */
     private static String setLocale(int category, String locale) {
         if (locale == null) {
-            CCharPointer cstrResult = Locale.setlocale(category, WordFactory.nullPointer());
+            CCharPointer cstrResult = Locale.setlocale(category, Word.nullPointer());
             return CTypeConversion.toJavaString(cstrResult);
         }
         try (CCharPointerHolder localePin = CTypeConversion.toCString(locale)) {
@@ -94,7 +108,7 @@ public class PosixUtils {
                 return Locale.LC_MESSAGES();
         }
 
-        if (Platform.includedIn(Platform.LINUX.class) && ImageSingletons.lookup(LibCBase.class).getClass().equals(GLibC.class)) {
+        if (Platform.includedIn(Platform.LINUX.class) && LibCBase.targetLibCIs(GLibC.class)) {
             switch (category) {
                 case "LC_PAPER":
                     return Locale.LC_PAPER();
@@ -129,12 +143,8 @@ public class PosixUtils {
 
     /** Return the error string for the last error, or a default message. */
     public static String lastErrorString(String defaultMsg) {
-        int errno = CErrorNumber.getCErrorNumber();
+        int errno = LibC.errno();
         return errorString(errno, defaultMsg);
-    }
-
-    public static IOException newIOExceptionWithLastError(String defaultMsg) {
-        return new IOException(lastErrorString(defaultMsg));
     }
 
     /** Return the error string for the given error number, or a default message. */
@@ -150,34 +160,23 @@ public class PosixUtils {
         return Unistd.getpid();
     }
 
-    @Platforms(Platform.HOSTED_ONLY.class)
-    private static final class ProcessNameProvider implements Function<TargetClass, String> {
-        @Override
-        public String apply(TargetClass annotation) {
-            if (JavaVersionUtil.JAVA_SPEC <= 8) {
-                return "java.lang.UNIXProcess";
-            } else {
-                return "java.lang.ProcessImpl";
-            }
-        }
-    }
-
-    @TargetClass(classNameProvider = ProcessNameProvider.class)
-    private static final class Target_java_lang_UNIXProcess {
+    @TargetClass(className = "java.lang.ProcessImpl")
+    private static final class Target_java_lang_ProcessImpl {
         @Alias int pid;
     }
 
     public static int getpid(Process process) {
-        Target_java_lang_UNIXProcess instance = SubstrateUtil.cast(process, Target_java_lang_UNIXProcess.class);
+        Target_java_lang_ProcessImpl instance = SubstrateUtil.cast(process, Target_java_lang_ProcessImpl.class);
         return instance.pid;
     }
 
     public static int waitForProcessExit(int ppid) {
-        CIntPointer statusptr = StackValue.get(CIntPointer.class);
+        CIntPointer statusptr = UnsafeStackValue.get(CIntPointer.class);
         while (Wait.waitpid(ppid, statusptr, 0) < 0) {
-            if (CErrorNumber.getCErrorNumber() == Errno.ECHILD()) {
+            int errno = LibC.errno();
+            if (errno == Errno.ECHILD()) {
                 return 0;
-            } else if (CErrorNumber.getCErrorNumber() == Errno.EINTR()) {
+            } else if (errno == Errno.EINTR()) {
                 break;
             } else {
                 return -1;
@@ -198,25 +197,52 @@ public class PosixUtils {
      * Low-level output of bytes already in native memory. This method is allocation free, so that
      * it can be used, e.g., in low-level logging routines.
      */
-    public static boolean writeBytes(FileDescriptor descriptor, CCharPointer bytes, UnsignedWord length) {
-        CCharPointer curBuf = bytes;
-        UnsignedWord curLen = length;
-        while (curLen.notEqual(0)) {
+    public static boolean write(FileDescriptor descriptor, CCharPointer data, UnsignedWord size) {
+        CCharPointer position = data;
+        UnsignedWord remaining = size;
+        while (remaining.notEqual(0)) {
             int fd = getFD(descriptor);
             if (fd == -1) {
                 return false;
             }
 
-            SignedWord n = Unistd.write(fd, curBuf, curLen);
-            if (n.equal(-1)) {
-                if (CErrorNumber.getCErrorNumber() == Errno.EINTR()) {
+            SignedWord writtenBytes = Unistd.write(fd, position, remaining);
+            if (writtenBytes.equal(-1)) {
+                if (LibC.errno() == Errno.EINTR()) {
                     // Retry the write if it was interrupted before any bytes were written.
                     continue;
                 }
                 return false;
             }
-            curBuf = curBuf.addressOf(n);
-            curLen = curLen.subtract((UnsignedWord) n);
+            position = position.addressOf(writtenBytes);
+            remaining = remaining.subtract((UnsignedWord) writtenBytes);
+        }
+        return true;
+    }
+
+    @Uninterruptible(reason = "Array must not move.")
+    public static boolean writeUninterruptibly(int fd, byte[] data) {
+        DynamicHub hub = KnownIntrinsics.readHub(data);
+        UnsignedWord baseOffset = LayoutEncoding.getArrayBaseOffset(hub.getLayoutEncoding());
+        Pointer dataPtr = Word.objectToUntrackedPointer(data).add(baseOffset);
+        return writeUninterruptibly(fd, dataPtr, Word.unsigned(data.length));
+    }
+
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    public static boolean writeUninterruptibly(int fd, Pointer data, UnsignedWord size) {
+        Pointer position = data;
+        UnsignedWord remaining = size;
+        while (remaining.notEqual(0)) {
+            SignedWord writtenBytes = Unistd.NoTransitions.write(fd, position, remaining);
+            if (writtenBytes.equal(-1)) {
+                if (LibC.errno() == Errno.EINTR()) {
+                    // Retry the write if it was interrupted before any bytes were written.
+                    continue;
+                }
+                return false;
+            }
+            position = position.add((UnsignedWord) writtenBytes);
+            remaining = remaining.subtract((UnsignedWord) writtenBytes);
         }
         return true;
     }
@@ -231,6 +257,10 @@ public class PosixUtils {
             CCharPointer pathPtr = pathPin.get();
             return Dlfcn.dlopen(pathPtr, mode);
         }
+    }
+
+    public static boolean dlclose(PointerBase handle) {
+        return Dlfcn.dlclose(handle) == 0;
     }
 
     public static <T extends PointerBase> T dlsym(PointerBase handle, String name) {
@@ -249,14 +279,92 @@ public class PosixUtils {
         VMError.guarantee(status == 0, message);
     }
 
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    public static int readBytes(int fd, CCharPointer buffer, int bufferLen, int readOffset) {
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    public static int readUninterruptibly(int fd, Pointer buffer, int bufferLen, int bufferOffset) {
         int readBytes = -1;
-        if (readOffset < bufferLen) {
+        if (bufferOffset < bufferLen) {
             do {
-                readBytes = (int) Unistd.NoTransitions.read(fd, buffer.addressOf(readOffset), WordFactory.unsigned(bufferLen - readOffset)).rawValue();
-            } while (readBytes == -1 && CErrorNumber.getCErrorNumber() == Errno.EINTR());
+                readBytes = (int) Unistd.NoTransitions.read(fd, buffer.add(bufferOffset), Word.unsigned(bufferLen - bufferOffset)).rawValue();
+            } while (readBytes == -1 && LibC.errno() == Errno.EINTR());
         }
         return readBytes;
+    }
+
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    public static int readUninterruptibly(int fd, Pointer buffer, int bufferSize) {
+        VMError.guarantee(bufferSize >= 0);
+        long readBytes = readUninterruptibly(fd, buffer, Word.unsigned(bufferSize));
+        assert (int) readBytes == readBytes;
+        return (int) readBytes;
+    }
+
+    @Uninterruptible(reason = CALLED_FROM_UNINTERRUPTIBLE_CODE, mayBeInlined = true)
+    public static long readUninterruptibly(int fd, Pointer buffer, UnsignedWord bufferSize) {
+        SignedWord readBytes;
+        do {
+            readBytes = Unistd.NoTransitions.read(fd, buffer, bufferSize);
+        } while (readBytes.equal(-1) && LibC.errno() == Errno.EINTR());
+
+        return readBytes.rawValue();
+    }
+
+    // Checkstyle: stop
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    public static int clock_gettime(int clock_id, Time.timespec ts) {
+        if (Platform.includedIn(Platform.DARWIN.class)) {
+            return DarwinTime.NoTransitions.clock_gettime(clock_id, ts);
+        } else {
+            assert Platform.includedIn(Platform.LINUX.class);
+            return LinuxTime.NoTransitions.clock_gettime(clock_id, ts);
+        }
+    }
+    // Checkstyle: resume
+
+    public static String getUserName(int uid) {
+        return getUserNameOrDir(uid, true);
+    }
+
+    public static String getUserDir(int uid) {
+        return getUserNameOrDir(uid, false);
+    }
+
+    @BasedOnJDKFile("https://github.com/openjdk/jdk/blob/jdk-24+13/src/hotspot/os/posix/perfMemory_posix.cpp#L436-L486")
+    private static String getUserNameOrDir(int uid, boolean name) {
+        /* Determine max. pwBuf size. */
+        long bufSize = Unistd.sysconf(_SC_GETPW_R_SIZE_MAX());
+        if (bufSize == -1) {
+            bufSize = 1024;
+        }
+
+        /* Does not use StackValue because it is not safe to use in virtual threads. */
+        UnsignedWord allocSize = Word.unsigned(SizeOf.get(passwdPointer.class) + SizeOf.get(passwd.class) + bufSize);
+        Pointer alloc = NullableNativeMemory.malloc(allocSize, NmtCategory.Internal);
+        if (alloc.isNull()) {
+            return null;
+        }
+
+        try {
+            passwdPointer p = (passwdPointer) alloc;
+            passwd pwent = (passwd) ((Pointer) p).add(SizeOf.get(passwdPointer.class));
+            CCharPointer pwBuf = (CCharPointer) ((Pointer) pwent).add(SizeOf.get(passwd.class));
+            int code = Pwd.getpwuid_r(uid, pwent, pwBuf, Word.unsigned(bufSize), p);
+            if (code != 0) {
+                return null;
+            }
+
+            passwd result = p.read();
+            if (result.isNull()) {
+                return null;
+            }
+
+            CCharPointer pwName = name ? result.pw_name() : result.pw_dir();
+            if (pwName.isNull() || pwName.read() == '\0') {
+                return null;
+            }
+
+            return CTypeConversion.toJavaString(pwName);
+        } finally {
+            NullableNativeMemory.free(alloc);
+        }
     }
 }

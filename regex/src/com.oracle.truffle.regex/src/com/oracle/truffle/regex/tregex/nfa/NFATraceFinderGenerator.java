@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -89,6 +89,8 @@ public final class NFATraceFinderGenerator {
      */
     private final EconomicMap<PreCalculatedResultFactory, PreCalculatedResultFactory> resultDeDuplicationMap = EconomicMap.create();
 
+    private final boolean trackLastGroup;
+
     private final Counter.ThresholdCounter stateID = new Counter.ThresholdCounter(TRegexOptions.TRegexMaxNFASize, "TraceFinder NFA explosion");
     private final Counter.ThresholdCounter transitionID = new Counter.ThresholdCounter(TRegexOptions.TRegexMaxNFASize, "TraceFinder NFA transition explosion");
 
@@ -97,6 +99,7 @@ public final class NFATraceFinderGenerator {
         this.originalNFA = originalNFA;
         this.states = new ArrayList<>(originalNFA.getStates().length * 2);
         this.duplicatedStatesMap = new ArrayList[originalNFA.getStates().length];
+        this.trackLastGroup = originalNFA.getAst().getOptions().getFlavor().usesLastGroupResultField();
     }
 
     /**
@@ -204,6 +207,9 @@ public final class NFATraceFinderGenerator {
         dummyInitialState.setPredecessors(new NFAStateTransition[]{newAnchoredEntry, newUnAnchoredEntry});
         ArrayList<PathElement> graphPath = new ArrayList<>();
         for (NFAStateTransition entry : new NFAStateTransition[]{originalNFA.getAnchoredEntry()[0], originalNFA.getUnAnchoredEntry()[0]}) {
+            if (entry == null) {
+                continue;
+            }
             for (NFAStateTransition t : entry.getTarget().getSuccessors()) {
                 // All paths start from the original initial states, which will be duplicated and
                 // become leaf nodes in the tree.
@@ -235,20 +241,23 @@ public final class NFATraceFinderGenerator {
                             final NFAStateTransition pathTransition = graphPath.get(i).getTransition();
                             NFAState copy = copy(pathTransition.getTarget(), resultID);
                             createTransition(lastCopied, copy, pathTransition, result, iResult);
-                            iResult += getEncodedSize(copy);
+                            iResult += getEncodedSize(pathTransition);
                             lastCopied = copy;
                         }
                         // link the copied path to the existing tree
                         createTransition(lastCopied, duplicate, curElement.getTransition(), result, iResult);
                         // traverse the existing tree to the root to complete the pre-calculated
                         // result.
+                        NFAStateTransition parentTransition = curElement.getTransition();
                         NFAState treeNode = duplicate;
                         while (!treeNode.isFinalState()) {
-                            iResult += getEncodedSize(treeNode);
+                            iResult += getEncodedSize(parentTransition);
                             assert treeNode.getSuccessors().length == 1;
+                            parentTransition = treeNode.getSuccessors()[0];
                             treeNode.addPossibleResult(resultID);
-                            treeNode.getSuccessors()[0].getGroupBoundaries().applyToResultFactory(result, iResult);
-                            treeNode = treeNode.getSuccessors()[0].getTarget();
+                            GroupBoundaries groupBoundaries = parentTransition.getGroupBoundaries();
+                            groupBoundaries.applyToResultFactory(result, iResult, trackLastGroup);
+                            treeNode = parentTransition.getTarget();
                         }
                         treeNode.addPossibleResult(resultID);
                         result.setLength(iResult);
@@ -283,19 +292,19 @@ public final class NFATraceFinderGenerator {
         for (NFAState s : states) {
             s.linkPredecessors();
         }
-        return new NFA(originalNFA.getAst(), dummyInitialState, null, null, newAnchoredEntry, newUnAnchoredEntry, states, stateID, transitionID, preCalculatedResults);
+        return new NFA(originalNFA.getAst(), dummyInitialState, null, null, newAnchoredEntry, newUnAnchoredEntry, states, stateID, transitionID, null, preCalculatedResults);
     }
 
     private NFAStateTransition createTransition(NFAState source, NFAState target, NFAStateTransition originalTransition,
                     PreCalculatedResultFactory preCalcResult, int preCalcResultIndex) {
-        originalTransition.getGroupBoundaries().applyToResultFactory(preCalcResult, preCalcResultIndex);
+        originalTransition.getGroupBoundaries().applyToResultFactory(preCalcResult, preCalcResultIndex, trackLastGroup);
         NFAStateTransition copy = new NFAStateTransition((short) transitionID.inc(), source, target, originalTransition.getCodePointSet(), originalTransition.getGroupBoundaries());
         source.setSuccessors(new NFAStateTransition[]{copy}, true);
         return copy;
     }
 
     private PreCalculatedResultFactory resultFactory() {
-        return new PreCalculatedResultFactory(originalNFA.getAst().getNumberOfCaptureGroups());
+        return new PreCalculatedResultFactory(originalNFA.getAst().getNumberOfCaptureGroups(), originalNFA.getAst().getOptions().getFlavor().usesLastGroupResultField());
     }
 
     private NFAStateTransition copyEntry(NFAState dummyInitialState, NFAStateTransition originalReverseEntry) {
@@ -324,9 +333,9 @@ public final class NFATraceFinderGenerator {
         assert states.get(copy.getId()) == copy;
     }
 
-    private int getEncodedSize(NFAState s) {
+    private int getEncodedSize(NFAStateTransition t) {
         Encoding encoding = originalNFA.getAst().getEncoding();
-        assert encoding.isFixedCodePointWidth(s.getCharSet());
-        return encoding.getEncodedSize(s.getCharSet().getMin());
+        assert encoding.isFixedCodePointWidth(t.getCodePointSet());
+        return encoding.getEncodedSize(t.getCodePointSet().getMin());
     }
 }

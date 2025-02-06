@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2019, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -29,85 +29,108 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.List;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.regex.Matcher;
 
+import com.oracle.truffle.api.ThreadLocalAction;
 import com.oracle.truffle.api.TruffleLanguage;
+import com.oracle.truffle.api.TruffleLogger;
 import com.oracle.truffle.api.debug.Debugger;
 import com.oracle.truffle.api.frame.Frame;
+import com.oracle.truffle.api.instrumentation.InstrumentableNode;
 import com.oracle.truffle.api.interop.InteropLibrary;
 import com.oracle.truffle.api.interop.UnsupportedMessageException;
 import com.oracle.truffle.api.nodes.Node;
 import com.oracle.truffle.api.nodes.RootNode;
 import com.oracle.truffle.api.profiles.BranchProfile;
 import com.oracle.truffle.espresso.EspressoLanguage;
-import com.oracle.truffle.espresso.bytecode.BytecodeStream;
-import com.oracle.truffle.espresso.descriptors.Symbol;
+import com.oracle.truffle.espresso.blocking.EspressoLock;
+import com.oracle.truffle.espresso.classfile.bytecode.BytecodeStream;
+import com.oracle.truffle.espresso.classfile.descriptors.Name;
+import com.oracle.truffle.espresso.classfile.descriptors.Symbol;
+import com.oracle.truffle.espresso.classfile.descriptors.Type;
+import com.oracle.truffle.espresso.descriptors.EspressoSymbols.Types;
 import com.oracle.truffle.espresso.impl.ArrayKlass;
-import com.oracle.truffle.espresso.impl.ChangePacket;
-import com.oracle.truffle.espresso.impl.ClassRedefinition;
-import com.oracle.truffle.espresso.impl.HotSwapClassInfo;
-import com.oracle.truffle.espresso.impl.InnerClassRedefiner;
 import com.oracle.truffle.espresso.impl.Klass;
 import com.oracle.truffle.espresso.impl.Method.MethodVersion;
 import com.oracle.truffle.espresso.impl.ObjectKlass;
-import com.oracle.truffle.espresso.impl.RedefintionNotSupportedException;
 import com.oracle.truffle.espresso.jdwp.api.CallFrame;
 import com.oracle.truffle.espresso.jdwp.api.FieldRef;
 import com.oracle.truffle.espresso.jdwp.api.Ids;
 import com.oracle.truffle.espresso.jdwp.api.JDWPContext;
-import com.oracle.truffle.espresso.jdwp.api.JDWPSetup;
 import com.oracle.truffle.espresso.jdwp.api.KlassRef;
 import com.oracle.truffle.espresso.jdwp.api.MethodRef;
+import com.oracle.truffle.espresso.jdwp.api.ModuleRef;
 import com.oracle.truffle.espresso.jdwp.api.MonitorStackInfo;
 import com.oracle.truffle.espresso.jdwp.api.RedefineInfo;
 import com.oracle.truffle.espresso.jdwp.api.TagConstants;
-import com.oracle.truffle.espresso.jdwp.api.VMListener;
+import com.oracle.truffle.espresso.jdwp.api.VMEventListenerImpl;
 import com.oracle.truffle.espresso.jdwp.impl.DebuggerController;
-import com.oracle.truffle.espresso.jdwp.impl.EmptyListener;
 import com.oracle.truffle.espresso.jdwp.impl.JDWPInstrument;
-import com.oracle.truffle.espresso.jdwp.impl.JDWPLogger;
 import com.oracle.truffle.espresso.jdwp.impl.TypeTag;
+import com.oracle.truffle.espresso.meta.EspressoError;
 import com.oracle.truffle.espresso.meta.Meta;
-import com.oracle.truffle.espresso.nodes.EspressoInstrumentableNode;
+import com.oracle.truffle.espresso.nodes.BciProvider;
+import com.oracle.truffle.espresso.nodes.EspressoInstrumentableRootNode;
 import com.oracle.truffle.espresso.nodes.EspressoRootNode;
-import com.oracle.truffle.espresso.nodes.quick.QuickNode;
 import com.oracle.truffle.espresso.nodes.quick.interop.ForeignArrayUtils;
-import com.oracle.truffle.espresso.runtime.dispatch.EspressoInterop;
-import com.oracle.truffle.espresso.substitutions.Target_java_lang_Thread;
+import com.oracle.truffle.espresso.redefinition.ChangePacket;
+import com.oracle.truffle.espresso.redefinition.ClassRedefinition;
+import com.oracle.truffle.espresso.redefinition.HotSwapClassInfo;
+import com.oracle.truffle.espresso.redefinition.InnerClassRedefiner;
+import com.oracle.truffle.espresso.redefinition.RedefinitionNotSupportedException;
+import com.oracle.truffle.espresso.redefinition.plugins.impl.RedefinitionPluginHandler;
+import com.oracle.truffle.espresso.runtime.staticobject.StaticObject;
+import com.oracle.truffle.espresso.threads.State;
+import com.oracle.truffle.espresso.vm.InterpreterToVM;
 
 public final class JDWPContextImpl implements JDWPContext {
 
-    public static final String JAVA_LANG_STRING = "Ljava/lang/String;";
+    public static final TruffleLogger LOGGER = TruffleLogger.getLogger(EspressoLanguage.ID, JDWPContextImpl.class);
     private static final InteropLibrary UNCACHED = InteropLibrary.getUncached();
+
+    private static final long SUSPEND_TIMEOUT = 100;
 
     private final EspressoContext context;
     private final Ids<Object> ids;
-    private JDWPSetup setup;
-    private VMListener eventListener = new EmptyListener();
-    private InnerClassRedefiner innerClassRedefiner;
+    private ClassRedefinition classRedefinition;
+    private final InnerClassRedefiner innerClassRedefiner;
+    private RedefinitionPluginHandler redefinitionPluginHandler;
+    private final ArrayList<ReloadingAction> classInitializerActions = new ArrayList<>(1);
+    private DebuggerController controller;
+    private VMEventListenerImpl vmEventListener;
 
     public JDWPContextImpl(EspressoContext context) {
         this.context = context;
         this.ids = new Ids<>(StaticObject.NULL);
-        this.setup = new JDWPSetup();
         this.innerClassRedefiner = new InnerClassRedefiner(context);
     }
 
-    public VMListener jdwpInit(TruffleLanguage.Env env, Object mainThread) {
-        // enable JDWP instrumenter only if options are set (assumed valid if non-null)
-        if (context.JDWPOptions != null) {
-            Debugger debugger = env.lookup(env.getInstruments().get("debugger"), Debugger.class);
-            DebuggerController control = env.lookup(env.getInstruments().get(JDWPInstrument.ID), DebuggerController.class);
-            setup.setup(debugger, control, context.JDWPOptions, this, mainThread);
-            eventListener = control.getEventListener();
-        }
-        return eventListener;
+    public void jdwpInit(TruffleLanguage.Env env, Object mainThread, VMEventListenerImpl eventListener) {
+        Debugger debugger = env.lookup(env.getInstruments().get("debugger"), Debugger.class);
+        this.controller = env.lookup(env.getInstruments().get(JDWPInstrument.ID), DebuggerController.class);
+        vmEventListener = eventListener;
+        eventListener.activate(mainThread, controller, this);
+        controller.initialize(debugger, context.getEspressoEnv().JDWPOptions, this, mainThread, eventListener);
+        redefinitionPluginHandler = RedefinitionPluginHandler.create(context);
+        classRedefinition = context.createClassRedefinition(ids, redefinitionPluginHandler);
     }
 
     public void finalizeContext() {
-        if (context.JDWPOptions != null) {
-            setup.finalizeSession();
+        if (context.getEspressoEnv().JDWPOptions != null) {
+            if (controller != null) { // in case we exited before initializing the controller field
+                controller.disposeDebugger(false);
+            }
         }
+    }
+
+    @Override
+    public void replaceController(DebuggerController newController) {
+        this.controller = newController;
+        vmEventListener.replaceController(newController);
     }
 
     @Override
@@ -122,12 +145,11 @@ public final class JDWPContextImpl implements JDWPContext {
 
     @Override
     public boolean isValidThread(Object thread, boolean checkTerminated) {
-        if (thread instanceof StaticObject) {
-            StaticObject staticObject = (StaticObject) thread;
+        if (thread instanceof StaticObject staticObject) {
             if (context.getMeta().java_lang_Thread.isAssignableFrom(staticObject.getKlass())) {
                 if (checkTerminated) {
                     // check if thread has been terminated
-                    return getThreadStatus(thread) != Target_java_lang_Thread.State.TERMINATED.value;
+                    return getThreadStatus(thread) != State.TERMINATED.value;
                 }
                 return true;
             }
@@ -137,8 +159,7 @@ public final class JDWPContextImpl implements JDWPContext {
 
     @Override
     public boolean isValidThreadGroup(Object threadGroup) {
-        if (threadGroup instanceof StaticObject) {
-            StaticObject staticObject = (StaticObject) threadGroup;
+        if (threadGroup instanceof StaticObject staticObject) {
             return context.getMeta().java_lang_ThreadGroup.isAssignableFrom(staticObject.getKlass());
         } else {
             return false;
@@ -209,7 +230,7 @@ public final class JDWPContextImpl implements JDWPContext {
             } else {
                 // object type
                 String componentType = componentRawName.substring(1, componentRawName.length() - 1);
-                Symbol<Symbol.Type> type = context.getTypes().fromClassGetName(componentType);
+                Symbol<Type> type = context.getTypes().fromClassGetName(componentType);
                 KlassRef[] klassRefs = context.getRegistries().findLoadedClassAny(type);
                 KlassRef[] result = new KlassRef[klassRefs.length];
                 for (int i = 0; i < klassRefs.length; i++) {
@@ -219,14 +240,14 @@ public final class JDWPContextImpl implements JDWPContext {
             }
         } else {
             // regular type
-            Symbol<Symbol.Type> type = context.getTypes().fromClassGetName(slashName);
+            Symbol<Type> type = context.getTypes().fromClassGetName(slashName);
             return context.getRegistries().findLoadedClassAny(type);
         }
     }
 
     @Override
     public KlassRef[] getAllLoadedClasses() {
-        return context.getRegistries().getAllLoadedClasses();
+        return context.getRegistries().getAllLoadedClasses().toArray(new KlassRef[0]);
     }
 
     @Override
@@ -236,9 +257,8 @@ public final class JDWPContextImpl implements JDWPContext {
 
     @Override
     public boolean isValidClassLoader(Object object) {
-        if (object instanceof StaticObject) {
-            StaticObject loader = (StaticObject) object;
-            return context.getRegistries().isClassLoader(loader);
+        if (object instanceof StaticObject loader) {
+            return InterpreterToVM.instanceOf(loader, context.getMeta().java_lang_ClassLoader);
         }
         return false;
     }
@@ -250,7 +270,33 @@ public final class JDWPContextImpl implements JDWPContext {
 
     @Override
     public Thread asHostThread(Object thread) {
-        return Target_java_lang_Thread.getHostFromGuestThread((StaticObject) thread);
+        return context.getThreadAccess().getHost((StaticObject) thread);
+    }
+
+    @Override
+    public boolean isVirtualThread(Object thread) {
+        return context.getThreadAccess().isVirtualThread((StaticObject) thread);
+    }
+
+    @Override
+    public boolean isSingleSteppingDisabled() {
+        return context.getLanguage().getThreadLocalState().isSteppingDisabled();
+    }
+
+    @Override
+    public Object allocateInstance(KlassRef klass) {
+        return context.getAllocator().createNew((ObjectKlass) klass);
+    }
+
+    @Override
+    public void steppingInProgress(Thread t, boolean value) {
+        Object previous = null;
+        try {
+            previous = controller.enterTruffleContext();
+            context.getLanguage().getThreadLocalStateFor(t).setSteppingInProgress(value);
+        } finally {
+            controller.leaveTruffleContext(previous);
+        }
     }
 
     @Override
@@ -270,9 +316,8 @@ public final class JDWPContextImpl implements JDWPContext {
 
     @Override
     public String getStringValue(Object object) {
-        if (object instanceof StaticObject) {
-            StaticObject staticObject = (StaticObject) object;
-            return (String) EspressoInterop.toDisplayString(staticObject, false);
+        if (object instanceof StaticObject staticObject) {
+            return (String) InteropLibrary.getUncached().toDisplayString(staticObject, false);
         }
         return object.toString();
     }
@@ -296,9 +341,8 @@ public final class JDWPContextImpl implements JDWPContext {
 
     @Override
     public KlassRef getReflectedType(Object classObject) {
-        if (classObject instanceof StaticObject) {
-            StaticObject staticObject = (StaticObject) classObject;
-            if (staticObject.getKlass().getType() == Symbol.Type.java_lang_Class) {
+        if (classObject instanceof StaticObject staticObject) {
+            if (staticObject.getKlass().getType() == Types.java_lang_Class) {
                 return (KlassRef) context.getMeta().HIDDEN_MIRROR_KLASS.getHiddenObject(staticObject);
             }
         }
@@ -307,14 +351,13 @@ public final class JDWPContextImpl implements JDWPContext {
 
     @Override
     public KlassRef[] getNestedTypes(KlassRef klass) {
-        if (klass instanceof ObjectKlass) {
+        if (klass instanceof ObjectKlass objectKlass) {
             ArrayList<KlassRef> result = new ArrayList<>();
-            ObjectKlass objectKlass = (ObjectKlass) klass;
-            List<Symbol<Symbol.Name>> nestedTypeNames = objectKlass.getNestedTypeNames();
+            List<Symbol<Name>> nestedTypeNames = objectKlass.getNestedTypeNames();
 
             StaticObject classLoader = objectKlass.getDefiningClassLoader();
-            for (Symbol<Symbol.Name> nestedType : nestedTypeNames) {
-                Symbol<Symbol.Type> type = context.getTypes().fromClassGetName(nestedType.toString());
+            for (Symbol<Name> nestedType : nestedTypeNames) {
+                Symbol<Type> type = context.getTypes().fromClassGetName(nestedType.toString());
                 KlassRef loadedKlass = context.getRegistries().findLoadedClass(type, classLoader);
                 if (loadedKlass != null && loadedKlass != klass) {
                     result.add(loadedKlass);
@@ -331,15 +374,13 @@ public final class JDWPContextImpl implements JDWPContext {
             return TagConstants.OBJECT;
         }
         byte tag = TagConstants.OBJECT;
-        if (object instanceof StaticObject) {
-            StaticObject staticObject = (StaticObject) object;
+        if (object instanceof StaticObject staticObject) {
             if (object == StaticObject.NULL) {
                 return tag;
             }
             tag = staticObject.getKlass().getTagConstant();
             if (tag == TagConstants.OBJECT) {
-                // check specifically for String
-                if (JAVA_LANG_STRING.equals(staticObject.getKlass().getType().toString())) {
+                if (staticObject.getKlass() == context.getMeta().java_lang_String) {
                     tag = TagConstants.STRING;
                 } else if (staticObject.getKlass().isArray()) {
                     tag = TagConstants.ARRAY;
@@ -365,17 +406,17 @@ public final class JDWPContextImpl implements JDWPContext {
 
     @Override
     public String getThreadName(Object thread) {
-        return Target_java_lang_Thread.getThreadName(context.getMeta(), (StaticObject) thread);
+        return context.getThreadAccess().getThreadName((StaticObject) thread);
     }
 
     @Override
     public int getThreadStatus(Object thread) {
-        return (int) context.getMeta().java_lang_Thread_threadStatus.get((StaticObject) thread);
+        return context.getThreadAccess().getState((StaticObject) thread);
     }
 
     @Override
     public Object getThreadGroup(Object thread) {
-        return context.getMeta().java_lang_Thread_group.get((StaticObject) thread);
+        return context.getThreadAccess().getThreadGroup((StaticObject) thread);
     }
 
     @Override
@@ -384,22 +425,12 @@ public final class JDWPContextImpl implements JDWPContext {
     }
 
     @Override
-    public Object[] getChildrenThreads(Object threadGroup) {
-        ArrayList<Object> result = new ArrayList<>();
-        for (Object thread : getAllGuestThreads()) {
-            if (getThreadGroup(thread) == threadGroup) {
-                result.add(thread);
-            }
-        }
-        return result.toArray();
-    }
-
-    @Override
     public int getArrayLength(Object array) {
         StaticObject staticObject = (StaticObject) array;
+        EspressoLanguage language = context.getLanguage();
         if (staticObject.isForeignObject()) {
             try {
-                long arrayLength = UNCACHED.getArraySize(staticObject.rawForeignObject());
+                long arrayLength = UNCACHED.getArraySize(staticObject.rawForeignObject(language));
                 if (arrayLength > Integer.MAX_VALUE) {
                     return -1;
                 }
@@ -408,19 +439,19 @@ public final class JDWPContextImpl implements JDWPContext {
                 return -1;
             }
         }
-        return staticObject.length();
+        return staticObject.length(language);
     }
 
     @Override
     public <T> T getUnboxedArray(Object array) {
         StaticObject staticObject = (StaticObject) array;
-        return staticObject.unwrap();
+        EspressoLanguage language = staticObject.getKlass().getContext().getLanguage();
+        return staticObject.unwrap(language);
     }
 
     @Override
     public boolean isArray(Object object) {
-        if (object instanceof StaticObject) {
-            StaticObject staticObject = (StaticObject) object;
+        if (object instanceof StaticObject staticObject) {
             return staticObject.isArray();
         }
         return false;
@@ -432,29 +463,14 @@ public final class JDWPContextImpl implements JDWPContext {
     }
 
     @Override
-    public byte getTypeTag(Object array) {
+    public byte getArrayComponentTag(Object array) {
         StaticObject staticObject = (StaticObject) array;
-        byte tag;
-        if (staticObject.isArray()) {
-            ArrayKlass arrayKlass = (ArrayKlass) staticObject.getKlass();
-            tag = arrayKlass.getComponentType().getJavaKind().toTagConstant();
-            if (arrayKlass.getDimension() > 1) {
-                tag = TagConstants.ARRAY;
-            } else if (tag == TagConstants.OBJECT) {
-                if (JAVA_LANG_STRING.equals(arrayKlass.getComponentType().getType().toString())) {
-                    tag = TagConstants.STRING;
-                }
-            }
-        } else {
-            tag = staticObject.getKlass().getTagConstant();
-            // Object type, so check for String
-            if (tag == TagConstants.OBJECT) {
-                if (JAVA_LANG_STRING.equals(((StaticObject) array).getKlass().getType().toString())) {
-                    tag = TagConstants.STRING;
-                }
-            }
+        assert ((StaticObject) array).isArray();
+        ArrayKlass arrayKlass = (ArrayKlass) staticObject.getKlass();
+        if (arrayKlass.getDimension() > 1) {
+            return TagConstants.ARRAY;
         }
-        return tag;
+        return TagConstants.toTagConstant(arrayKlass.getComponentType().getJavaKind());
     }
 
     // introspection
@@ -474,12 +490,12 @@ public final class JDWPContextImpl implements JDWPContext {
         StaticObject arrayRef = (StaticObject) array;
         Object value;
         if (arrayRef.isForeignObject()) {
-            value = ForeignArrayUtils.readForeignArrayElement(arrayRef, index, InteropLibrary.getUncached(), context.getMeta(), BranchProfile.create());
+            value = ForeignArrayUtils.readForeignArrayElement(arrayRef, index, context.getLanguage(), context.getMeta(), InteropLibrary.getUncached(), BranchProfile.create());
             if (!(value instanceof StaticObject)) {
                 // For JDWP we have to have a ref type, so here we have to create a copy
                 // value when possible as a StaticObject based on the foreign type.
                 // Note: we only support Host String conversion for now
-                if (String.class.isInstance(value)) {
+                if (value instanceof String) {
                     return context.getMeta().toGuestString((String) value);
                 } else {
                     throw new IllegalStateException("foreign object conversion not supported");
@@ -490,7 +506,7 @@ public final class JDWPContextImpl implements JDWPContext {
             Object boxedArray = getUnboxedArray(array);
             value = Array.get(boxedArray, index);
         } else {
-            value = arrayRef.get(index);
+            value = arrayRef.get(context.getLanguage(), index);
         }
         return value;
     }
@@ -498,17 +514,30 @@ public final class JDWPContextImpl implements JDWPContext {
     @Override
     public void setArrayValue(Object array, int index, Object value) {
         StaticObject arrayRef = (StaticObject) array;
-        arrayRef.putObject((StaticObject) value, index, context.getMeta());
+        byte tag = getTag(value);
+        switch (tag) {
+            case TagConstants.BOOLEAN -> context.getInterpreterToVM().setArrayByte(context.getLanguage(), (boolean) value ? (byte) 1 : 0, index, arrayRef);
+            case TagConstants.BYTE -> context.getInterpreterToVM().setArrayByte(context.getLanguage(), (byte) value, index, arrayRef);
+            case TagConstants.SHORT -> context.getInterpreterToVM().setArrayShort(context.getLanguage(), (short) value, index, arrayRef);
+            case TagConstants.CHAR -> context.getInterpreterToVM().setArrayChar(context.getLanguage(), (char) value, index, arrayRef);
+            case TagConstants.INT -> context.getInterpreterToVM().setArrayInt(context.getLanguage(), (int) value, index, arrayRef);
+            case TagConstants.FLOAT -> context.getInterpreterToVM().setArrayFloat(context.getLanguage(), (float) value, index, arrayRef);
+            case TagConstants.LONG -> context.getInterpreterToVM().setArrayLong(context.getLanguage(), (long) value, index, arrayRef);
+            case TagConstants.DOUBLE -> context.getInterpreterToVM().setArrayDouble(context.getLanguage(), (double) value, index, arrayRef);
+            case TagConstants.ARRAY, TagConstants.STRING, TagConstants.OBJECT ->
+                context.getInterpreterToVM().setArrayObject(context.getLanguage(), (StaticObject) value, index, arrayRef);
+            default -> throw new RuntimeException("should not reach here: " + tag);
+        }
     }
 
     @Override
     public Object newArray(KlassRef klass, int length) {
-        return StaticObject.createArray((ArrayKlass) klass, new StaticObject[length]);
-    }
-
-    @Override
-    public Object toGuest(Object object) {
-        return context.getMeta().toGuestBoxed(object);
+        ArrayKlass arrayKlass = (ArrayKlass) klass;
+        Klass componentType = arrayKlass.getComponentType();
+        if (componentType.isPrimitive()) {
+            return context.getAllocator().createNewPrimitiveArray(componentType, length);
+        }
+        return context.getAllocator().createNewReferenceArray(componentType, length);
     }
 
     @Override
@@ -518,9 +547,8 @@ public final class JDWPContextImpl implements JDWPContext {
 
     @Override
     public Object getGuestException(Throwable exception) {
-        if (exception instanceof EspressoException) {
-            EspressoException ex = (EspressoException) exception;
-            return ex.getExceptionObject();
+        if (exception instanceof EspressoException ex) {
+            return ex.getGuestException();
         } else {
             throw new RuntimeException("unknown exception type: " + exception.getClass(), exception);
         }
@@ -528,9 +556,42 @@ public final class JDWPContextImpl implements JDWPContext {
 
     @Override
     public CallFrame[] getStackTrace(Object thread) {
-        // TODO(Gregersen) - implement this method when we can get stack frames
-        // for arbitrary threads.
-        return new CallFrame[0];
+        Thread hostThread = asHostThread(thread);
+
+        if (Thread.currentThread() == hostThread) {
+            // on current thread, we can just fetch the frames directly
+            return controller.getCallFrames(thread);
+        } else {
+            // on other threads, we have to utilize Truffle safe points
+            CollectStackFramesAction action = new CollectStackFramesAction(thread);
+            Future<Void> future = context.getEnv().submitThreadLocal(new Thread[]{hostThread}, action);
+            try {
+                future.get(SUSPEND_TIMEOUT, TimeUnit.MILLISECONDS);
+                return action.result;
+            } catch (ExecutionException e) {
+                throw EspressoError.shouldNotReachHere(e);
+            } catch (InterruptedException | TimeoutException e) {
+                // OK, when interrupted we can't get stack frames
+                future.cancel(true);
+                return new CallFrame[0];
+            }
+        }
+    }
+
+    private final class CollectStackFramesAction extends ThreadLocalAction {
+        CallFrame[] result;
+
+        final Object guestThread;
+
+        CollectStackFramesAction(Object guestThread) {
+            super(false, false);
+            this.guestThread = guestThread;
+        }
+
+        @Override
+        protected void perform(Access access) {
+            result = controller.getCallFrames(guestThread);
+        }
     }
 
     @Override
@@ -541,12 +602,24 @@ public final class JDWPContextImpl implements JDWPContext {
 
     @Override
     public void stopThread(Object guestThread, Object guestThrowable) {
-        Target_java_lang_Thread.stop0((StaticObject) guestThread, (StaticObject) guestThrowable);
+        Object previous = null;
+        try {
+            previous = controller.enterTruffleContext();
+            context.getThreadAccess().stop((StaticObject) guestThread, (StaticObject) guestThrowable);
+        } finally {
+            controller.leaveTruffleContext(previous);
+        }
     }
 
     @Override
     public void interruptThread(Object thread) {
-        Target_java_lang_Thread.interrupt0((StaticObject) thread);
+        Object previous = null;
+        try {
+            previous = controller.enterTruffleContext();
+            context.interruptThread((StaticObject) thread);
+        } finally {
+            controller.leaveTruffleContext(previous);
+        }
     }
 
     @Override
@@ -556,9 +629,13 @@ public final class JDWPContextImpl implements JDWPContext {
 
     @Override
     public void exit(int exitCode) {
-        // TODO - implement proper system exit for Espresso
-        // tracked here: /browse/GR-20496
-        System.exit(exitCode);
+        Object previous = null;
+        try {
+            previous = controller.enterTruffleContext();
+            context.truffleExit(null, exitCode);
+        } finally {
+            controller.leaveTruffleContext(previous);
+        }
     }
 
     @Override
@@ -583,10 +660,9 @@ public final class JDWPContextImpl implements JDWPContext {
 
     @Override
     public int getNextBCI(RootNode callerRoot, Frame frame) {
-        if (callerRoot instanceof EspressoRootNode) {
-            EspressoRootNode espressoRootNode = (EspressoRootNode) callerRoot;
+        if (callerRoot instanceof EspressoRootNode espressoRootNode) {
             int bci = (int) readBCIFromFrame(callerRoot, frame);
-            if (bci != -1) {
+            if (bci >= 0) {
                 BytecodeStream bs = new BytecodeStream(espressoRootNode.getMethodVersion().getOriginalCode());
                 return bs.nextBCI(bci);
             }
@@ -596,11 +672,8 @@ public final class JDWPContextImpl implements JDWPContext {
 
     @Override
     public long readBCIFromFrame(RootNode root, Frame frame) {
-        if (root instanceof EspressoRootNode && frame != null) {
-            EspressoRootNode rootNode = (EspressoRootNode) root;
-            if (rootNode.isBytecodeNode()) {
-                return rootNode.readBCI(frame);
-            }
+        if (root instanceof EspressoRootNode rootNode && frame != null) {
+            return rootNode.readBCI(frame);
         }
         return -1;
     }
@@ -610,25 +683,66 @@ public final class JDWPContextImpl implements JDWPContext {
         Object currentThread = asGuestThread(Thread.currentThread());
         KlassRef klass = context.getMeta().java_lang_Object;
         MethodRef method = context.getMeta().java_lang_Object_wait.getMethodVersion();
-        return new CallFrame(ids.getIdAsLong(currentThread), TypeTag.CLASS, ids.getIdAsLong(klass), method, ids.getIdAsLong(method), 0, null, null, null, null);
+        return new CallFrame(ids.getIdAsLong(currentThread), TypeTag.CLASS, ids.getIdAsLong(klass), method, ids.getIdAsLong(method), 0, null, null, null, null, null, LOGGER);
     }
 
     @Override
     public Object getMonitorOwnerThread(Object object) {
         if (object instanceof StaticObject) {
-            EspressoLock lock = ((StaticObject) object).getLock();
-            return asGuestThread(lock.getOwnerThread());
+            EspressoLock lock = ((StaticObject) object).getLock(context);
+            Thread ownerThread = lock.getOwnerThread();
+            if (ownerThread != null) {
+                return asGuestThread(ownerThread);
+            }
         }
         return null;
     }
 
     @Override
-    public int getMonitorEntryCount(Object monitor) {
-        if (monitor instanceof StaticObject) {
-            EspressoLock lock = ((StaticObject) monitor).getLock();
-            return lock.getEntryCount();
+    public int getMonitorEntryCount(Object monitorOwnerThread, Object monitor) {
+        if (!(monitor instanceof StaticObject theMonitor)) {
+            return -1;
         }
-        return -1;
+        Thread hostThread = asHostThread(monitorOwnerThread);
+        if (Thread.currentThread() == hostThread) {
+            // on current thread, we can get the results directly
+            EspressoLock lock = theMonitor.getLock(context);
+            return lock.getEntryCount();
+        } else {
+            // on other threads, we have to utilize Truffle safe points
+            GetMonitorEntryCountAction action = new GetMonitorEntryCountAction(theMonitor);
+            Future<Void> future = context.getEnv().submitThreadLocal(new Thread[]{hostThread}, action);
+            try {
+                future.get(SUSPEND_TIMEOUT, TimeUnit.MILLISECONDS);
+                return action.result;
+            } catch (ExecutionException e) {
+                throw EspressoError.shouldNotReachHere(e);
+            } catch (InterruptedException | TimeoutException e) {
+                future.cancel(true);
+                // OK, not possible to get accurate result, but since we know the monitor is
+                // currently owned by the owner thread, we return 1 because it's currently locked at
+                // least once
+                return 1;
+            }
+        }
+    }
+
+    private final class GetMonitorEntryCountAction extends ThreadLocalAction {
+        int result;
+        StaticObject monitor;
+
+        GetMonitorEntryCountAction(StaticObject monitor) {
+            super(false, false);
+            this.monitor = monitor;
+        }
+
+        @Override
+        protected void perform(Access access) {
+            // Since by the time we get here this thread might not own the lock, so we'll return 0.
+            // In this case it's up to the caller to handle that.
+            EspressoLock lock = monitor.getLock(context);
+            result = lock.getEntryCount();
+        }
     }
 
     @Override
@@ -637,8 +751,7 @@ public final class JDWPContextImpl implements JDWPContext {
         int stackDepth = 0;
         for (CallFrame callFrame : callFrames) {
             RootNode rootNode = callFrame.getRootNode();
-            if (rootNode instanceof EspressoRootNode) {
-                EspressoRootNode espressoRootNode = (EspressoRootNode) rootNode;
+            if (rootNode instanceof EspressoRootNode espressoRootNode) {
                 if (espressoRootNode.usesMonitors()) {
                     StaticObject[] monitors = espressoRootNode.getMonitorsOnFrame(callFrame.getFrame());
                     for (StaticObject monitor : monitors) {
@@ -654,22 +767,11 @@ public final class JDWPContextImpl implements JDWPContext {
     }
 
     @Override
-    public Object getCurrentContendedMonitor(Object guestThread) {
-        return eventListener.getCurrentContendedMonitor(guestThread);
-    }
-
-    @Override
     public void clearFrameMonitors(CallFrame frame) {
         RootNode rootNode = frame.getRootNode();
-        if (rootNode instanceof EspressoRootNode) {
-            EspressoRootNode espressoRootNode = (EspressoRootNode) rootNode;
+        if (rootNode instanceof EspressoRootNode espressoRootNode) {
             espressoRootNode.abortInternalMonitors(frame.getFrame());
         }
-    }
-
-    @Override
-    public void abort(int exitCode) {
-        context.doExit(197);
     }
 
     @Override
@@ -677,94 +779,176 @@ public final class JDWPContextImpl implements JDWPContext {
         return EspressoLanguage.class;
     }
 
-    @Override
-    public Node getInstrumentableNode(Node node) {
-        Node currentNode = node;
-
+    private BciProvider getBciProviderNode(Node node) {
+        if (node instanceof BciProvider bciProvider) {
+            return bciProvider;
+        }
+        Node currentNode = node.getParent();
         while (currentNode != null) {
-            if (currentNode instanceof EspressoRootNode) {
-                return ((EspressoRootNode) currentNode).getMethodNode();
-            } else if (currentNode instanceof EspressoInstrumentableNode) {
-                return currentNode;
-            } else if (currentNode instanceof QuickNode) {
-                QuickNode quickNode = (QuickNode) currentNode;
-                return quickNode.getBytecodesNode();
-            } else {
-                currentNode = currentNode.getParent();
+            if (currentNode instanceof BciProvider) {
+                return (BciProvider) currentNode;
             }
+            currentNode = currentNode.getParent();
+        }
+        Node instrumentableNode = getInstrumentableNode(node.getRootNode());
+        if (instrumentableNode instanceof BciProvider bciProvider) {
+            return bciProvider;
         }
         return null;
     }
 
-    @Override
     public long getBCI(Node rawNode, Frame frame) {
-        Node node = getInstrumentableNode(rawNode);
-        if (node == null) {
+        BciProvider bciProvider = getBciProviderNode(rawNode);
+        if (bciProvider == null) {
             return -1;
         }
-        EspressoInstrumentableNode instrumentableNode = (EspressoInstrumentableNode) node;
-        return instrumentableNode.getCurrentBCI(frame);
+        return bciProvider.getBci(frame);
     }
 
     @Override
-    public synchronized int redefineClasses(RedefineInfo[] redefineInfos) {
+    public Node getInstrumentableNode(RootNode rootNode) {
+        if (rootNode instanceof EspressoRootNode) {
+            EspressoInstrumentableRootNode baseMethodNode = ((EspressoRootNode) rootNode).getMethodNode();
+            if (baseMethodNode instanceof InstrumentableNode.WrapperNode) {
+                return ((InstrumentableNode.WrapperNode) baseMethodNode).getDelegateNode();
+            } else {
+                return baseMethodNode;
+            }
+        }
+        return rootNode;
+    }
+
+    @Override
+    public boolean isMemberOf(Object guestObject, KlassRef klass) {
+        if (guestObject instanceof StaticObject staticObject) {
+            return klass.isAssignable(staticObject.getKlass());
+        } else {
+            return false;
+        }
+    }
+
+    @Override
+    public ModuleRef[] getAllModulesRefs() {
+        return context.getRegistries().getAllModuleRefs();
+    }
+
+    public void rerunclinit(ObjectKlass oldKlass) {
+        classInitializerActions.add(new ReloadingAction(oldKlass));
+    }
+
+    public synchronized int redefineClasses(List<RedefineInfo> redefineInfos) {
+        // list to collect all changed classes
+        List<ObjectKlass> changedKlasses = new ArrayList<>(redefineInfos.size());
         try {
-            JDWPLogger.log("Redefining %d classes", JDWPLogger.LogLevel.REDEFINE, redefineInfos.length);
-            // list of sub classes that needs to refresh things like vtable
-            List<ObjectKlass> refreshSubClasses = new ArrayList<>();
-
-            // match anon inner classes with previous state
-            List<ObjectKlass> removedInnerClasses = new ArrayList<>(0);
-            HotSwapClassInfo[] matchedInfos = innerClassRedefiner.matchAnonymousInnerClasses(redefineInfos, removedInnerClasses);
-
-            // detect all changes to all classes, throws if redefinition cannot be completed
-            // due to the nature of the changes
-            List<ChangePacket> changePackets = ClassRedefinition.detectClassChanges(matchedInfos, context);
-
-            // We have to redefine super classes prior to subclasses
-            Collections.sort(changePackets, new HierarchyComparator());
+            controller.fine(() -> "Redefining " + redefineInfos.size() + " classes");
 
             // begin redefine transaction
-            ClassRedefinition.begin();
-            for (ChangePacket packet : changePackets) {
-                JDWPLogger.log("Redefining class %s", JDWPLogger.LogLevel.REDEFINE, packet.info.getNewName());
-                int result = ClassRedefinition.redefineClass(packet, getIds(), context, refreshSubClasses);
-                if (result != 0) {
-                    return result;
+            classRedefinition.begin();
+
+            // clear synthetic fields, which forces re-resolution
+            classRedefinition.clearDelegationFields();
+
+            // invalidate missing fields assumption, which forces re-resolution
+            classRedefinition.invalidateMissingFields();
+
+            // redefine classes based on direct code changes first
+            doRedefine(redefineInfos, changedKlasses);
+
+            // Now, collect additional classes to redefine in response
+            // to the redefined classes above
+            List<RedefineInfo> additional = Collections.synchronizedList(new ArrayList<>());
+            classRedefinition.addExtraReloadClasses(redefineInfos, additional);
+            // redefine additional classes now
+            doRedefine(additional, changedKlasses);
+
+            // re-run all registered class initializers before ending transaction
+            classInitializerActions.forEach((reloadingAction) -> {
+                try {
+                    reloadingAction.fire();
+                } catch (Throwable t) {
+                    // Some anomalies when rerunning class initializers
+                    // to be expected. Treat them as non-fatal.
+                    controller.warning(() -> "exception while re-running a class initializer!");
                 }
+            });
+            assert !changedKlasses.contains(null);
+            // run post redefinition plugins before ending the redefinition transaction
+            try {
+                classRedefinition.runPostRedefinitionListeners(changedKlasses.toArray(new ObjectKlass[changedKlasses.size()]));
+            } catch (Throwable t) {
+                controller.severe(() -> JDWPContextImpl.class.getName() + ": redefineClasses: " + t.getMessage());
             }
-            // refresh subclasses when needed
-            Collections.sort(refreshSubClasses, new SubClassHierarchyComparator());
-            for (ObjectKlass subKlass : refreshSubClasses) {
-                JDWPLogger.log("Updating sub class %s for redefined super class", JDWPLogger.LogLevel.REDEFINE, subKlass.getName());
-                subKlass.onSuperKlassUpdate();
-            }
-
-            // update the JWDP IDs
-            for (ChangePacket changePacket : changePackets) {
-                if (changePacket.info.isRenamed()) {
-                    ObjectKlass klass = changePacket.info.getKlass();
-                    if (klass != null) {
-                        ids.updateId(klass);
-                    }
-                }
-            }
-
-            // tell the InnerClassRedefiner to commit the changes to cache
-            innerClassRedefiner.commit(matchedInfos);
-
-            for (ObjectKlass removed : removedInnerClasses) {
-                removed.removeByRedefinition();
-            }
-        } catch (RedefintionNotSupportedException ex) {
+        } catch (RedefinitionNotSupportedException ex) {
             return ex.getErrorCode();
         } finally {
-            ClassRedefinition.end();
+            classRedefinition.end();
         }
         return 0;
     }
 
-    private static class HierarchyComparator implements Comparator<ChangePacket> {
+    private void doRedefine(List<RedefineInfo> redefineInfos, List<ObjectKlass> changedKlasses) throws RedefinitionNotSupportedException {
+        // list to hold removed inner classes that must be marked removed
+        List<ObjectKlass> removedInnerClasses = new ArrayList<>(0);
+        // list of classes that need to refresh due to
+        // changes in other classes for things like vtable
+        List<ObjectKlass> invalidatedClasses = new ArrayList<>();
+        // list of all classes that have been redefined within this transaction
+        List<ObjectKlass> redefinedClasses = new ArrayList<>();
+
+        // match anon inner classes with previous state
+        HotSwapClassInfo[] matchedInfos = innerClassRedefiner.matchAnonymousInnerClasses(redefineInfos, removedInnerClasses);
+
+        // detect all changes to all classes, throws if redefinition cannot be completed
+        // due to the nature of the changes
+        List<ChangePacket> changePackets = classRedefinition.detectClassChanges(matchedInfos);
+
+        // We have to redefine super classes prior to subclasses
+        Collections.sort(changePackets, new HierarchyComparator());
+
+        for (ChangePacket packet : changePackets) {
+            controller.fine(() -> "Redefining class " + packet.info.getNewName());
+            int result = classRedefinition.redefineClass(packet, invalidatedClasses, redefinedClasses);
+            if (result != 0) {
+                throw new RedefinitionNotSupportedException(result);
+            }
+        }
+
+        // refresh invalidated classes if not already redefined
+        Collections.sort(invalidatedClasses, new SubClassHierarchyComparator());
+        for (ObjectKlass invalidatedClass : invalidatedClasses) {
+            if (!redefinedClasses.contains(invalidatedClass)) {
+                controller.fine(() -> "Refreshing invalidated class " + invalidatedClass.getName());
+                invalidatedClass.swapKlassVersion(ids);
+            }
+        }
+
+        // include invalidated classes in all changed classes list
+        changedKlasses.addAll(invalidatedClasses);
+
+        // update the JWDP IDs for renamed inner classes
+        for (ChangePacket changePacket : changePackets) {
+            ObjectKlass klass = changePacket.info.getKlass();
+            if (klass != null) {
+                changedKlasses.add(klass);
+                if (changePacket.info.isRenamed()) {
+                    ids.updateId(klass);
+                }
+            }
+        }
+
+        // tell the InnerClassRedefiner to commit the changes to cache
+        innerClassRedefiner.commit(matchedInfos);
+
+        for (ObjectKlass removed : removedInnerClasses) {
+            removed.removeByRedefinition();
+        }
+    }
+
+    public void registerExternalHotSwapHandler(StaticObject handler) {
+        redefinitionPluginHandler.registerExternalHotSwapHandler(handler);
+    }
+
+    private static final class HierarchyComparator implements Comparator<ChangePacket> {
         public int compare(ChangePacket packet1, ChangePacket packet2) {
             Klass k1 = packet1.info.getKlass();
             Klass k2 = packet2.info.getKlass();
@@ -793,7 +977,7 @@ public final class JDWPContextImpl implements JDWPContext {
         }
     }
 
-    private static class SubClassHierarchyComparator implements Comparator<ObjectKlass> {
+    private static final class SubClassHierarchyComparator implements Comparator<ObjectKlass> {
         public int compare(ObjectKlass k1, ObjectKlass k2) {
             // we need to do this check because isAssignableFrom is true in this case
             // and we would get an order that doesn't exist
@@ -807,6 +991,18 @@ public final class JDWPContextImpl implements JDWPContext {
             }
             // no hierarchy
             return 0;
+        }
+    }
+
+    private final class ReloadingAction {
+        private ObjectKlass klass;
+
+        private ReloadingAction(ObjectKlass klass) {
+            this.klass = klass;
+        }
+
+        private void fire() {
+            klass.reRunClinit();
         }
     }
 }

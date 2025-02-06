@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2019, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -44,7 +44,8 @@ import java.lang.reflect.Method;
 
 import org.graalvm.polyglot.Engine;
 import org.graalvm.polyglot.impl.AbstractPolyglotImpl;
-import org.graalvm.polyglot.impl.AbstractPolyglotImpl.AbstractManagementImpl;
+import org.graalvm.polyglot.impl.AbstractPolyglotImpl.AbstractExecutionEventDispatch;
+import org.graalvm.polyglot.impl.AbstractPolyglotImpl.AbstractExecutionListenerDispatch;
 import org.graalvm.polyglot.impl.AbstractPolyglotImpl.ManagementAccess;
 
 /*
@@ -52,29 +53,61 @@ import org.graalvm.polyglot.impl.AbstractPolyglotImpl.ManagementAccess;
  */
 final class Management {
 
+    static final ManagementAccessImpl ACCESS = new ManagementAccessImpl();
+
     private Management() {
     }
 
-    static final AbstractManagementImpl IMPL = initImpl();
+    /*
+     * ImplHolder is needed because at the time of initializing this Engine might not yet be fully
+     * initialized.
+     */
+    static class ImplHolder {
+        static final AbstractPolyglotImpl IMPL = initImpl();
 
-    private static AbstractManagementImpl initImpl() {
-        try {
-            Method method = Engine.class.getDeclaredMethod("getImpl");
-            method.setAccessible(true);
-            AbstractPolyglotImpl impl = (AbstractPolyglotImpl) method.invoke(null);
-            impl.setMonitoring(new ManagementAccessImpl());
-            return impl.getManagementImpl();
-        } catch (Exception e) {
-            throw new IllegalStateException("Failed to initialize execution listener class.", e);
+        private static AbstractPolyglotImpl initImpl() {
+            try {
+                Method method = Engine.class.getDeclaredMethod("getImpl");
+                method.setAccessible(true);
+                AbstractPolyglotImpl impl = (AbstractPolyglotImpl) method.invoke(null);
+                return impl;
+            } catch (Exception e) {
+                throw new IllegalStateException("Failed to initialize execution listener class.", e);
+            }
         }
     }
 
-    private static class ManagementAccessImpl extends ManagementAccess {
+    private static final class ManagementAccessImpl extends ManagementAccess {
+
         @Override
-        public ExecutionEvent newExecutionEvent(Object event) {
-            return new ExecutionEvent(event);
+        public Object newExecutionListener(AbstractExecutionListenerDispatch dispatch, Object receiver, Engine engine) {
+            return new ExecutionListener(dispatch, receiver, engine);
         }
 
+        @Override
+        public Object newExecutionEvent(AbstractExecutionEventDispatch dispatch, Object event) {
+            return new ExecutionEvent(dispatch, event);
+        }
+
+        @Override
+        public Object getExecutionListenerReceiver(Object executionListener) {
+            return ((ExecutionListener) executionListener).receiver;
+        }
+
+        @Override
+        public AbstractExecutionListenerDispatch getExecutionListenerDispatch(Object executionListener) {
+            return ((ExecutionListener) executionListener).dispatch;
+        }
+
+        @Override
+        public Object getExecutionEventReceiver(Object executionEvent) {
+            return ((ExecutionEvent) executionEvent).receiver;
+        }
+
+        @Override
+        public AbstractExecutionEventDispatch getExecutionEventDispatch(Object executionEvent) {
+            return ((ExecutionEvent) executionEvent).dispatch;
+        }
     }
 
 }

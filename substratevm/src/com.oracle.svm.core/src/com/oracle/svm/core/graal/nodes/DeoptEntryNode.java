@@ -24,34 +24,70 @@
  */
 package com.oracle.svm.core.graal.nodes;
 
-import org.graalvm.compiler.core.gen.NodeLIRBuilder;
-import org.graalvm.compiler.graph.NodeClass;
-import org.graalvm.compiler.nodeinfo.InputType;
-import org.graalvm.compiler.nodeinfo.NodeCycles;
-import org.graalvm.compiler.nodeinfo.NodeInfo;
-import org.graalvm.compiler.nodeinfo.NodeSize;
-import org.graalvm.compiler.nodes.DeoptimizingNode;
-import org.graalvm.compiler.nodes.memory.SingleMemoryKill;
-import org.graalvm.compiler.nodes.spi.NodeLIRBuilderTool;
+import jdk.graal.compiler.core.common.type.StampFactory;
+import jdk.graal.compiler.core.gen.NodeLIRBuilder;
+import jdk.graal.compiler.graph.NodeClass;
+import jdk.graal.compiler.lir.LabelRef;
+import jdk.graal.compiler.nodeinfo.InputType;
+import jdk.graal.compiler.nodeinfo.NodeCycles;
+import jdk.graal.compiler.nodeinfo.NodeInfo;
+import jdk.graal.compiler.nodeinfo.NodeSize;
+import jdk.graal.compiler.nodes.AbstractBeginNode;
+import jdk.graal.compiler.nodes.DeoptimizingNode;
+import jdk.graal.compiler.nodes.FrameState;
+import jdk.graal.compiler.nodes.UnreachableBeginNode;
+import jdk.graal.compiler.nodes.WithExceptionNode;
+import jdk.graal.compiler.nodes.debug.ControlFlowAnchored;
+import jdk.graal.compiler.nodes.memory.SingleMemoryKill;
+import jdk.graal.compiler.nodes.spi.NodeLIRBuilderTool;
 import org.graalvm.word.LocationIdentity;
 
 import com.oracle.svm.core.graal.lir.DeoptEntryOp;
+
+import jdk.vm.ci.code.BytecodeFrame;
 
 /**
  * A landing-pad for deoptimization. This node is generated in deoptimization target methods for all
  * deoptimization entry points.
  */
 @NodeInfo(allowedUsageTypes = InputType.Anchor, cycles = NodeCycles.CYCLES_0, size = NodeSize.SIZE_0)
-public final class DeoptEntryNode extends DeoptProxyAnchorNode implements DeoptimizingNode.DeoptAfter, SingleMemoryKill {
+public final class DeoptEntryNode extends WithExceptionNode implements DeoptEntrySupport, DeoptimizingNode.DeoptAfter, SingleMemoryKill, ControlFlowAnchored {
     public static final NodeClass<DeoptEntryNode> TYPE = NodeClass.create(DeoptEntryNode.class);
 
-    public DeoptEntryNode() {
-        super(TYPE);
+    @OptionalInput(InputType.State) protected FrameState stateAfter;
+
+    private final int proxifiedInvokeBci;
+
+    protected DeoptEntryNode(int proxifiedInvokeBci) {
+        super(TYPE, StampFactory.forVoid());
+        this.proxifiedInvokeBci = proxifiedInvokeBci;
+    }
+
+    public static DeoptEntryNode create(int proxifiedInvokeBci) {
+        assert proxifiedInvokeBci != BytecodeFrame.UNKNOWN_BCI;
+        return new DeoptEntryNode(proxifiedInvokeBci);
+    }
+
+    public static DeoptEntryNode create() {
+        return new DeoptEntryNode(BytecodeFrame.UNKNOWN_BCI);
     }
 
     @Override
     public void generate(NodeLIRBuilderTool gen) {
-        gen.getLIRGeneratorTool().append(new DeoptEntryOp(((NodeLIRBuilder) gen).stateFor(this, stateAfter())));
+        LabelRef exceptionRef;
+        AbstractBeginNode exceptionNode = exceptionEdge();
+        if (exceptionNode instanceof UnreachableBeginNode) {
+            exceptionRef = null;
+        } else {
+            /* Only register exception handler if it is meaningful. */
+            NodeLIRBuilder nodeLIRBuilder = (NodeLIRBuilder) gen;
+            exceptionRef = nodeLIRBuilder.getLIRBlock(exceptionNode);
+            exceptionRef.getTargetBlock().setIndirectBranchTarget();
+        }
+        gen.getLIRGeneratorTool().append(new DeoptEntryOp(((NodeLIRBuilder) gen).stateForWithExceptionEdge(this, stateAfter(), exceptionRef)));
+
+        /* Link to next() instruction. */
+        gen.getLIRGeneratorTool().emitJump(((NodeLIRBuilder) gen).getLIRBlock(next()));
     }
 
     @Override
@@ -62,5 +98,27 @@ public final class DeoptEntryNode extends DeoptProxyAnchorNode implements Deopti
     @Override
     public LocationIdentity getKilledLocationIdentity() {
         return LocationIdentity.any();
+    }
+
+    @Override
+    public FrameState stateAfter() {
+        return stateAfter;
+    }
+
+    @Override
+    public void setStateAfter(FrameState x) {
+        assert x == null || x.isAlive() : "frame state must be in a graph";
+        updateUsages(stateAfter, x);
+        stateAfter = x;
+    }
+
+    @Override
+    public boolean hasSideEffect() {
+        return true;
+    }
+
+    @Override
+    public int getProxifiedInvokeBci() {
+        return proxifiedInvokeBci;
     }
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2025, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -41,6 +41,7 @@
 package org.graalvm.nativeimage;
 
 import java.nio.file.Path;
+import java.util.Map;
 
 import org.graalvm.nativeimage.c.function.CEntryPointLiteral;
 import org.graalvm.nativeimage.impl.ProcessPropertiesSupport;
@@ -144,7 +145,11 @@ public final class ProcessProperties {
      * Set the program locale.
      *
      * @since 19.0
+     * @deprecated in 25.0 without replacement. This method is inherently unsafe because
+     *             {@code setlocale(...)} is not thread-safe on the OS level.
      */
+    @Deprecated(since = "25.0")
+    @SuppressWarnings("deprecation")
     public static String setLocale(String category, String locale) {
         return ImageSingletons.lookup(ProcessPropertiesSupport.class).setLocale(category, locale);
     }
@@ -157,6 +162,18 @@ public final class ProcessProperties {
      */
     public static void exec(Path executable, String... args) {
         ImageSingletons.lookup(ProcessPropertiesSupport.class).exec(executable, args);
+    }
+
+    /**
+     * Replaces the current process image with the process image specified by the given path invoked
+     * with the given arguments and environment. If the process should inherit members of the
+     * calling environment, those members need to be added by the caller. This method does not
+     * return if the call is successful.
+     *
+     * @since 22.1
+     */
+    public static void exec(Path executable, String[] args, Map<String, String> env) {
+        ImageSingletons.lookup(ProcessPropertiesSupport.class).exec(executable, args, env);
     }
 
     /**

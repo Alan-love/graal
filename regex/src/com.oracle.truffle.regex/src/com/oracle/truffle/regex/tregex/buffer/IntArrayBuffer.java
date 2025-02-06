@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2022, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -44,6 +44,8 @@ package com.oracle.truffle.regex.tregex.buffer;
 import java.util.Arrays;
 import java.util.PrimitiveIterator;
 
+import com.oracle.truffle.regex.util.EmptyArrays;
+
 /**
  * This class is designed as a "scratchpad" for generating many char arrays of unknown size. It will
  * never shrink its internal buffer, so it should be disposed as soon as it is no longer needed.
@@ -53,7 +55,7 @@ import java.util.PrimitiveIterator;
  *
  * <pre>
  * IntArrayBuffer buf = new IntArrayBuffer();
- * List<int[]> results = new ArrayList<>();
+ * List&lt;int[]> results = new ArrayList&lt;>();
  * for (Object obj : listOfThingsToProcess) {
  *     for (Object x : obj.thingsThatShouldBecomeInts()) {
  *         buf.add(someCalculation(x));
@@ -65,7 +67,6 @@ import java.util.PrimitiveIterator;
  */
 public class IntArrayBuffer extends AbstractArrayBuffer implements Iterable<Integer> {
 
-    private static final int[] EMPTY = {};
     protected int[] buf;
 
     public IntArrayBuffer() {
@@ -124,8 +125,20 @@ public class IntArrayBuffer extends AbstractArrayBuffer implements Iterable<Inte
         System.arraycopy(o.buf, 0, buf, length, o.length);
     }
 
+    public int getLast() {
+        assert !isEmpty();
+        return get(length - 1);
+    }
+
+    public int removeLast() {
+        assert !isEmpty();
+        int last = getLast();
+        setLength(length - 1);
+        return last;
+    }
+
     public int[] toArray() {
-        return isEmpty() ? EMPTY : Arrays.copyOf(buf, length);
+        return isEmpty() ? EmptyArrays.INT : Arrays.copyOf(buf, length);
     }
 
     @Override

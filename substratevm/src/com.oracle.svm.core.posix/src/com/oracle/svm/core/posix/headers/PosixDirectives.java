@@ -37,18 +37,22 @@ import com.oracle.svm.core.util.VMError;
 public class PosixDirectives implements CContext.Directives {
     private static final String[] commonLibs = new String[]{
                     "<dlfcn.h>",
+                    "<dirent.h>",
                     "<fcntl.h>",
                     "<limits.h>",
                     "<locale.h>",
                     "<pthread.h>",
                     "<pwd.h>",
+                    "<semaphore.h>",
                     "<signal.h>",
                     "<errno.h>",
+                    "<sys/file.h>",
                     "<sys/mman.h>",
                     "<sys/resource.h>",
                     "<sys/stat.h>",
                     "<sys/time.h>",
                     "<sys/times.h>",
+                    "<sys/types.h>",
                     "<sys/utsname.h>",
                     "<time.h>",
                     "<unistd.h>",
@@ -57,6 +61,7 @@ public class PosixDirectives implements CContext.Directives {
     private static final String[] darwinLibs = new String[]{
                     "<Foundation/Foundation.h>",
                     "<mach/mach.h>",
+                    "<mach/semaphore.h>",
                     "<mach/mach_time.h>",
                     "<mach-o/dyld.h>",
                     "<sys/sysctl.h>",
@@ -95,6 +100,6 @@ public class PosixDirectives implements CContext.Directives {
 
     @Override
     public List<String> getMacroDefinitions() {
-        return Arrays.asList("_GNU_SOURCE", "_LARGEFILE64_SOURCE");
+        return Arrays.asList("_GNU_SOURCE", "_LARGEFILE64_SOURCE", "_DARWIN_USE_64_BIT_INODE");
     }
 }

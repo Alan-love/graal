@@ -24,14 +24,16 @@
  */
 package com.oracle.svm.truffle.api;
 
-import org.graalvm.compiler.truffle.runtime.OptimizedCallTarget;
 import org.graalvm.nativeimage.c.function.CFunctionPointer;
 
-import com.oracle.svm.core.annotate.InvokeJavaFunctionPointer;
+import com.oracle.svm.core.Uninterruptible;
+import com.oracle.svm.core.c.InvokeJavaFunctionPointer;
 import com.oracle.svm.core.deopt.SubstrateSpeculationLog;
 import com.oracle.svm.core.thread.VMOperation;
 import com.oracle.svm.truffle.TruffleSupport;
 import com.oracle.truffle.api.nodes.RootNode;
+import com.oracle.truffle.runtime.EngineData;
+import com.oracle.truffle.runtime.OptimizedCallTarget;
 
 import jdk.vm.ci.code.InstalledCode;
 import jdk.vm.ci.meta.SpeculationLog;
@@ -54,12 +56,20 @@ public class SubstrateOptimizedCallTarget extends OptimizedCallTarget implements
      * at one point in time (or not an entry point, if invalid). Must never be {@code null}.
      * <p>
      * Does not need to be volatile because it is modified only in safepoint operations. Reads of
-     * this field must be done carefully placed so they cannot float across safepoint checks.
+     * this field must be done carefully so they cannot float across safepoint checks.
      */
     protected SubstrateOptimizedCallTargetInstalledCode installedCode;
 
+    @SuppressWarnings("this-escape")
     public SubstrateOptimizedCallTarget(OptimizedCallTarget sourceCallTarget, RootNode rootNode) {
         super(sourceCallTarget, rootNode);
+        this.installedCode = createInitializationInstalledCode();
+        assert this.installedCode != null : "Must never be null";
+    }
+
+    @SuppressWarnings("this-escape")
+    public SubstrateOptimizedCallTarget(EngineData engine) {
+        super(engine);
         this.installedCode = createInitializationInstalledCode();
         assert this.installedCode != null : "Must never be null";
     }
@@ -91,14 +101,6 @@ public class SubstrateOptimizedCallTarget extends OptimizedCallTarget implements
         return installedCode.getAddress();
     }
 
-    /**
-     * Prevents reads from floating across a safepoint when the caller is inlined in another method.
-     * Intrinsified in {@link SubstrateTruffleGraphBuilderPlugins}.
-     */
-    public static void safepointBarrier() {
-        // Intrinsified, but empty so it can be called during hosted Truffle calls
-    }
-
     @Override
     public Object doInvoke(Object[] args) {
         return SubstrateOptimizedCallTargetInstalledCode.doInvoke(this, args);
@@ -117,7 +119,8 @@ public class SubstrateOptimizedCallTarget extends OptimizedCallTarget implements
         return createInstalledCode();
     }
 
-    public Object invokeCallBoundary(Object[] args) {
+    @Uninterruptible(reason = "Transitioning back to interruptible code", calleeMustBe = false)
+    protected Object invokeCallBoundary(Object[] args) {
         return callBoundary(args);
     }
 

@@ -35,8 +35,8 @@ import com.oracle.truffle.api.debug.DebuggerSession;
 import com.oracle.truffle.api.nodes.LanguageInfo;
 import com.oracle.truffle.tools.chromeinspector.InspectorExecutionContext;
 import com.oracle.truffle.tools.chromeinspector.RemoteObjectsHandler;
-import com.oracle.truffle.tools.utils.json.JSONArray;
-import com.oracle.truffle.tools.utils.json.JSONObject;
+import org.graalvm.shadowed.org.json.JSONArray;
+import org.graalvm.shadowed.org.json.JSONObject;
 
 /**
  * Custom preview of an object through devtools formatter, which is registered as
@@ -71,10 +71,7 @@ public final class CustomPreview {
     }
 
     private static JSONObject create(DebugValue debugValue, DebugValue config, LanguageInfo language, InspectorExecutionContext context) {
-        DebuggerSession debuggerSession = context.getDebuggerSession();
-        if (debuggerSession == null) {
-            return null;
-        }
+        DebuggerSession debuggerSession = debugValue.getSession();
         DebugScope topScope = debuggerSession.getTopScope(language.getId());
         DebugValue formatters = null;
         while (topScope != null) {

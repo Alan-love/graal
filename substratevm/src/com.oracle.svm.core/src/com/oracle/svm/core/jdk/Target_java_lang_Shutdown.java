@@ -42,23 +42,10 @@ public final class Target_java_lang_Shutdown {
 
     static {
         hooks = new Runnable[Util_java_lang_Shutdown.MAX_SYSTEM_HOOKS];
-        /*
-         * We use the last system hook slot (index 9), which is currently not used by the JDK, for
-         * our own shutdown hooks that are registered during image generation. The JDK currently
-         * uses slots 0, 1, and 2.
-         */
-        hooks[hooks.length - 1] = RuntimeSupport::executeShutdownHooks;
-    }
-
-    /* Wormhole for invoking java.lang.ref.Finalizer.runAllFinalizers */
-    @Substitute
-    @TargetElement(onlyWith = JDK8OrEarlier.class)
-    static void runAllFinalizers() {
-        throw VMError.unsupportedFeature("java.lang.Shudown.runAllFinalizers()");
+        hooks[Util_java_lang_Shutdown.NATIVE_IMAGE_SHUTDOWN_HOOKS_SLOT] = RuntimeSupport::executeShutdownHooks;
     }
 
     @Substitute
-    @TargetElement(onlyWith = JDK11OrLater.class)
     static void beforeHalt() {
     }
 
@@ -68,6 +55,13 @@ public final class Target_java_lang_Shutdown {
      */
     @Alias
     static native void shutdown();
+
+    @Substitute
+    @TargetElement
+    @SuppressWarnings("unused")
+    private static void logRuntimeExit(int status) {
+        // Disable exit logging (GR-45418/JDK-8301627)
+    }
 }
 
 /** Utility methods for Target_java_lang_Shutdown. */
@@ -75,7 +69,21 @@ final class Util_java_lang_Shutdown {
 
     /**
      * Value *copied* from {@code java.lang.Shutdown.MAX_SYSTEM_HOOKS} so that the value can be used
-     * during image generation (@Alias values are only visible at run time).
+     * during image generation (@Alias values are only visible at run time). The JDK currently uses
+     * slots 0, 1, and 2.
      */
     static final int MAX_SYSTEM_HOOKS = 10;
+
+    static final int LOG_MANAGER_SHUTDOWN_HOOK_SLOT = MAX_SYSTEM_HOOKS - 1;
+    static final int NATIVE_IMAGE_SHUTDOWN_HOOKS_SLOT = LOG_MANAGER_SHUTDOWN_HOOK_SLOT - 1;
+
+    public static void registerLogManagerShutdownHook(Runnable hook) {
+        /*
+         * Execute the LogManager shutdown hook after all other shutdown hooks. This is a workaround
+         * for GR-39429.
+         */
+        Runnable[] hooks = Target_java_lang_Shutdown.hooks;
+        VMError.guarantee(hooks[LOG_MANAGER_SHUTDOWN_HOOK_SLOT] == null, "slot must not be used");
+        hooks[LOG_MANAGER_SHUTDOWN_HOOK_SLOT] = hook;
+    }
 }

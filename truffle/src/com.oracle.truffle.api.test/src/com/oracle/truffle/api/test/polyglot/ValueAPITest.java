@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -61,6 +61,8 @@ import static com.oracle.truffle.tck.tests.ValueAssert.Trait.STRING;
 import static com.oracle.truffle.tck.tests.ValueAssert.Trait.TIME;
 import static com.oracle.truffle.tck.tests.ValueAssert.Trait.TIMEZONE;
 import static org.hamcrest.CoreMatchers.containsString;
+import static org.hamcrest.MatcherAssert.assertThat;
+import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotEquals;
@@ -68,10 +70,10 @@ import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNotSame;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertSame;
-import static org.junit.Assert.assertThat;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
+import java.lang.reflect.Field;
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
@@ -79,6 +81,9 @@ import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
+import java.nio.charset.UnsupportedCharsetException;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.LocalDate;
@@ -86,12 +91,14 @@ import java.time.LocalDateTime;
 import java.time.LocalTime;
 import java.time.ZoneId;
 import java.time.ZonedDateTime;
+import java.util.AbstractList;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Date;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.ListIterator;
 import java.util.Map;
@@ -105,10 +112,12 @@ import org.graalvm.polyglot.HostAccess.Implementable;
 import org.graalvm.polyglot.PolyglotException;
 import org.graalvm.polyglot.TypeLiteral;
 import org.graalvm.polyglot.Value;
+import org.graalvm.polyglot.Value.StringEncoding;
 import org.graalvm.polyglot.proxy.ProxyArray;
 import org.graalvm.polyglot.proxy.ProxyDate;
 import org.graalvm.polyglot.proxy.ProxyDuration;
 import org.graalvm.polyglot.proxy.ProxyExecutable;
+import org.graalvm.polyglot.proxy.ProxyHashMap;
 import org.graalvm.polyglot.proxy.ProxyInstant;
 import org.graalvm.polyglot.proxy.ProxyInstantiable;
 import org.graalvm.polyglot.proxy.ProxyObject;
@@ -120,10 +129,9 @@ import org.junit.BeforeClass;
 import org.junit.ComparisonFailure;
 import org.junit.Test;
 
-import com.oracle.truffle.api.CallTarget;
 import com.oracle.truffle.api.CompilerDirectives;
 import com.oracle.truffle.api.CompilerDirectives.CompilationFinal;
-import com.oracle.truffle.api.Truffle;
+import com.oracle.truffle.api.dsl.Bind;
 import com.oracle.truffle.api.dsl.Cached;
 import com.oracle.truffle.api.exception.AbstractTruffleException;
 import com.oracle.truffle.api.interop.InteropLibrary;
@@ -133,28 +141,49 @@ import com.oracle.truffle.api.interop.UnknownIdentifierException;
 import com.oracle.truffle.api.interop.UnsupportedMessageException;
 import com.oracle.truffle.api.library.ExportLibrary;
 import com.oracle.truffle.api.library.ExportMessage;
-import com.oracle.truffle.api.nodes.RootNode;
-import com.oracle.truffle.api.profiles.BranchProfile;
+import com.oracle.truffle.api.nodes.Node;
+import com.oracle.truffle.api.profiles.InlinedBranchProfile;
 import com.oracle.truffle.tck.tests.ValueAssert;
 import com.oracle.truffle.tck.tests.ValueAssert.Trait;
 
+import sun.misc.Unsafe;
+
 public class ValueAPITest {
 
+    // used for native string tests
+    static final sun.misc.Unsafe UNSAFE = getUnsafe();
+
+    private static Unsafe getUnsafe() {
+        try {
+            return Unsafe.getUnsafe();
+        } catch (SecurityException e) {
+        }
+        try {
+            Field theUnsafeInstance = Unsafe.class.getDeclaredField("theUnsafe");
+            theUnsafeInstance.setAccessible(true);
+            return (Unsafe) theUnsafeInstance.get(Unsafe.class);
+        } catch (Exception e) {
+            throw new RuntimeException("exception while trying to get Unsafe.theUnsafe via reflection:", e);
+        }
+    }
+
     private static Context context;
+    private static Context secondaryContext;
 
     @BeforeClass
     public static void setUp() {
         context = Context.newBuilder().allowHostAccess(HostAccess.ALL).build();
+        secondaryContext = Context.newBuilder().allowHostAccess(HostAccess.ALL).build();
     }
 
     @AfterClass
     public static void tearDown() {
         context.close();
+        secondaryContext.close();
     }
 
     @Test
     public void testGetContext() {
-
         assertNull(Value.asValue(null).getContext());
         assertNull(Value.asValue("").getContext());
         assertNull(Value.asValue(42).getContext());
@@ -199,27 +228,39 @@ public class ValueAPITest {
     @Test
     public void testString() {
         for (Object string : STRINGS) {
-            assertValue(context.asValue(string), STRING);
-            assertValue(context.asValue(new StringWrapper(string.toString())), STRING);
+            assertValueInContexts(context.asValue(string), STRING);
+            assertValueInContexts(context.asValue(new StringWrapper(string.toString())), STRING);
         }
+
     }
 
     @Test
     public void testDatesTimesZonesAndDuration() {
-        assertValue(context.asValue(LocalDate.now()), HOST_OBJECT, MEMBERS, DATE, EXECUTABLE);
-        assertValue(context.asValue(LocalTime.now()), HOST_OBJECT, MEMBERS, TIME, EXECUTABLE);
-        assertValue(context.asValue(LocalDateTime.now()), HOST_OBJECT, MEMBERS, DATE, TIME, EXECUTABLE);
-        assertValue(context.asValue(Instant.now()), HOST_OBJECT, MEMBERS, DATE, TIME, TIMEZONE, EXECUTABLE);
-        assertValue(context.asValue(ZonedDateTime.now()), HOST_OBJECT, MEMBERS, DATE, TIME, TIMEZONE);
-        assertValue(context.asValue(ZoneId.of("UTC")), HOST_OBJECT, MEMBERS, TIMEZONE);
-        assertValue(context.asValue(Date.from(Instant.now())), HOST_OBJECT, MEMBERS, DATE, TIME, TIMEZONE);
-        assertValue(context.asValue(Duration.ofMillis(100)), HOST_OBJECT, MEMBERS, DURATION);
+        assertValueInContexts(context.asValue(LocalDate.now()), HOST_OBJECT, MEMBERS, DATE, EXECUTABLE);
+        assertValueInContexts(context.asValue(LocalTime.now()), HOST_OBJECT, MEMBERS, TIME, EXECUTABLE);
+        assertValueInContexts(context.asValue(LocalDateTime.now()), HOST_OBJECT, MEMBERS, DATE, TIME, EXECUTABLE);
+        assertValueInContexts(context.asValue(Instant.now()), HOST_OBJECT, MEMBERS, DATE, TIME, TIMEZONE, EXECUTABLE);
+        assertValueInContexts(context.asValue(ZonedDateTime.now()), HOST_OBJECT, MEMBERS, DATE, TIME, TIMEZONE);
+        assertValueInContexts(context.asValue(ZoneId.of("UTC")), HOST_OBJECT, MEMBERS, TIMEZONE);
+        assertValueInContexts(context.asValue(Date.from(Instant.now())), HOST_OBJECT, MEMBERS, DATE, TIME, TIMEZONE);
+        assertValueInContexts(context.asValue(Duration.ofMillis(100)), HOST_OBJECT, MEMBERS, DURATION);
 
-        assertValue(context.asValue(ProxyDate.from(LocalDate.now())), DATE, PROXY_OBJECT);
-        assertValue(context.asValue(ProxyTime.from(LocalTime.now())), TIME, PROXY_OBJECT);
-        assertValue(context.asValue(ProxyInstant.from(Instant.now())), DATE, TIME, TIMEZONE, PROXY_OBJECT);
-        assertValue(context.asValue(ProxyTimeZone.from(ZoneId.of("UTC"))), TIMEZONE, PROXY_OBJECT);
-        assertValue(context.asValue(ProxyDuration.from(Duration.ofMillis(100))), DURATION, PROXY_OBJECT);
+        assertValueInContexts(context.asValue(ProxyDate.from(LocalDate.now())), DATE, PROXY_OBJECT);
+        assertValueInContexts(context.asValue(ProxyTime.from(LocalTime.now())), TIME, PROXY_OBJECT);
+        assertValueInContexts(context.asValue(ProxyInstant.from(Instant.now())), DATE, TIME, TIMEZONE, PROXY_OBJECT);
+        assertValueInContexts(context.asValue(ProxyTimeZone.from(ZoneId.of("UTC"))), TIMEZONE, PROXY_OBJECT);
+        assertValueInContexts(context.asValue(ProxyDuration.from(Duration.ofMillis(100))), DURATION, PROXY_OBJECT);
+
+    }
+
+    private static void assertValueInContexts(Value value) {
+        assertValue(value);
+        assertValue(secondaryContext.asValue(value));
+    }
+
+    private static void assertValueInContexts(Value value, Trait... expectedTypes) {
+        assertValue(value, expectedTypes);
+        assertValue(secondaryContext.asValue(value), expectedTypes);
     }
 
     private static final Number[] NUMBERS = new Number[]{
@@ -235,8 +276,8 @@ public class ValueAPITest {
     @Test
     public void testNumbers() {
         for (Number number : NUMBERS) {
-            assertValue(context.asValue(number), NUMBER);
-            assertValue(context.asValue(new NumberWrapper(number)), NUMBER);
+            assertValueInContexts(context.asValue(number), NUMBER);
+            assertValueInContexts(context.asValue(new NumberWrapper(number)), NUMBER);
         }
     }
 
@@ -248,14 +289,24 @@ public class ValueAPITest {
     @Test
     public void testBooleans() {
         for (boolean bool : BOOLEANS) {
-            assertValue(context.asValue(bool), BOOLEAN);
-            assertValue(context.asValue(new BooleanWrapper(bool)), BOOLEAN);
+            assertValueInContexts(context.asValue(bool), BOOLEAN);
+            assertValueInContexts(context.asValue(new BooleanWrapper(bool)), BOOLEAN);
         }
     }
 
     @Test
     public void testNull() {
-        assertValue(context.asValue(null), HOST_OBJECT, NULL);
+        assertValueInContexts(context.asValue(null), HOST_OBJECT, NULL);
+        assertValueInContexts(createDelegateInteropWrapper(context, context.asValue(null)), NULL);
+    }
+
+    private static class BigIntegerSubClass extends BigInteger {
+
+        private static final long serialVersionUID = -8639948598957064947L;
+
+        BigIntegerSubClass(String val) {
+            super(val);
+        }
     }
 
     private static final Object[] HOST_OBJECTS = new Object[]{
@@ -266,20 +317,16 @@ public class ValueAPITest {
                     new FieldAccess(),
                     new JavaSuperClass(),
                     new BigInteger("42"),
-                    new BigDecimal("42"),
-                    new Function<Object, Object>() {
+                    new BigIntegerSubClass("42"),
+                    new BigDecimal("42"), new Function<>() {
                         public Object apply(Object t) {
                             return t;
                         }
-                    },
-                    new Supplier<String>() {
+                    }, new Supplier<String>() {
                         public String get() {
                             return "foobar";
                         }
-                    },
-                    BigDecimal.class,
-                    Class.class,
-                    Proxy.newProxyInstance(ValueAPITest.class.getClassLoader(), new Class<?>[]{ProxyInterface.class}, new InvocationHandler() {
+                    }, BigDecimal.class, Class.class, Proxy.newProxyInstance(ValueAPITest.class.getClassLoader(), new Class<?>[]{ProxyInterface.class}, new InvocationHandler() {
                         public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
                             switch (method.getName()) {
                                 case "foobar":
@@ -294,8 +341,33 @@ public class ValueAPITest {
                                     throw new UnsupportedOperationException(method.getName());
                             }
                         }
-                    }),
-                    ByteBuffer.wrap(new byte[0])};
+                    }), ByteBuffer.wrap(new byte[0])};
+
+    @Test
+    public void testBigIntegerNumberAccess() {
+        try (Context ctx = Context.newBuilder().allowHostAccess(HostAccess.newBuilder().allowPublicAccess(true).allowBigIntegerNumberAccess(false).build()).build()) {
+            Value val = ctx.asValue(new BigInteger("42"));
+            assertFalse(val.fitsInByte());
+            assertFalse(val.fitsInShort());
+            assertFalse(val.fitsInInt());
+            assertFalse(val.fitsInLong());
+            assertFalse(val.fitsInBigInteger());
+            assertFalse(val.fitsInFloat());
+            assertFalse(val.fitsInDouble());
+            assertFalse(val.isNumber());
+        }
+        try (Context ctx = Context.newBuilder().allowHostAccess(HostAccess.newBuilder().allowPublicAccess(true).build()).build()) {
+            Value val = ctx.asValue(new BigInteger("42"));
+            assertTrue(val.fitsInByte());
+            assertTrue(val.fitsInShort());
+            assertTrue(val.fitsInInt());
+            assertTrue(val.fitsInLong());
+            assertTrue(val.fitsInBigInteger());
+            assertTrue(val.fitsInFloat());
+            assertTrue(val.fitsInDouble());
+            assertTrue(val.isNumber());
+        }
+    }
 
     @Test
     public void testHostObject() {
@@ -306,6 +378,10 @@ public class ValueAPITest {
             List<Trait> expectedTraits = new ArrayList<>();
             expectedTraits.add(MEMBERS);
             expectedTraits.add(HOST_OBJECT);
+
+            if (value.getClass() == BigInteger.class) {
+                expectedTraits.add(NUMBER);
+            }
 
             if (value instanceof Supplier || value instanceof Function) {
                 expectedTraits.add(EXECUTABLE);
@@ -332,7 +408,12 @@ public class ValueAPITest {
                 expectedTraits.add(HASH);
             }
 
-            assertValue(context.asValue(value), expectedTraits.toArray(new Trait[0]));
+            Value v = context.asValue(value);
+            assertValueInContexts(v, expectedTraits.toArray(new Trait[0]));
+
+            expectedTraits.remove(HOST_OBJECT);
+            assertValueInContexts(createDelegateInteropWrapper(context, v), expectedTraits.toArray(new Trait[0]));
+
         }
     }
 
@@ -364,7 +445,7 @@ public class ValueAPITest {
     @Test
     public void testArrays() {
         for (Object array : ARRAYS) {
-            assertValue(context.asValue(array), ARRAY_ELEMENTS, ITERABLE, HOST_OBJECT, MEMBERS);
+            assertValueInContexts(context.asValue(array), ARRAY_ELEMENTS, ITERABLE, HOST_OBJECT, MEMBERS);
         }
     }
 
@@ -407,7 +488,11 @@ public class ValueAPITest {
         return list.toArray(new ByteBuffer[0]);
     }
 
-    private static final ByteBuffer[] BUFFERS = makeTestBuffers();
+    /*
+     * testBuffers field cannot be static, otherwise the test doesn't run on SVM unless ValueAPITest
+     * is initialized at runtime, which we want to avoid.
+     */
+    private final ByteBuffer[] testBuffers = makeTestBuffers();
 
     private static ByteBuffer fillTestBuffer(ByteBuffer buffer) {
         return buffer.put(0, (byte) 1).put(1, (byte) 2).put(2, (byte) 3).put(3, (byte) 4).put(4, (byte) 5).put(5, (byte) 6).put(6, (byte) 7).put(7, (byte) 8);
@@ -421,10 +506,25 @@ public class ValueAPITest {
 
     @Test
     public void testBuffers() {
-        for (final ByteBuffer buffer : BUFFERS) {
+        for (final ByteBuffer buffer : testBuffers) {
             final Value value = context.asValue(buffer);
-            assertValue(value, BUFFER_ELEMENTS, HOST_OBJECT, MEMBERS);
+
+            assertValueInContexts(value, BUFFER_ELEMENTS, HOST_OBJECT, MEMBERS);
+
+            // with the wrapper these buffers are no longer host buffers and trigger context to
+            // context migration code
+            assertValueInContexts(createDelegateInteropWrapper(context, value), BUFFER_ELEMENTS, MEMBERS);
         }
+    }
+
+    /**
+     * Creates a wrapper that delegates all interop contracts to the inner value. This means that if
+     * you pass in a host object the resulting value will no longer have this trait. This method is
+     * useful to trigger more elaborate context migration behavior for host objects as they are
+     * directly used and not wrapped if they are passed to other contexts.
+     */
+    private static Value createDelegateInteropWrapper(Context c, Value v) {
+        return c.asValue(new InteropWrapperExecutable()).execute(v);
     }
 
     @Test
@@ -537,7 +637,7 @@ public class ValueAPITest {
 
     @Test
     public void testBuffersErrors() {
-        for (final ByteBuffer buffer : BUFFERS) {
+        for (final ByteBuffer buffer : testBuffers) {
             final Value value = context.asValue(buffer);
             final String className = buffer.getClass().getName();
             final ByteOrder order = buffer.order();
@@ -622,7 +722,7 @@ public class ValueAPITest {
 
     @Test
     public void testComplexGenericCoercion() {
-        TypeLiteral<List<Map<Integer, Map<String, Object[]>>>> literal = new TypeLiteral<List<Map<Integer, Map<String, Object[]>>>>() {
+        TypeLiteral<List<Map<Integer, Map<String, Object[]>>>> literal = new TypeLiteral<>() {
         };
         Map<String, Object> map = new HashMap<>();
         map.put("foobar", new Object[]{"baz"});
@@ -635,7 +735,7 @@ public class ValueAPITest {
 
     @Test
     public void testComplexGenericCoercion2() {
-        TypeLiteral<List<Map<String, Map<String, Object[]>>>> literal = new TypeLiteral<List<Map<String, Map<String, Object[]>>>>() {
+        TypeLiteral<List<Map<String, Map<String, Object[]>>>> literal = new TypeLiteral<>() {
         };
         Object[] array = new Object[]{ProxyObject.fromMap(Collections.singletonMap("foo", ProxyObject.fromMap(Collections.singletonMap("bar", new Object[]{"baz"}))))};
 
@@ -736,9 +836,8 @@ public class ValueAPITest {
         mapAndArray.map.put("foo", "bar");
         mapAndArray.array.add(42);
 
-        objectCoercionTest(mapAndArray, Map.class, (v) -> {
-            assertNull(v.get(0L));
-            assertEquals("bar", v.get("foo"));
+        objectCoercionTest(mapAndArray, List.class, (v) -> {
+            assertEquals(42, v.get(0));
             assertEquals(1, v.size());
             assertFalse(v instanceof Function);
 
@@ -788,9 +887,8 @@ public class ValueAPITest {
         mapAndArrayAndExecutable.array.add(42);
         mapAndArrayAndExecutable.executableResult = "foobarbaz";
 
-        objectCoercionTest(mapAndArrayAndExecutable, Map.class, (v) -> {
-            assertNull(v.get(0L));
-            assertEquals("bar", v.get("foo"));
+        objectCoercionTest(mapAndArrayAndExecutable, List.class, (v) -> {
+            assertEquals(42, v.get(0));
             assertEquals(1, v.size());
             assertTrue(v instanceof Function);
             assertEquals("foobarbaz", ((Function<Object, Object>) v).apply(new Object[0]));
@@ -807,9 +905,8 @@ public class ValueAPITest {
         mapAndArrayAndInstantiable.array.add(42);
         mapAndArrayAndInstantiable.instantiableResult = "foobarbaz";
 
-        objectCoercionTest(mapAndArrayAndInstantiable, Map.class, (v) -> {
-            assertNull(v.get(0L));
-            assertEquals("bar", v.get("foo"));
+        objectCoercionTest(mapAndArrayAndInstantiable, List.class, (v) -> {
+            assertEquals(42, v.get(0));
             assertEquals(1, v.size());
             assertTrue(v instanceof Function);
             assertEquals("foobarbaz", ((Function<Object, Object>) v).apply(new Object[0]));
@@ -826,9 +923,8 @@ public class ValueAPITest {
         mapAndArrayAndExecutableAndInstantiable.array.add(42);
         mapAndArrayAndExecutableAndInstantiable.executableResult = "foobarbaz";
 
-        objectCoercionTest(mapAndArrayAndExecutableAndInstantiable, Map.class, (v) -> {
-            assertNull(v.get(0L));
-            assertEquals("bar", v.get("foo"));
+        objectCoercionTest(mapAndArrayAndExecutableAndInstantiable, List.class, (v) -> {
+            assertEquals(42, v.get(0));
             assertEquals(1, v.size());
             assertTrue(v instanceof Function);
             assertEquals("foobarbaz", ((Function<Object, Object>) v).apply(new Object[0]));
@@ -860,6 +956,62 @@ public class ValueAPITest {
             assertTrue(value.canInvokeMember("foo"));
             assertEquals("foobarbaz", value.invokeMember("foo").asString());
         }, false);
+
+        HashEntries hashEntries = new HashEntries();
+        hashEntries.hashEntries.put("foo", "foobarbaz");
+
+        objectCoercionTest(hashEntries, Map.class, (v) -> {
+            assertEquals(1, v.size());
+            assertEquals("foobarbaz", v.get("foo"));
+            Value value = context.asValue(v);
+            assertTrue(value.hasHashEntries());
+            assertFalse(value.hasMembers());
+        });
+
+        HashEntriesAndArray hashEntriesAndArray = new HashEntriesAndArray();
+        hashEntries.hashEntries.put("foo", "foobarbaz");
+        hashEntriesAndArray.array.add(42);
+        hashEntriesAndArray.array.add(43);
+
+        objectCoercionTest(hashEntriesAndArray, List.class, (v) -> {
+            assertEquals(2, v.size());
+            assertEquals(42, v.get(0));
+            assertEquals(43, v.get(1));
+            Value value = context.asValue(v);
+            assertTrue(value.hasHashEntries());
+            assertTrue(value.hasArrayElements());
+            assertFalse(value.hasMembers());
+        });
+
+        HashEntriesAndMembers hashEntriesAndMembers = new HashEntriesAndMembers();
+        hashEntriesAndMembers.hashEntries.put("foo", "foobarbaz");
+        hashEntriesAndMembers.members.put("member1", "whatever");
+        hashEntriesAndMembers.members.put("member2", "whatever");
+
+        objectCoercionTest(hashEntriesAndMembers, Map.class, (v) -> {
+            assertEquals(1, v.size());
+            assertEquals("foobarbaz", v.get("foo"));
+            Value value = context.asValue(v);
+            assertTrue(value.hasHashEntries());
+            assertTrue(value.hasMembers());
+        });
+
+        HashEntriesAndArrayAndMembers hashEntriesAndArrayAndMembers = new HashEntriesAndArrayAndMembers();
+        hashEntriesAndArrayAndMembers.hashEntries.put("foo", "foobarbaz");
+        hashEntriesAndArrayAndMembers.members.put("member1", "whatever");
+        hashEntriesAndArrayAndMembers.members.put("member2", "whatever");
+        hashEntriesAndArrayAndMembers.array.addAll(Arrays.asList(42, 43, 44));
+
+        objectCoercionTest(hashEntriesAndArrayAndMembers, List.class, (v) -> {
+            assertEquals(3, v.size());
+            assertEquals(42, v.get(0));
+            assertEquals(43, v.get(1));
+            assertEquals(44, v.get(2));
+            Value value = context.asValue(v);
+            assertTrue(value.hasHashEntries());
+            assertTrue(value.hasMembers());
+            assertTrue(value.hasArrayElements());
+        });
     }
 
     private static <T> void objectCoercionTest(Object value, Class<T> expectedType, Consumer<T> validator) {
@@ -884,12 +1036,12 @@ public class ValueAPITest {
         }
 
         if (valueTest) {
-            assertValue(context.asValue(value));
-            assertValue(context.asValue(result));
+            assertValueInContexts(context.asValue(value));
+            assertValueInContexts(context.asValue(result));
         }
     }
 
-    private static class DummyList extends DummyCollection implements List<Object> {
+    private static final class DummyList extends DummyCollection implements List<Object> {
 
         public boolean addAll(int index, Collection<? extends Object> c) {
             return values.addAll(index, c);
@@ -998,13 +1150,13 @@ public class ValueAPITest {
 
     }
 
-    public static class EmptyObject {
+    public static final class EmptyObject {
     }
 
-    private static class PrivateObject {
+    private static final class PrivateObject {
     }
 
-    private static class FieldAccess {
+    private static final class FieldAccess {
         @SuppressWarnings("unused") public EmptyObject member;
     }
 
@@ -1053,6 +1205,115 @@ public class ValueAPITest {
         }
     }
 
+    static class HashEntries implements ProxyHashMap {
+
+        final Map<Object, Object> hashEntries;
+        private final ProxyHashMap delegate;
+
+        HashEntries() {
+            this.hashEntries = new LinkedHashMap<>();
+            this.delegate = ProxyHashMap.from(hashEntries);
+        }
+
+        @Override
+        public long getHashSize() {
+            return delegate.getHashSize();
+        }
+
+        @Override
+        public boolean hasHashEntry(Value key) {
+            return delegate.hasHashEntry(key);
+        }
+
+        @Override
+        public Object getHashValue(Value key) {
+            return delegate.getHashValue(key);
+        }
+
+        @Override
+        public void putHashEntry(Value key, Value value) {
+            delegate.putHashEntry(key, value);
+        }
+
+        @Override
+        public boolean removeHashEntry(Value key) {
+            return delegate.removeHashEntry(key);
+        }
+
+        @Override
+        public Object getHashEntriesIterator() {
+            return delegate.getHashEntriesIterator();
+        }
+    }
+
+    static class HashEntriesAndArray extends HashEntries implements ProxyArray {
+
+        final List<Object> array = new ArrayList<>();
+
+        @Override
+        public Object get(long index) {
+            return array.get((int) index);
+        }
+
+        @Override
+        public void set(long index, Value value) {
+            array.set((int) index, value);
+        }
+
+        @Override
+        public long getSize() {
+            return array.size();
+        }
+    }
+
+    static class HashEntriesAndMembers extends HashEntries implements ProxyObject {
+        final Map<String, Object> members = new HashMap<>();
+
+        @Override
+        public Object getMember(String key) {
+            return members.get(key);
+        }
+
+        @Override
+        public ProxyArray getMemberKeys() {
+            return ProxyArray.fromArray(members.keySet().toArray());
+        }
+
+        @Override
+        public boolean hasMember(String key) {
+            return members.containsKey(key);
+        }
+
+        @Override
+        public void putMember(String key, Value value) {
+            members.put(key, value);
+        }
+    }
+
+    static class HashEntriesAndArrayAndMembers extends HashEntriesAndArray implements ProxyObject {
+        final Map<String, Object> members = new HashMap<>();
+
+        @Override
+        public Object getMember(String key) {
+            return members.get(key);
+        }
+
+        @Override
+        public ProxyArray getMemberKeys() {
+            return ProxyArray.fromArray(members.keySet().toArray());
+        }
+
+        @Override
+        public boolean hasMember(String key) {
+            return members.containsKey(key);
+        }
+
+        @Override
+        public void putMember(String key, Value value) {
+            members.put(key, value);
+        }
+    }
+
     static class MembersAndArray extends Members implements ProxyObject, ProxyArray {
 
         final List<Object> array = new ArrayList<>();
@@ -1071,7 +1332,7 @@ public class ValueAPITest {
 
     }
 
-    private static class MembersAndExecutable extends Members implements ProxyObject, ProxyExecutable {
+    private static final class MembersAndExecutable extends Members implements ProxyObject, ProxyExecutable {
 
         Object executableResult;
 
@@ -1080,7 +1341,7 @@ public class ValueAPITest {
         }
     }
 
-    private static class MembersAndInstantiable extends Members implements ProxyObject, ProxyInstantiable {
+    private static final class MembersAndInstantiable extends Members implements ProxyObject, ProxyInstantiable {
 
         Object instantiableResult;
 
@@ -1090,7 +1351,7 @@ public class ValueAPITest {
 
     }
 
-    private static class MembersAndArrayAndExecutable extends MembersAndArray implements ProxyArray, ProxyObject, ProxyExecutable {
+    private static final class MembersAndArrayAndExecutable extends MembersAndArray implements ProxyArray, ProxyObject, ProxyExecutable {
 
         Object executableResult;
 
@@ -1100,7 +1361,7 @@ public class ValueAPITest {
 
     }
 
-    private static class MembersAndArrayAndInstantiable extends MembersAndArray implements ProxyArray, ProxyObject, ProxyInstantiable {
+    private static final class MembersAndArrayAndInstantiable extends MembersAndArray implements ProxyArray, ProxyObject, ProxyInstantiable {
 
         Object instantiableResult;
 
@@ -1110,7 +1371,7 @@ public class ValueAPITest {
 
     }
 
-    private static class MembersAndArrayAndExecutableAndInstantiable extends MembersAndArray implements ProxyArray, ProxyObject, ProxyInstantiable, ProxyExecutable {
+    private static final class MembersAndArrayAndExecutableAndInstantiable extends MembersAndArray implements ProxyArray, ProxyObject, ProxyInstantiable, ProxyExecutable {
 
         Object executableResult;
         Object instantiableResult;
@@ -1125,7 +1386,7 @@ public class ValueAPITest {
 
     }
 
-    private static class Executable implements ProxyExecutable {
+    private static final class Executable implements ProxyExecutable {
 
         Object executableResult;
 
@@ -1224,6 +1485,9 @@ public class ValueAPITest {
         assertFails(() -> nullValue.asLong(), NullPointerException.class,
                         "Cannot convert null value 'null'(language: Java) to Java type 'long' using Value.asLong(). " +
                                         "You can ensure that the operation is supported using Value.fitsInLong().");
+        assertFails(() -> nullValue.asBigInteger(), ClassCastException.class,
+                        "Cannot convert 'null'(language: Java) to Java type 'java.math.BigInteger' using Value.asBigInteger(): Invalid or lossy coercion. " +
+                                        "You can ensure that the value can be converted using Value.fitsInBigInteger().");
         assertFails(() -> nullValue.as(long.class), NullPointerException.class,
                         "Cannot convert null value 'null'(language: Java) to Java type 'long'.");
         assertFails(() -> nullValue.asFloat(), NullPointerException.class,
@@ -1283,6 +1547,10 @@ public class ValueAPITest {
         assertFails(() -> nan.as(Long.class), ClassCastException.class,
                         "Cannot convert 'NaN'(language: Java, type: java.lang.Double) to Java type 'java.lang.Long': Invalid or lossy primitive coercion.");
 
+        assertFails(() -> nan.asBigInteger(), ClassCastException.class,
+                        "Cannot convert 'NaN'(language: Java, type: java.lang.Double) to Java type 'java.math.BigInteger' using Value.asBigInteger(): Invalid or lossy coercion. " +
+                                        "You can ensure that the value can be converted using Value.fitsInBigInteger().");
+
         Value nofloat = context.asValue(Double.MAX_VALUE);
 
         assertFails(() -> nofloat.asFloat(), ClassCastException.class,
@@ -1323,7 +1591,7 @@ public class ValueAPITest {
 
     }
 
-    private static class EmptyProxy implements org.graalvm.polyglot.proxy.Proxy {
+    private static final class EmptyProxy implements org.graalvm.polyglot.proxy.Proxy {
 
         @Override
         public String toString() {
@@ -1379,9 +1647,9 @@ public class ValueAPITest {
 
     }
 
-    private static final TypeLiteral<List<String>> STRING_LIST = new TypeLiteral<List<String>>() {
+    private static final TypeLiteral<List<String>> STRING_LIST = new TypeLiteral<>() {
     };
-    private static final TypeLiteral<List<Integer>> INTEGER_LIST = new TypeLiteral<List<Integer>>() {
+    private static final TypeLiteral<List<Integer>> INTEGER_LIST = new TypeLiteral<>() {
     };
 
     @Test
@@ -1438,7 +1706,7 @@ public class ValueAPITest {
         assertFalse(v.removeMember("a"));
     }
 
-    private static final TypeLiteral<Map<String, String>> STRING_MAP = new TypeLiteral<Map<String, String>>() {
+    private static final TypeLiteral<Map<String, String>> STRING_MAP = new TypeLiteral<>() {
     };
 
     public static class MemberErrorTest {
@@ -1552,6 +1820,9 @@ public class ValueAPITest {
 
     }
 
+    /*
+     * Referenced in proxy-config.json
+     */
     @FunctionalInterface
     public interface OtherInterface0 {
 
@@ -1559,6 +1830,9 @@ public class ValueAPITest {
 
     }
 
+    /*
+     * Referenced in proxy-config.json
+     */
     @FunctionalInterface
     public interface OtherInterface1 {
 
@@ -1566,10 +1840,17 @@ public class ValueAPITest {
 
     }
 
+    /*
+     * Referenced in proxy-config.json
+     */
     @FunctionalInterface
     public interface OtherInterface2 {
 
         Object execute(String s, String s2);
+
+    }
+
+    public abstract static class AbstractClass1<T> extends AbstractList<T> implements OtherInterface0, OtherInterface1 {
 
     }
 
@@ -1585,19 +1866,21 @@ public class ValueAPITest {
         }
     }
 
+    static class TestExecutable implements ExecutableInterface {
+
+        public String execute(String argument) {
+            return argument;
+        }
+
+        @Override
+        public String toString() {
+            return "testExecutable";
+        }
+    }
+
     @Test
     public void testExecutableErrors() {
-        ExecutableInterface executable = new ExecutableInterface() {
-
-            public String execute(String argument) {
-                return argument;
-            }
-
-            @Override
-            public String toString() {
-                return "testExecutable";
-            }
-        };
+        ExecutableInterface executable = new TestExecutable();
 
         Value v = context.asValue(executable);
 
@@ -1746,8 +2029,8 @@ public class ValueAPITest {
         assertEquals(v1, v1);
         assertEquals(v2, v2);
 
-        ValueAssert.assertValue(v1);
-        ValueAssert.assertValue(v2);
+        assertValueInContexts(v1);
+        assertValueInContexts(v2);
     }
 
     public static class RecursiveObject {
@@ -1772,8 +2055,8 @@ public class ValueAPITest {
         assertEquals(v1, v1);
         assertEquals(v2, v2);
 
-        ValueAssert.assertValue(v1);
-        ValueAssert.assertValue(v2);
+        assertValueInContexts(v1);
+        assertValueInContexts(v2);
     }
 
     @Test
@@ -1799,6 +2082,9 @@ public class ValueAPITest {
         assertEquals(0, arrayMap.size());
     }
 
+    /*
+     * Referenced in proxy-config.json
+     */
     @Implementable
     public interface EmptyInterface {
 
@@ -1808,6 +2094,9 @@ public class ValueAPITest {
 
     }
 
+    /*
+     * Referenced in proxy-config.json
+     */
     @FunctionalInterface
     public interface EmptyFunctionalInterface {
 
@@ -1862,72 +2151,20 @@ public class ValueAPITest {
     }
 
     @Test
-    public void testValueContextPropagation() {
-        Object o = new TestObject();
-
-        ProxyLanguage.setDelegate(new ProxyLanguage() {
-            @Override
-            protected CallTarget parse(ParsingRequest request) throws Exception {
-                return Truffle.getRuntime().createCallTarget(RootNode.createConstantNode(o));
-            }
-
-            @Override
-            protected boolean isObjectOfLanguage(Object object) {
-                return object == o;
-            }
-
-            @Override
-            protected String toString(@SuppressWarnings("hiding") LanguageContext context, Object value) {
-                if (o == value) {
-                    return "true";
-                } else {
-                    return "false";
-                }
-            }
-        });
-        Value v = context.eval(ProxyLanguage.ID, "");
-        assertEquals("true", v.toString());
-        assertEquals("true", context.asValue(v).toString());
-        assertEquals("true", v.as(Map.class).toString());
-        assertEquals("true", v.as(Function.class).toString());
-        assertEquals("true", v.as(List.class).toString());
-        assertEquals("true", context.asValue(v.as(Map.class)).toString());
-        assertEquals("true", context.asValue(v.as(Function.class)).toString());
-        assertEquals("true", context.asValue(v.as(List.class)).toString());
-
-        assertEquals(v, v);
-        assertEquals(v, context.asValue(v));
-
-        assertEquals(v.as(Map.class), v.as(Map.class));
-        assertEquals(v.as(Function.class), v.as(Function.class));
-        assertEquals(v.as(List.class), v.as(List.class));
-        assertEquals(v.as(Map.class), context.asValue(v.as(Map.class)).as(Map.class));
-        assertEquals(v.as(Function.class), context.asValue(v.as(Function.class)).as(Function.class));
-        assertEquals(v.as(List.class), context.asValue(v.as(List.class)).as(List.class));
-
-        assertNotEquals(v.as(Function.class), v.as(Map.class));
-        assertNotEquals(v.as(Function.class), v.as(List.class));
-        assertNotEquals(v.as(Map.class), v.as(Function.class));
-        assertNotEquals(v.as(Map.class), v.as(List.class));
-        assertNotEquals(v.as(List.class), v.as(Function.class));
-        assertNotEquals(v.as(List.class), v.as(Map.class));
-    }
-
-    @Test
     public void testAsValue() {
         for (Object number : NUMBERS) {
-            ValueAssert.assertValue(Value.asValue(number), Trait.NUMBER);
+            assertValueInContexts(Value.asValue(number), Trait.NUMBER);
         }
         for (Object string : STRINGS) {
-            ValueAssert.assertValue(Value.asValue(string), Trait.STRING);
+            assertValueInContexts(Value.asValue(string), Trait.STRING);
         }
         for (Object b : BOOLEANS) {
-            ValueAssert.assertValue(Value.asValue(b), Trait.BOOLEAN);
+            assertValueInContexts(Value.asValue(b), Trait.BOOLEAN);
         }
         for (Object b : HOST_OBJECTS) {
             Value v = Value.asValue(b);
             assertTrue(v.isHostObject());
-            ValueAssert.assertValue(v);
+            assertValueInContexts(v);
         }
         Object o = new Object();
         Value v = Value.asValue(o);
@@ -1980,7 +2217,7 @@ public class ValueAPITest {
     }
 
     @Test
-    public void testHostObjectsAndPrimitivesNonSharable() {
+    public void testGuestObjectSharable() {
         Context context1 = context;
         Context context2 = Context.create();
         List<Object> nonSharables = new ArrayList<>();
@@ -2000,25 +2237,15 @@ public class ValueAPITest {
             if (nonSharableObject instanceof TruffleObject) {
                 nonSharableObject = context1.asValue(nonSharableObject);
             }
-            try {
-                context2.getPolyglotBindings().putMember("foo", nonSharableObject);
-                fail();
-            } catch (PolyglotException e) {
-                assertTrue(e.getMessage(), e.getMessage().contains("cannot be passed from one context to another"));
-            }
+            context2.getPolyglotBindings().putMember("foo", nonSharableObject);
+
             ProxyExecutable executable = new ProxyExecutable() {
                 public Object execute(Value... arguments) {
                     return 42;
                 }
             };
-            // supported
             assertEquals(42, context1.asValue(executable).execute(nonSharableObject).asInt());
-            try {
-                context2.asValue(executable).execute(nonSharableObject);
-                fail();
-            } catch (PolyglotException e) {
-                assertTrue(e.getMessage(), e.getMessage().contains("cannot be passed from one context to another"));
-            }
+            context2.asValue(executable).execute(nonSharableObject);
             nonSharableObject.toString(); // does not fails
             assertTrue(nonSharableObject.equals(nonSharableObject));
             assertTrue(nonSharableObject.hashCode() == nonSharableObject.hashCode());
@@ -2037,7 +2264,7 @@ public class ValueAPITest {
         sharableObjects.addAll(Arrays.asList(BOOLEANS));
         sharableObjects.addAll(Arrays.asList(STRINGS));
         sharableObjects.addAll(Arrays.asList(ARRAYS));
-        sharableObjects.addAll(Arrays.asList(BUFFERS));
+        sharableObjects.addAll(Arrays.asList(testBuffers));
 
         expandObjectVariants(context1, sharableObjects);
         for (Object object : sharableObjects) {
@@ -2096,7 +2323,8 @@ public class ValueAPITest {
     @Test
     public void testHostException() {
         Value exceptionValue = context.asValue(new RuntimeException("expected"));
-        assertValue(exceptionValue, HOST_OBJECT, MEMBERS, EXCEPTION);
+        assertValueInContexts(exceptionValue, HOST_OBJECT, MEMBERS, EXCEPTION);
+        assertValueInContexts(createDelegateInteropWrapper(context, exceptionValue), MEMBERS, EXCEPTION);
         try {
             exceptionValue.throwException();
             fail("should have thrown");
@@ -2115,7 +2343,7 @@ public class ValueAPITest {
     @Test
     public void testGuestException() {
         Value exceptionValue = context.asValue(new ExceptionWrapper(new LanguageException("expected")));
-        assertValue(exceptionValue, EXCEPTION);
+        assertValueInContexts(exceptionValue, EXCEPTION);
         try {
             exceptionValue.throwException();
             fail("should have thrown");
@@ -2149,6 +2377,25 @@ public class ValueAPITest {
                 return null;
             }
         }));
+    }
+
+    @Test
+    public void testMetaParents() {
+        Value v = context.asValue(AbstractClass1.class);
+        assertTrue(v.isMetaObject());
+        assertTrue(v.hasMetaParents());
+        Class<?>[] superTypes = new Class<?>[3];
+        superTypes[0] = AbstractClass1.class.getSuperclass();
+        superTypes[1] = AbstractClass1.class.getInterfaces()[0];
+        superTypes[2] = AbstractClass1.class.getInterfaces()[1];
+
+        Value metaParents = v.getMetaParents();
+        assertTrue(metaParents.hasArrayElements());
+        assertEquals(superTypes.length, metaParents.getArraySize());
+        for (int i = 0; i < superTypes.length; i++) {
+            assertEquals(superTypes[i].getSimpleName(), metaParents.getArrayElement(i).getMetaSimpleName());
+            assertEquals(superTypes[i].getTypeName(), metaParents.getArrayElement(i).getMetaQualifiedName());
+        }
     }
 
     @Test
@@ -2193,7 +2440,34 @@ public class ValueAPITest {
 
     }
 
-    static final InteropLibrary INTEROP = InteropLibrary.getFactory().getUncached();
+    @ExportLibrary(value = InteropLibrary.class)
+    @SuppressWarnings("static-method")
+    static final class InteropWrapperExecutable implements TruffleObject {
+
+        InteropWrapperExecutable() {
+        }
+
+        @ExportMessage
+        public Object execute(Object... args) {
+            return new InteropWrapper(args[0]);
+        }
+
+        @ExportMessage
+        public boolean isExecutable() {
+            return true;
+        }
+
+    }
+
+    @ExportLibrary(value = InteropLibrary.class, delegateTo = "delegate")
+    static final class InteropWrapper implements TruffleObject {
+
+        final Object delegate;
+
+        InteropWrapper(Object delegate) {
+            this.delegate = delegate;
+        }
+    }
 
     @ExportLibrary(value = InteropLibrary.class, delegateTo = "number")
     static final class NumberWrapper implements TruffleObject {
@@ -2299,9 +2573,10 @@ public class ValueAPITest {
 
         @ExportMessage
         String readArrayElement(long idx,
-                        @Cached BranchProfile exception) throws InvalidArrayIndexException {
+                        @Bind Node node,
+                        @Cached InlinedBranchProfile exception) throws InvalidArrayIndexException {
             if (!isArrayElementReadable(idx)) {
-                exception.enter();
+                exception.enter(node);
                 throw InvalidArrayIndexException.create(idx);
             }
             return members[(int) idx];
@@ -2320,7 +2595,7 @@ public class ValueAPITest {
     public void testPrimitiveAndObject() {
         BooleanAndDelegate o = new BooleanAndDelegate(new TestArray(new String[0]));
         Value v = context.asValue(o);
-        ValueAssert.assertValue(v, ARRAY_ELEMENTS, ITERABLE, BOOLEAN);
+        assertValueInContexts(v, ARRAY_ELEMENTS, ITERABLE, BOOLEAN);
     }
 
     @Test
@@ -2350,6 +2625,288 @@ public class ValueAPITest {
             AbstractPolyglotTest.assertFails(() -> buffer.readBufferDouble(ByteOrder.LITTLE_ENDIAN, index), IndexOutOfBoundsException.class);
             AbstractPolyglotTest.assertFails(() -> buffer.writeBufferDouble(ByteOrder.LITTLE_ENDIAN, index, 42), IndexOutOfBoundsException.class);
         }
+    }
+
+    @Test
+    public void testToString() {
+        // test null context
+        assertNotNull(Value.asValue("").toString());
+
+        Context c = Context.create();
+
+        Object[] values = new Object[]{
+                        c.asValue(""), // bound value,
+                        c.asValue(new Members()).as(Map.class),
+                        c.asValue(new ArrayElements()).as(List.class),
+                        c.asValue(new Executable()).as(Function.class),
+                        c.asValue(new HashEntries()).as(Map.class),
+        };
+
+        for (Object v : values) {
+            assertNotNull(v.toString());
+        }
+
+        c.close();
+
+        for (Object v : values) {
+            assertEquals("Error in toString(): Context is invalid or closed.", v.toString());
+        }
+
+    }
+
+    @Test
+    public void testProxyErrorInToString() {
+        try (Context c = Context.create()) {
+
+            Value v = c.asValue(new org.graalvm.polyglot.proxy.Proxy() {
+
+                @Override
+                public String toString() {
+                    throw new UnsupportedOperationException("test message");
+                }
+
+            });
+
+            AbstractPolyglotTest.assertFails(() -> v.toString(), PolyglotException.class, (e) -> {
+                assertEquals("test message", e.getMessage());
+                assertTrue(e.isHostException());
+                assertTrue(e.asHostException() instanceof UnsupportedOperationException);
+            });
+
+        }
+    }
+
+    @Test
+    public void testDisconnectedBigInteger() {
+        Value val = Value.asValue(BigInteger.ONE);
+        assertTrue(val.isNumber());
+        assertTrue(val.fitsInByte());
+        assertTrue(val.fitsInShort());
+        assertTrue(val.fitsInInt());
+        assertTrue(val.fitsInInt());
+        assertTrue(val.fitsInBigInteger());
+        assertTrue(val.fitsInFloat());
+        assertTrue(val.fitsInDouble());
+        assertEquals(1, val.asByte());
+        assertEquals(1, val.asShort());
+        assertEquals(1, val.asInt());
+        assertEquals(1, val.asLong());
+        assertEquals(BigInteger.ONE, val.asBigInteger());
+        assertEquals(1.0f, val.asFloat(), 0.0000001f);
+        assertEquals(1.0d, val.asDouble(), 0.000000000d);
+        assertEquals((Byte) (byte) 1, val.as(byte.class));
+        assertEquals((Byte) (byte) 1, val.as(Byte.class));
+        assertEquals((Short) (short) 1, val.as(short.class));
+        assertEquals((Short) (short) 1, val.as(Short.class));
+        assertEquals((Integer) 1, val.as(int.class));
+        assertEquals((Integer) 1, val.as(Integer.class));
+        assertEquals((Long) 1L, val.as(long.class));
+        assertEquals((Long) 1L, val.as(Long.class));
+        assertEquals((Float) 1.0f, val.as(float.class));
+        assertEquals((Float) 1.0f, val.as(Float.class));
+        assertEquals((Double) 1.0d, val.as(double.class));
+        assertEquals((Double) 1.0d, val.as(Double.class));
+        assertEquals(BigInteger.ONE, val.as(BigInteger.class));
+        assertEquals(BigInteger.ONE, val.as(Number.class));
+        assertEquals((Character) (char) 1, val.as(char.class));
+        assertEquals((Character) (char) 1, val.as(Character.class));
+    }
+
+    record TestEncoding(StringEncoding encoding, Charset charSet) {
+    }
+
+    static final TestEncoding[] ENCODINGS;
+
+    static {
+        List<TestEncoding> encodings = new ArrayList<>();
+        encodings.add(new TestEncoding(StringEncoding.UTF_8, StandardCharsets.UTF_8));
+        encodings.add(new TestEncoding(StringEncoding.UTF_16_LITTLE_ENDIAN, StandardCharsets.UTF_16LE));
+        encodings.add(new TestEncoding(StringEncoding.UTF_16_BIG_ENDIAN, StandardCharsets.UTF_16BE));
+        try {
+            encodings.add(new TestEncoding(StringEncoding.UTF_32_LITTLE_ENDIAN, Charset.forName("UTF-32LE")));
+            encodings.add(new TestEncoding(StringEncoding.UTF_32_BIG_ENDIAN, Charset.forName("UTF-32BE")));
+        } catch (UnsupportedCharsetException e) {
+            // expected for JDK 21
+        }
+        ENCODINGS = encodings.toArray(TestEncoding[]::new);
+    }
+
+    static final String[] SAMPLE_STRINGS = new String[]{
+                    "Hello world!", // English
+                    "Hello, \u4e16\u754c!", // Chinese
+                    "\u0048\u0065\u006c\u006c\u006f\u002c\u0020\ud83c\udf0d\u0021", // Emoticon
+                    "\u041f\u0440\u0438\u0432\u0456\u0442, \u0441\u0432\u0456\u0442\u0435!"}; // Ukrainian
+
+    @Test
+    public void testFromByteBasedString() {
+        for (TestEncoding e : ENCODINGS) {
+            for (String s : SAMPLE_STRINGS) {
+                byte[] bytes = s.getBytes(e.charSet);
+                Value value = Value.fromByteBasedString(bytes, e.encoding);
+
+                ValueAssert.assertValue(value, Trait.STRING);
+
+                assertTrue(value.isString());
+                for (TestEncoding e2 : ENCODINGS) {
+                    assertArrayEquals(e2.toString(), s.getBytes(e2.charSet), value.asStringBytes(e2.encoding));
+                }
+
+                value = Value.fromByteBasedString(bytes, 0, bytes.length, e.encoding, true);
+                assertArrayEquals(bytes, value.asStringBytes(e.encoding));
+                assertEquals(s, value.asString());
+                ValueAssert.assertValue(value, Trait.STRING);
+
+                value = Value.fromByteBasedString(bytes, 0, bytes.length, e.encoding, false);
+                assertArrayEquals(bytes, value.asStringBytes(e.encoding));
+                assertEquals(s, value.asString());
+                ValueAssert.assertValue(value, Trait.STRING);
+            }
+        }
+    }
+
+    @Test
+    public void testFromByteBasedStringMutation() {
+        for (TestEncoding e : ENCODINGS) {
+            for (String s : SAMPLE_STRINGS) {
+                byte[] bytes = s.getBytes(e.charSet);
+                // create invalid string
+                bytes[3] = 42;
+                Value value = Value.fromByteBasedString(bytes, 0, bytes.length, e.encoding, false);
+                bytes[3] = 43;
+                assertEquals(43, value.asStringBytes(e.encoding)[3]);
+            }
+        }
+    }
+
+    @Test
+    public void testFromByteBasedStringErrors() {
+        assertFails(() -> Value.fromByteBasedString(null, StringEncoding.UTF_8), NullPointerException.class, null);
+        assertFails(() -> Value.fromByteBasedString(new byte[0], null), NullPointerException.class, null);
+
+        assertFails(() -> Value.fromByteBasedString(new byte[]{42}, 0, 1, null, false), NullPointerException.class, null);
+        assertFails(() -> Value.fromByteBasedString(null, 0, 1, StringEncoding.UTF_8, false), NullPointerException.class, null);
+        assertFails(() -> Value.fromByteBasedString(new byte[]{42}, 0, 2, StringEncoding.UTF_8, false), IndexOutOfBoundsException.class, null);
+        assertFails(() -> Value.fromByteBasedString(new byte[]{42}, 1, 1, StringEncoding.UTF_8, false), IndexOutOfBoundsException.class, null);
+        assertFails(() -> Value.fromByteBasedString(new byte[]{42}, -1, 1, StringEncoding.UTF_8, false), IndexOutOfBoundsException.class, null);
+        assertFails(() -> Value.fromByteBasedString(new byte[]{42}, 0, -1, StringEncoding.UTF_8, false), IndexOutOfBoundsException.class, null);
+
+        assertFails(() -> Value.fromByteBasedString(new byte[]{42}, 0, 1, null, true), NullPointerException.class, null);
+        assertFails(() -> Value.fromByteBasedString(null, 0, 1, StringEncoding.UTF_8, true), NullPointerException.class, null);
+        assertFails(() -> Value.fromByteBasedString(new byte[]{42}, 0, 2, StringEncoding.UTF_8, true), IndexOutOfBoundsException.class, null);
+        assertFails(() -> Value.fromByteBasedString(new byte[]{42}, 1, 1, StringEncoding.UTF_8, true), IndexOutOfBoundsException.class, null);
+        assertFails(() -> Value.fromByteBasedString(new byte[]{42}, -1, 1, StringEncoding.UTF_8, true), IndexOutOfBoundsException.class, null);
+        assertFails(() -> Value.fromByteBasedString(new byte[]{42}, 0, -1, StringEncoding.UTF_8, true), IndexOutOfBoundsException.class, null);
+    }
+
+    @Test
+    public void testFromNativeBasedString() {
+        for (TestEncoding e : ENCODINGS) {
+            for (String s : SAMPLE_STRINGS) {
+                byte[] bytes = s.getBytes(e.charSet);
+                long size = bytes.length;
+                long address = UNSAFE.allocateMemory(size);
+                try {
+                    UNSAFE.copyMemory(
+                                    bytes,
+                                    Unsafe.ARRAY_BYTE_BASE_OFFSET,
+                                    null,
+                                    address,
+                                    size);
+
+                    Value value = Value.fromNativeString(address, bytes.length, e.encoding);
+                    ValueAssert.assertValue(value, Trait.STRING);
+                    assertTrue(value.isString());
+                    for (TestEncoding e2 : ENCODINGS) {
+                        assertArrayEquals(e2.toString(), s.getBytes(e2.charSet), value.asStringBytes(e2.encoding));
+                    }
+                    assertEquals(s, value.asString());
+
+                    value = Value.fromNativeString(address, 0, bytes.length, e.encoding, true);
+                    assertArrayEquals(bytes, value.asStringBytes(e.encoding));
+                    assertEquals(s, value.asString());
+                    ValueAssert.assertValue(value, Trait.STRING);
+                    value = Value.fromNativeString(address, 0, bytes.length, e.encoding, false);
+                    assertArrayEquals(bytes, value.asStringBytes(e.encoding));
+                    assertEquals(s, value.asString());
+                    ValueAssert.assertValue(value, Trait.STRING);
+
+                } finally {
+                    UNSAFE.freeMemory(address);
+                }
+            }
+        }
+    }
+
+    @Test
+    public void testFromNativeBasedStringOffset() {
+        for (TestEncoding e : ENCODINGS) {
+            for (String s : SAMPLE_STRINGS) {
+                byte[] bytes = s.getBytes(e.charSet);
+                long size = bytes.length;
+                int offset = 42;
+                long address = UNSAFE.allocateMemory(size + offset);
+                try {
+                    UNSAFE.copyMemory(
+                                    bytes,
+                                    Unsafe.ARRAY_BYTE_BASE_OFFSET,
+                                    null,
+                                    address + offset,
+                                    size);
+
+                    Value value = Value.fromNativeString(address, offset, bytes.length, e.encoding, false);
+                    assertTrue(value.isString());
+                    assertEquals(s, value.asString());
+                    ValueAssert.assertValue(value, Trait.STRING);
+                } finally {
+                    UNSAFE.freeMemory(address);
+                }
+            }
+        }
+    }
+
+    @Test
+    public void testFromNativeStringMutation() {
+        for (TestEncoding e : ENCODINGS) {
+            for (String s : SAMPLE_STRINGS) {
+                byte[] bytes = s.getBytes(e.charSet);
+                long size = bytes.length;
+                long address = UNSAFE.allocateMemory(size);
+                try {
+                    UNSAFE.copyMemory(
+                                    bytes,
+                                    Unsafe.ARRAY_BYTE_BASE_OFFSET,
+                                    null,
+                                    address,
+                                    size);
+                    UNSAFE.putByte(address + 3, (byte) 42);
+                    Value value = Value.fromNativeString(address, 0, bytes.length, e.encoding, false);
+                    UNSAFE.putByte(address + 3, (byte) 43);
+
+                    assertTrue(value.isString());
+                    assertEquals(43, value.asStringBytes(e.encoding)[3]);
+                } finally {
+                    // Step 6: Free the allocated memory
+                    UNSAFE.freeMemory(address);
+                }
+
+            }
+        }
+    }
+
+    @Test
+    public void testFromNativeBasedStringErrors() {
+        assertFails(() -> Value.fromNativeString(0L, 0, StringEncoding.UTF_8), NullPointerException.class, null);
+        assertFails(() -> Value.fromNativeString(1L, -1, StringEncoding.UTF_8), IndexOutOfBoundsException.class, null);
+
+        assertFails(() -> Value.fromNativeString(0L, 0, 0, StringEncoding.UTF_8, false), NullPointerException.class, null);
+        assertFails(() -> Value.fromNativeString(1L, 0, 0, null, false), NullPointerException.class, null);
+        assertFails(() -> Value.fromNativeString(1L, 0, -1, StringEncoding.UTF_8, false), IndexOutOfBoundsException.class, null);
+        assertFails(() -> Value.fromNativeString(1L, -1, 0, StringEncoding.UTF_8, false), IndexOutOfBoundsException.class, null);
+
+        assertFails(() -> Value.fromNativeString(0L, 0, 0, StringEncoding.UTF_8, true), NullPointerException.class, null);
+        assertFails(() -> Value.fromNativeString(1L, 0, 0, null, true), NullPointerException.class, null);
+        assertFails(() -> Value.fromNativeString(1L, 0, -1, StringEncoding.UTF_8, true), IndexOutOfBoundsException.class, null);
+        assertFails(() -> Value.fromNativeString(1L, -1, 0, StringEncoding.UTF_8, true), IndexOutOfBoundsException.class, null);
     }
 
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2012, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -42,26 +42,29 @@ package com.oracle.truffle.api.nodes;
 
 import java.util.List;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
 import java.util.concurrent.locks.ReentrantLock;
 
 import com.oracle.truffle.api.CallTarget;
 import com.oracle.truffle.api.CompilerAsserts;
+import com.oracle.truffle.api.CompilerDirectives;
 import com.oracle.truffle.api.CompilerDirectives.CompilationFinal;
 import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
-import com.oracle.truffle.api.CompilerOptions;
+import com.oracle.truffle.api.ContextLocal;
+import com.oracle.truffle.api.ContextThreadLocal;
 import com.oracle.truffle.api.RootCallTarget;
 import com.oracle.truffle.api.TruffleContext;
 import com.oracle.truffle.api.TruffleLanguage;
 import com.oracle.truffle.api.TruffleLanguage.ContextReference;
 import com.oracle.truffle.api.TruffleLanguage.Env;
+import com.oracle.truffle.api.TruffleLanguage.LanguageReference;
 import com.oracle.truffle.api.TruffleLanguage.ParsingRequest;
-import com.oracle.truffle.api.TruffleRuntime;
 import com.oracle.truffle.api.TruffleStackTraceElement;
 import com.oracle.truffle.api.frame.Frame;
 import com.oracle.truffle.api.frame.FrameDescriptor;
+import com.oracle.truffle.api.frame.FrameInstance;
 import com.oracle.truffle.api.frame.VirtualFrame;
-import com.oracle.truffle.api.impl.DefaultCompilerOptions;
 import com.oracle.truffle.api.source.Source;
 import com.oracle.truffle.api.source.SourceSection;
 
@@ -84,13 +87,13 @@ import com.oracle.truffle.api.source.SourceSection;
  *
  * <h4>Execution</h4>
  *
- * In order to execute a root node, a call target needs to be created using
- * {@link TruffleRuntime#createCallTarget(RootNode)}. This allows the runtime system to optimize the
- * execution of the AST. The {@link CallTarget} can either be {@link CallTarget#call(Object...)
- * called} directly from runtime code or {@link DirectCallNode direct} and {@link IndirectCallNode
- * indirect} call nodes can be created, inserted in a child field and
- * {@link DirectCallNode#call(Object[]) called}. The use of direct call nodes allows the framework
- * to automatically inline and further optimize call sites based on heuristics.
+ * In order to execute a root node, its call target is lazily created and can be accessed via
+ * {@link RootNode#getCallTarget()}. This allows the runtime system to optimize the execution of the
+ * AST. The {@link CallTarget} can either be {@link CallTarget#call(Object...) called} directly from
+ * runtime code or {@link DirectCallNode direct} and {@link IndirectCallNode indirect} call nodes
+ * can be created, inserted in a child field and {@link DirectCallNode#call(Object[]) called}. The
+ * use of direct call nodes allows the framework to automatically inline and further optimize call
+ * sites based on heuristics.
  * <p>
  * After several calls to a call target or call node, the root node might get compiled using partial
  * evaluation. The details of the compilation heuristic are unspecified, therefore the Truffle
@@ -125,6 +128,7 @@ import com.oracle.truffle.api.source.SourceSection;
  *
  * @since 0.8 or earlier
  */
+// @DefaultSymbol("$rootNode")
 public abstract class RootNode extends ExecutableNode {
 
     private static final AtomicReferenceFieldUpdater<RootNode, ReentrantLock> LOCK_UPDATER = AtomicReferenceFieldUpdater.newUpdater(RootNode.class, ReentrantLock.class, "lock");
@@ -167,26 +171,19 @@ public abstract class RootNode extends ExecutableNode {
         this.frameDescriptor = frameDescriptor == null ? new FrameDescriptor() : frameDescriptor;
     }
 
-    /**
-     * @see TruffleLanguage#getContextReference()
-     * @since 0.27
-     * @deprecated use {@link #lookupContextReference(Class)} instead.
-     */
-    @SuppressWarnings("deprecation")
-    @Deprecated
-    public final <C, T extends TruffleLanguage<C>> C getCurrentContext(Class<T> languageClass) {
-        if (getLanguage() == null) {
-            return null;
-        }
-        return getLanguage(languageClass).getContextReference().get();
-    }
-
     /** @since 0.8 or earlier */
     @Override
     public Node copy() {
         RootNode root = (RootNode) super.copy();
         root.frameDescriptor = frameDescriptor;
+        resetFieldsAfterCopy(root);
         return root;
+    }
+
+    private static void resetFieldsAfterCopy(RootNode root) {
+        root.callTarget = null;
+        root.instrumentationBits = 0;
+        root.lock = null;
     }
 
     /**
@@ -195,7 +192,7 @@ public abstract class RootNode extends ExecutableNode {
      * default. A root node that represents a Java method could consist of the package name, the
      * class name and the method name. E.g. <code>mypackage.MyClass.myMethod</code>
      *
-     * @since 20.0.0 beta 1
+     * @since 20.0
      */
     public String getQualifiedName() {
         return getName();
@@ -268,19 +265,75 @@ public abstract class RootNode extends ExecutableNode {
         return !isInternal();
     }
 
+    /**
+     * Returns the current byte code index of the root node using a given node location and a frame.
+     * Depending on the strategy (see below) either the node or the frame may be used to find the
+     * bytecode index.
+     * <p>
+     * This method is called by Truffle to determine the bytecode index when constructing
+     * {@link TruffleStackTraceElement} objects. There are two common strategies to implement this
+     * method:
+     * <ul>
+     * <li>If the bytecode index is stored in the frame, then
+     * {@link #isCaptureFramesForTrace(boolean)} should be overridden and return <code>true</code>.
+     * Next use the frame argument and read the bytecode index from the frame. Note that the
+     * provided frame may be <code>null</code> even if {@link #isCaptureFramesForTrace(boolean)}
+     * returns <code>true</code>.
+     * <li>If the bytecode index is stored in the call node, then {@link Node#getParent() parent}
+     * nodes should be walked to find the node containing the bytecode index.
+     * </ul>
+     * <p>
+     * This method should return a negative bytecode index if it is unavailable or invalid. A
+     * language implementation may assign additional semantics for individual negative byte code
+     * indices, other languages will interpret any negative index as if the index is unavailable.
+     *
+     * @param node the top-most node of the activation or <code>null</code>
+     * @param frame the current frame of the activation or <code>null</code>
+     * @see FrameInstance#getBytecodeIndex() to access byte code indices
+     * @since 24.1
+     */
+    protected int findBytecodeIndex(Node node, Frame frame) {
+        return -1;
+    }
+
     @TruffleBoundary
     private SourceSection materializeSourceSection() {
         return getSourceSection();
     }
 
     /**
-     * Returns <code>true</code> if a TruffleException leaving this node should capture
+     * @since 24.1
+     * @deprecated in 24.1, implement and use {@link #isCaptureFramesForTrace(boolean)} instead
+     */
+    @Deprecated
+    protected boolean isCaptureFramesForTrace(@SuppressWarnings("unused") Node compiledFrame) {
+        return isCaptureFramesForTrace();
+    }
+
+    /**
+     * Returns <code>true</code> if an AbstractTruffleException leaving this node should capture
      * {@link Frame} objects in its stack trace in addition to the default information. This is
      * <code>false</code> by default to avoid the attached overhead. The captured frames are then
-     * accessible through {@link TruffleStackTraceElement#getFrame()}
+     * accessible through {@link TruffleStackTraceElement#getFrame()}.
+     * <p>
+     * Using the compiledFrame argument can be useful to capture the frame only for interpreted
+     * frames. This way it is possible to store the {@link #findBytecodeIndex(Node, Frame) bytecode
+     * index} in the frame only in the interpreter, but never in compiled code. This is more
+     * efficient, because capturing the frame is a fast operation in the interpreter, but a slow
+     * operation for compiled frames.
      *
-     * @since 0.31
+     * @param compiledFrame whether the frame would be from a compiled execution.
+     * @since 24.1
      */
+    protected boolean isCaptureFramesForTrace(boolean compiledFrame) {
+        return isCaptureFramesForTrace(null);
+    }
+
+    /**
+     * @since 0.31
+     * @deprecated in 24.1, implement and use {@link #isCaptureFramesForTrace(boolean)} instead
+     */
+    @Deprecated
     public boolean isCaptureFramesForTrace() {
         return false;
     }
@@ -347,6 +400,38 @@ public abstract class RootNode extends ExecutableNode {
         throw new UnsupportedOperationException();
     }
 
+    final RootNode cloneUninitializedImpl(CallTarget sourceCallTarget, RootNode uninitializedRootNode) {
+        RootNode clonedRoot;
+        if (isCloneUninitializedSupported()) {
+            assert uninitializedRootNode == null : "uninitializedRootNode should not have been created";
+            clonedRoot = cloneUninitialized();
+
+            // if the language copied we cannot be sure
+            // that the call target is not reset (with their own means of copying)
+            // so better make sure they are reset.
+            resetFieldsAfterCopy(clonedRoot);
+        } else {
+            clonedRoot = NodeUtil.cloneNode(uninitializedRootNode);
+            // regular cloning guarantees that call target, instrumentation bits,
+            // and lock are null. See #copy().
+            assert clonedRoot.callTarget == null;
+            assert clonedRoot.instrumentationBits == 0;
+            assert clonedRoot.lock == null;
+        }
+
+        RootCallTarget clonedTarget = NodeAccessor.RUNTIME.newCallTarget(sourceCallTarget, clonedRoot);
+
+        ReentrantLock l = clonedRoot.getLazyLock();
+        l.lock();
+        try {
+            clonedRoot.setupCallTarget(clonedTarget, "callTarget not null. Was getCallTarget on the result of RootNode.cloneUninitialized called?");
+        } finally {
+            l.unlock();
+        }
+
+        return clonedRoot;
+    }
+
     /**
      * Executes this function using the specified frame and returns the result value.
      *
@@ -359,26 +444,54 @@ public abstract class RootNode extends ExecutableNode {
 
     /** @since 0.8 or earlier */
     public final RootCallTarget getCallTarget() {
+        RootCallTarget target = this.callTarget;
+        // Check isLoaded to avoid returning a CallTarget before notifyOnLoad() is done
+        if (target == null || !NodeAccessor.RUNTIME.isLoaded(target)) {
+            CompilerDirectives.transferToInterpreterAndInvalidate();
+            target = initializeTarget();
+        }
+        return target;
+    }
+
+    private RootCallTarget initializeTarget() {
+        RootCallTarget target;
+        ReentrantLock l = getLazyLock();
+        l.lock();
+        try {
+            target = this.callTarget;
+            if (target == null) {
+                target = NodeAccessor.RUNTIME.newCallTarget(null, this);
+                this.setupCallTarget(target, "callTarget was set by newCallTarget but should not");
+            }
+        } finally {
+            l.unlock();
+        }
+        return target;
+    }
+
+    private void setupCallTarget(RootCallTarget callTarget, String message) {
+        assert getLazyLock().isHeldByCurrentThread();
+
+        if (this.callTarget != null) {
+            throw CompilerDirectives.shouldNotReachHere(message);
+        }
+        prepareForCall();
+        this.callTarget = callTarget;
+
+        // Call notifyOnLoad() after the callTarget field is set, so the invariant that if a
+        // CallTarget exists for a RootNode then that rootNode.callTarget points to the CallTarget
+        // always holds, and no matter what notifyOnLoad() does the 1-1 relation between the
+        // RootNode and CallTarget is already there.
+        NodeAccessor.RUNTIME.notifyOnLoad(callTarget);
+    }
+
+    final RootCallTarget getCallTargetWithoutInitialization() {
         return callTarget;
     }
 
     /** @since 0.8 or earlier */
     public final FrameDescriptor getFrameDescriptor() {
         return frameDescriptor;
-    }
-
-    /** @since 19.0 */
-    protected final void setCallTarget(RootCallTarget callTarget) {
-        this.callTarget = callTarget;
-    }
-
-    /**
-     * Get compiler options specific to this <code>RootNode</code>.
-     *
-     * @since 0.8 or earlier
-     */
-    public CompilerOptions getCompilerOptions() {
-        return DefaultCompilerOptions.INSTANCE;
     }
 
     /**
@@ -388,6 +501,83 @@ public abstract class RootNode extends ExecutableNode {
      * @since 0.8 or earlier
      */
     protected boolean isInstrumentable() {
+        return true;
+    }
+
+    /**
+     * Prepares this {@link RootNode} to be called with a {@link CallTarget}. This method will be
+     * called exactly once when a {@link #getCallTarget() call target is requested} for the first
+     * time. This method can be used to lazily initialize parts of a root node, or to validate that
+     * a root node can be used as a call target.
+     * 
+     * @since 25.0
+     */
+    protected void prepareForCall() {
+        // no default implementation
+    }
+
+    /**
+     * Prepares this {@link RootNode} for compilation. This method is guaranteed to be called at
+     * least once before any code paths are executed as compiled code (see
+     * {@link CompilerDirectives#inCompiledCode()}) for a given compilation tier. It may be called
+     * multiple times per compilation and can be invoked concurrently by multiple compiler threads
+     * without synchronization; therefore, it must be thread-safe.
+     *
+     * By default, this method returns <code>true</code> to indicate sufficient profiling for
+     * compilation, but implementations can return <code>false</code> if not. Returning
+     * <code>false</code> for root compilations will defer the compilation to allow for additional
+     * profiling, whereas otherwise returning <code>false</code> during inlining will disable
+     * inlining for this call site. Any exception thrown will fail the compilation for this
+     * {@link RootNode} permanently.
+     *
+     * Compilations are initiated by the runtime for optimization through partial evaluation and
+     * compilation. The timing and threading of compilations are runtime-specific and should not be
+     * relied upon. This method is not called for Truffle runtimes that do not support compilation,
+     * such as the fallback runtime.
+     *
+     * Compilations may be initiated for the following reasons:
+     * <ul>
+     * <li>The {@link CallTarget} for this {@link RootNode} has been invoked frequently enough to
+     * trigger compilation.
+     * <li>A {@link LoopNode} or {@link BytecodeOSRNode} has executed frequently enough to trigger
+     * OSR compilation.
+     * <li>The compiler is exploring inlining during compilation, preparing to inline a
+     * {@link DirectCallNode} or an indirect call with a partially evaluated constant
+     * {@link CallTarget}.
+     * </ul>
+     *
+     * Work performed in this method counts towards compilation time, not interpretation time.
+     * Implementing this method can help offload expensive computations to compiler threads. Cache
+     * any preparation work to avoid repeating it for every compilation and inlining. To prevent
+     * deadlocks when using synchronization, adhere to the following guidelines:
+     * <ul>
+     * <li>Do not execute guest code or invoke {@link CallTarget#call(Object...)} within this
+     * method.
+     * <li>Avoid acquiring locks shared with execution threads, especially across call boundaries or
+     * loop back-edges when OSR compilation is enabled.
+     * <li>Use {@link AtomicReferenceFieldUpdater} CAS-locking for caching non-expensive preparation
+     * work to minimize contention.
+     * <li>Ensure all synchronization primitives are released upon method exit; use finally blocks
+     * for safety.
+     * </ul>
+     *
+     * Note that during the execution of this method, no language context is entered. Therefore, you
+     * cannot use {@link ContextThreadLocal}, {@link ContextLocal}, {@link LanguageReference}, or
+     * {@link ContextReference}.
+     *
+     * @param rootCompilation <code>true</code> if this is a root compilation; <code>false</code> if
+     *            inlining this root.
+     * @param compilationTier the current compilation tier, as per
+     *            {@link FrameInstance#getCompilationTier()}.
+     * @param lastTier <code>true</code> if this is the last compilation tier for which this
+     *            {@link RootNode} is prepared; <code>false</code> otherwise. Useful for performing
+     *            preparation only at the highest tier.
+     * @return <code>true</code> if the method is sufficiently profiled; <code>false</code>
+     *         otherwise.
+     *
+     * @since 24.2
+     */
+    protected boolean prepareForCompilation(boolean rootCompilation, int compilationTier, boolean lastTier) {
         return true;
     }
 
@@ -410,6 +600,52 @@ public abstract class RootNode extends ExecutableNode {
      */
     protected boolean isTrivial() {
         return false;
+    }
+
+    /**
+     * Prepares a root node for use with the Truffle instrumentation framework. This is similar to
+     * materialization of syntax nodes in an InstrumentableNode, but this method should be preferred
+     * if the root node is updated as a whole and the individual materialization of nodes is not
+     * needed. Another advantage of this method is that it is always invoked before
+     * {@link #getSourceSection()} by the instrumentation framework. This allows to perform the
+     * materialization of sources and tags in one operation.
+     * <p>
+     * This method is invoked repeatedly and should not perform any operation if a set of tags was
+     * already prepared before. In other words, this method should stabilize and eventually not
+     * perform any operation if the same tags were observed before.
+     *
+     * @since 24.2
+     */
+    protected void prepareForInstrumentation(@SuppressWarnings("unused") Set<Class<?>> tags) {
+        // no default implementation
+    }
+
+    /**
+     * Returns an instrumentable call node from a node and frame. By default, returns the given
+     * <code>callNode</code>. If the returned node is not instrumentable, the
+     * {@link Node#getParent() parent} chain of the node may be traversed until an instrumentable
+     * node is found (thus, the returned node should be adopted).
+     * <p>
+     * This method should be implemented if the instrumentable call node is not reachable through
+     * the {@link Node#getParent() parent} chain of a {@link FrameInstance#getCallNode() call node}.
+     * For example, in bytecode interpreters instrumentable nodes may be stored in a side data
+     * structure and the instrumentable node must be looked up using the bytecode index. This method
+     * is intended to be overridden to implement specify such behavior.
+     * <p>
+     * A {@link Frame frame} parameter is only provided if {@link #isCaptureFramesForTrace(boolean)}
+     * returns <code>true</code>. If the frame is not captured then the frame parameter is
+     * <code>null</code>.
+     * <p>
+     * The <code>bytecodeIndex</code> parameter takes on the value produced by calling
+     * {@link #findBytecodeIndex(Node, Frame)} (<code>-1</code> unless overridden).
+     *
+     * @param callNode the top-most node of the activation or <code>null</code>
+     * @param frame the current frame of the activation or <code>null</code>
+     * @param bytecodeIndex the current bytecode index of the activation or a negative number
+     * @since 24.2
+     */
+    protected Node findInstrumentableCallNode(Node callNode, Frame frame, int bytecodeIndex) {
+        return callNode;
     }
 
     /**
@@ -439,7 +675,7 @@ public abstract class RootNode extends ExecutableNode {
      * <p>
      * The intention of this method is to provide a guest language object for other languages that
      * they can inspect using interop. An implementation of this method is expected to not fail with
-     * a guest error. Implementations are allowed to do {@link ContextReference#get() context
+     * a guest error. Implementations are allowed to do {@link ContextReference#get(Node) context
      * reference lookups} in the implementation of the method. This may be useful to access the
      * function objects needed to resolve the stack trace element.
      *
@@ -480,7 +716,9 @@ public abstract class RootNode extends ExecutableNode {
      * any thread, even threads unknown to the guest language implementation. It is allowed to
      * create new {@link CallTarget call targets} during preparation of the root node or perform
      * modifications to the {@link TruffleLanguage language} of this root node.
+     * <p>
      *
+     * @see #prepareForCompilation(boolean, int, boolean)
      * @since 20.3
      */
     protected ExecutionSignature prepareForAOT() {
@@ -501,6 +739,59 @@ public abstract class RootNode extends ExecutableNode {
         return new Constant(constant);
     }
 
+    /**
+     * If this root node has a lexical scope parent, this method returns its frame descriptor.
+     *
+     * As an example, consider the following pseudocode:
+     *
+     * <pre>
+     * def m {
+     *   # For the "m" root node:
+     *   # getFrameDescriptor       returns FrameDescriptor(m)
+     *   # getParentFrameDescriptor returns null
+     *   var_method = 0
+     *   a = () -> {
+     *     # For the "a lambda" root node:
+     *     # getFrameDescriptor       returns FrameDescriptor(a)
+     *     # getParentFrameDescriptor returns FrameDescriptor(m)
+     *     var_lambda1 = 1
+     *     b = () -> {
+     *       # For the "b lambda" root node:
+     *       # getFrameDescriptor       returns FrameDescriptor(b)
+     *       # getParentFrameDescriptor returns FrameDescriptor(a)
+     *       var_method + var_lambda1
+     *     }
+     *     b.call
+     *   }
+     *   a.call
+     * }
+     * </pre>
+     *
+     * This info is used by the runtime to optimize compilation order by giving more priority to
+     * lexical parents which are likely to inline the child thus resulting in better performance
+     * sooner rather than waiting for the lexical parent to get hot on its own.
+     *
+     * @return The frame descriptor of the lexical parent scope if it exists. <code>null</code>
+     *         otherwise.
+     * @since 22.3.0
+     */
+    protected FrameDescriptor getParentFrameDescriptor() {
+        return null;
+    }
+
+    /**
+     * Tests if two frames are the same. This method is mainly used by instruments in case of
+     * <code>yield</code> of the execution and later resume. Frame comparison is used to match the
+     * particular yielded and resumed execution.
+     * <p>
+     * The default implementation compares the frames identity.
+     *
+     * @since 24.0
+     */
+    protected boolean isSameFrame(Frame frame1, Frame frame2) {
+        return frame1 == frame2;
+    }
+
     final ReentrantLock getLazyLock() {
         ReentrantLock l = this.lock;
         if (l == null) {
@@ -516,6 +807,22 @@ public abstract class RootNode extends ExecutableNode {
             l = Objects.requireNonNull(this.lock);
         }
         return l;
+    }
+
+    /**
+     * Computes a size estimate of this root node. This is intended to be overwritten if the size of
+     * the root node cannot be estimated from the natural AST size. For example, in case the root
+     * node is represented by a bytecode interpreter. If <code>-1</code> is returned, the regular
+     * AST size estimate is going to be used. By default this method returns <code>-1</code>.
+     * <p>
+     * The size estimate is guaranteed to be invoked only once when the {@link CallTarget} is
+     * created. This corresponds to calls to {@link #getCallTarget()} for the first time. This
+     * method will never be invoked after the root node was already executed.
+     *
+     * @since 23.0
+     */
+    protected int computeSize() {
+        return -1;
     }
 
     private static final class Constant extends RootNode {

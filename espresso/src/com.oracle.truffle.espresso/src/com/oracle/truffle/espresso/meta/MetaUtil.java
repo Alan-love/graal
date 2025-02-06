@@ -24,7 +24,9 @@ package com.oracle.truffle.espresso.meta;
 
 import com.oracle.truffle.api.CompilerAsserts;
 import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
-import com.oracle.truffle.espresso.runtime.StaticObject;
+import com.oracle.truffle.espresso.EspressoLanguage;
+import com.oracle.truffle.espresso.classfile.JavaKind;
+import com.oracle.truffle.espresso.runtime.staticobject.StaticObject;
 
 /**
  * Miscellaneous collection of utility methods used by {@code jdk.vm.ci.meta} and its clients.
@@ -168,12 +170,12 @@ public class MetaUtil {
         return obj.getClass().getName() + "@" + System.identityHashCode(obj);
     }
 
-    public static Object unwrapArrayOrNull(StaticObject object) {
+    public static Object unwrapArrayOrNull(EspressoLanguage language, StaticObject object) {
         if (StaticObject.isNull(object)) {
             return null;
         }
         if (object.isArray()) {
-            return object.unwrap();
+            return object.unwrap(language);
         }
         return object;
     }

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2020, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -52,11 +52,17 @@ import com.oracle.truffle.sl.SLLanguage;
 @SuppressWarnings({"static-method", "unused"})
 public class GR22815Test {
 
+    /*
+     * Referenced in reflect-config.json
+     */
     @Export
     public static String log(String msg, Throwable thrown) {
         return "log1";
     }
 
+    /*
+     * Referenced in reflect-config.json
+     */
     @Export
     public static String log(Throwable thrown, String msgSupplier) {
         return "log2";

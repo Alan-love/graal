@@ -38,7 +38,7 @@ import com.oracle.truffle.espresso.analysis.BlockIteratorClosure;
 import com.oracle.truffle.espresso.analysis.BlockLogger;
 import com.oracle.truffle.espresso.analysis.Util;
 import com.oracle.truffle.espresso.analysis.graph.LinkedBlock;
-import com.oracle.truffle.espresso.bytecode.BytecodeStream;
+import com.oracle.truffle.espresso.classfile.bytecode.BytecodeStream;
 import com.oracle.truffle.espresso.impl.Method;
 
 /**
@@ -58,7 +58,7 @@ public final class BlockBoundaryFinder extends BlockIteratorClosure implements B
 
     private final BitSet emptyBitSet;
 
-    BlockBoundaryFinder(Method m, History[] blockHistory) {
+    BlockBoundaryFinder(Method.MethodVersion m, History[] blockHistory) {
         this.blockHistory = blockHistory;
         this.totalBlocks = blockHistory.length;
         this.maxLocals = m.getMaxLocals();
@@ -153,7 +153,7 @@ public final class BlockBoundaryFinder extends BlockIteratorClosure implements B
             }
         }
         BitSet endState = getEndState(processor.idToBlock(blockID), processor);
-        for (int i : Util.bitSetIterator(endState)) {
+        for (int i : Util.bitSetSetIterator(endState)) {
             if (!treated.get(i)) {
                 // One of the successor needs the local
                 entryLiveSet.set(i);

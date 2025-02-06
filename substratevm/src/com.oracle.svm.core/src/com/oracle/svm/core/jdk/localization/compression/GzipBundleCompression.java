@@ -43,12 +43,12 @@ import java.util.ResourceBundle;
 import java.util.zip.GZIPInputStream;
 import java.util.zip.GZIPOutputStream;
 
-import org.graalvm.collections.Pair;
-import org.graalvm.compiler.debug.GraalError;
-
-import com.oracle.svm.core.jdk.localization.bundles.CompressedBundle;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
+
+import com.oracle.svm.core.jdk.localization.bundles.CompressedBundle;
+import com.oracle.svm.core.jdk.localization.compression.utils.BundleSerializationUtils.SerializedContent;
+import com.oracle.svm.core.util.VMError;
 
 /**
  * Class responsible for serialization and compression of resource bundles. Only bundles whose
@@ -83,14 +83,14 @@ public class GzipBundleCompression {
     @Platforms(Platform.HOSTED_ONLY.class)
     public static CompressedBundle compress(ResourceBundle bundle) {
         final Map<String, Object> content = extractContent(bundle);
-        Pair<String, int[]> input = serializeContent(content);
+        SerializedContent input = serializeContent(content);
         try (ByteArrayOutputStream byteStream = new ByteArrayOutputStream(); GZIPOutputStream out = new GZIPOutputStream(byteStream)) {
-            writeIndices(input.getRight(), out);
-            writeText(input.getLeft(), out);
+            writeIndices(input.indices(), out);
+            writeText(input.text(), out);
             out.finish();
             return new CompressedBundle(byteStream.toByteArray(), GzipBundleCompression::decompressBundle);
         } catch (IOException ex) {
-            throw GraalError.shouldNotReachHere(ex, "Compression of a bundle " + bundle.getClass() + " failed. This is an internal error. Please open an issue and submit a reproducer.");
+            throw VMError.shouldNotReachHere("Compression of a bundle " + bundle.getClass() + " failed. This is an internal error. Please open an issue and submit a reproducer.", ex);
         }
     }
 
@@ -100,7 +100,7 @@ public class GzipBundleCompression {
             String decompressed = readText(input);
             return deserializeContent(indices, decompressed);
         } catch (IOException e) {
-            throw GraalError.shouldNotReachHere(e, "Decompressing a resource bundle failed.");
+            throw VMError.shouldNotReachHere("Decompressing a resource bundle failed.", e);
         }
     }
 

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2017, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -54,6 +54,7 @@ import java.util.NoSuchElementException;
 import java.util.Objects;
 import java.util.Set;
 import java.util.stream.Collectors;
+
 import org.graalvm.polyglot.Value;
 
 /**
@@ -144,7 +145,7 @@ public final class TypeDescriptor {
      * content type.
      *
      * @see #isAssignable(org.graalvm.polyglot.tck.TypeDescriptor).
-     * @see Value#hasMembers().
+     * @see Value#hasArrayElements().
      * @since 0.30
      */
     public static final TypeDescriptor ARRAY;
@@ -171,6 +172,7 @@ public final class TypeDescriptor {
     /**
      * Type descriptor for date.
      *
+     * @see Value#isDate().
      * @since 20.0
      */
     public static final TypeDescriptor DATE = new TypeDescriptor(new PrimitiveImpl(PrimitiveKind.DATE));
@@ -178,6 +180,7 @@ public final class TypeDescriptor {
     /**
      * Type descriptor for time.
      *
+     * @see Value#isTime().
      * @since 20.0
      */
     public static final TypeDescriptor TIME = new TypeDescriptor(new PrimitiveImpl(PrimitiveKind.TIME));
@@ -185,6 +188,7 @@ public final class TypeDescriptor {
     /**
      * Type descriptor for time zone.
      *
+     * @see Value#isTimeZone().
      * @since 20.0
      */
     public static final TypeDescriptor TIME_ZONE = new TypeDescriptor(new PrimitiveImpl(PrimitiveKind.TIME_ZONE));
@@ -192,6 +196,7 @@ public final class TypeDescriptor {
     /**
      * Type descriptor for duration.
      *
+     * @see Value#isDuration().
      * @since 20.0
      */
     public static final TypeDescriptor DURATION = new TypeDescriptor(new PrimitiveImpl(PrimitiveKind.DURATION));
@@ -199,13 +204,15 @@ public final class TypeDescriptor {
     /**
      * Type descriptor for metaobjects.
      *
+     * @see Value#isMetaObject().
      * @since 20.0
      */
     public static final TypeDescriptor META_OBJECT = new TypeDescriptor(new PrimitiveImpl(PrimitiveKind.META_OBJECT));
 
     /**
-     * Type descriptor for duration.
+     * Type descriptor for exception.
      *
+     * @see Value#isException()
      * @since 19.3
      */
     public static final TypeDescriptor EXCEPTION = new TypeDescriptor(new PrimitiveImpl(PrimitiveKind.EXCEPTION));
@@ -219,8 +226,16 @@ public final class TypeDescriptor {
      *
      * <p>
      * The JavaScript sample usage for no argument function constructor:
-     * {@codesnippet LanguageProviderSnippets#TypeDescriptorSnippets#createValueConstructors}
-     * <p>
+     * 
+     * <pre>
+     * &#64;Override
+     * public Collection&lt;? extends Snippet&gt; createValueConstructors(Context context) {
+     *     return Collections.singleton(Snippet.newBuilder(
+     *                     "function",
+     *                     context.eval("js", "(function(){ return function(){}})"),
+     *                     TypeDescriptor.EXECUTABLE).build());
+     * }
+     * </pre>
      *
      * @see Value#canExecute().
      * @since 0.30
@@ -235,10 +250,39 @@ public final class TypeDescriptor {
      * . This type can be used for specifying expressions or statements parameter types when the
      * passed executable is actually not invoked.
      *
-     * <p>
-     * The JavaScript sample usage for plus operator:
-     * {@codesnippet LanguageProviderSnippets#JsSnippets#createExpressions}
-     * <p>
+     * <pre>
+     * &#64;Override
+     * public Collection&lt;? extends Snippet&gt; createExpressions(Context context) {
+     *     final Collection&lt;Snippet&gt; expressions = new ArrayList&lt;&gt;();
+     *     final TypeDescriptor numeric = TypeDescriptor.union(
+     *                     TypeDescriptor.NUMBER,
+     *                     TypeDescriptor.BOOLEAN);
+     *     final TypeDescriptor nonNumeric = TypeDescriptor.union(
+     *                     TypeDescriptor.STRING,
+     *                     TypeDescriptor.OBJECT,
+     *                     TypeDescriptor.ARRAY,
+     *                     TypeDescriptor.EXECUTABLE_ANY);
+     *     Snippet.Builder builder = Snippet.newBuilder(
+     *                     "+",
+     *                     context.eval("js",
+     *                                     "(function (a, b){ return a + b;})"),
+     *                     TypeDescriptor.NUMBER).parameterTypes(numeric, numeric);
+     *     expressions.add(builder.build());
+     *     builder = Snippet.newBuilder(
+     *                     "+",
+     *                     context.eval("js",
+     *                                     "(function (a, b){ return a + b;})"),
+     *                     TypeDescriptor.STRING).parameterTypes(nonNumeric, TypeDescriptor.ANY);
+     *     expressions.add(builder.build());
+     *     builder = Snippet.newBuilder(
+     *                     "+",
+     *                     context.eval("js",
+     *                                     "(function (a, b){ return a + b;})"),
+     *                     TypeDescriptor.STRING).parameterTypes(TypeDescriptor.ANY, nonNumeric);
+     *     expressions.add(builder.build());
+     *     return expressions;
+     * }
+     * </pre>
      *
      * @see TypeDescriptor#EXECUTABLE
      * @since 19.0
@@ -273,18 +317,29 @@ public final class TypeDescriptor {
     public static final TypeDescriptor INSTANTIABLE_ANY = new TypeDescriptor(new InstantiableImpl(ExecutableImpl.Kind.TOP, null, true, Collections.emptyList()));
 
     /**
-     * Represents all types. It's an intersection of no type.
+     * Represents any type. It's a union of all types.
      *
      * @since 0.30
      */
     public static final TypeDescriptor ANY = new TypeDescriptor(new UnionImpl(new HashSet<>(Arrays.asList(
-                    NOTYPE.impl, NULL.impl, BOOLEAN.impl, NUMBER.impl, STRING.impl, HOST_OBJECT.impl, NATIVE_POINTER.impl, OBJECT.impl, ARRAY.impl, EXECUTABLE_ANY.impl, INSTANTIABLE_ANY.impl,
-                    DATE.impl, TIME.impl, TIME_ZONE.impl, DURATION.impl, META_OBJECT.impl, ITERABLE.impl, ITERATOR.impl, EXCEPTION.impl, HASH.impl))));
+                    NOTYPE.impl, NULL.impl, BOOLEAN.impl, NUMBER.impl, STRING.impl, HOST_OBJECT.impl, NATIVE_POINTER.impl, OBJECT.impl, ARRAY.impl,
+                    DATE.impl, TIME.impl, TIME_ZONE.impl, DURATION.impl, META_OBJECT.impl, ITERABLE.impl, ITERATOR.impl, EXCEPTION.impl, HASH.impl,
+                    EXECUTABLE_ANY.impl, INSTANTIABLE_ANY.impl))));
+
+    /**
+     * Represents all types. It's an intersection of all types.
+     *
+     * @since 24.2
+     */
+    public static final TypeDescriptor ALL = new TypeDescriptor(intersectionImpl(Arrays.asList(
+                    NOTYPE.impl, NULL.impl, BOOLEAN.impl, NUMBER.impl, STRING.impl, HOST_OBJECT.impl, NATIVE_POINTER.impl, OBJECT.impl, ARRAY.impl,
+                    DATE.impl, TIME.impl, TIME_ZONE.impl, DURATION.impl, META_OBJECT.impl, ITERABLE.impl, ITERATOR.impl, EXCEPTION.impl, HASH.impl,
+                    EXECUTABLE.impl, INSTANTIABLE.impl)));
 
     private static final TypeDescriptor[] PREDEFINED_TYPES = new TypeDescriptor[]{
-                    NOTYPE, NULL, BOOLEAN, NUMBER, STRING, HOST_OBJECT, DATE, TIME, TIME_ZONE, DURATION, META_OBJECT, EXCEPTION, NATIVE_POINTER, OBJECT, ARRAY, EXECUTABLE, EXECUTABLE_ANY,
-                    INSTANTIABLE, ITERABLE, ITERATOR, HASH,
-                    INSTANTIABLE_ANY, ANY
+                    NOTYPE, NULL, BOOLEAN, NUMBER, STRING, HOST_OBJECT, NATIVE_POINTER, OBJECT, ARRAY,
+                    DATE, TIME, TIME_ZONE, DURATION, META_OBJECT, ITERABLE, ITERATOR, EXCEPTION, HASH,
+                    EXECUTABLE_ANY, EXECUTABLE, INSTANTIABLE_ANY, INSTANTIABLE, ANY, ALL
     };
 
     private final TypeDescriptorImpl impl;
@@ -641,8 +696,10 @@ public final class TypeDescriptor {
      * <li>NUMBER.subtract(STRING) -> NUMBER</li>
      * <li>UNION[NUMBER|STRING|OBJECT].subtract(NUMBER) -> UNION[STRING|OBJECT]</li>
      * <li>UNION[NUMBER|STRING|OBJECT].subtract(UNION[NUMBER|STRING]) -> OBJECT</li>
-     * <li>INTERSECTION[NUMBER&STRING&OBJECT].subtract(NUMBER) -> INTERSECTION[STRING&OBJECT]</li>
-     * <li>INTERSECTION[NUMBER&STRING&OBJECT].subtract(INTERSECTION[NUMBER&STRING]) -> OBJECT</li>
+     * <li>INTERSECTION[NUMBER&amp;STRING&amp;OBJECT].subtract(NUMBER) ->
+     * INTERSECTION[STRING&amp;OBJECT]</li>
+     * <li>INTERSECTION[NUMBER&amp;STRING&amp;OBJECT].subtract(INTERSECTION[NUMBER&amp;STRING]) ->
+     * OBJECT</li>
      * <li>ARRAY[UNION[NUMBER|STRING]].subtract(ARRAY[NUMBER]) -> ARRAY[STRING]</li>
      * <li>ARRAY[INTERSECTION[NUMBER|STRING]].subtract(ARRAY[NUMBER]) -> ARRAY[STRING]</li>
      * </ul>
@@ -941,9 +998,7 @@ public final class TypeDescriptor {
         }
         switch (contentTypes.size()) {
             case 0:
-                return intersection(NOTYPE, NULL, BOOLEAN, NUMBER, STRING, HOST_OBJECT, NATIVE_POINTER, OBJECT,
-                                ARRAY, EXECUTABLE, INSTANTIABLE, ITERABLE, ITERATOR, DATE, TIME, TIME_ZONE, DURATION,
-                                META_OBJECT, EXCEPTION, HASH);
+                return ALL;
             case 1:
                 return contentTypes.iterator().next();
             default:
@@ -1324,7 +1379,7 @@ public final class TypeDescriptor {
                 if (typeParameter == null) {
                     sb.append("<any>");
                 } else {
-                    sb.append(typeParameter.toString());
+                    sb.append(typeParameter);
                 }
             }
             sb.append(">");
@@ -1562,6 +1617,9 @@ public final class TypeDescriptor {
 
         @Override
         public String toString() {
+            if (this == ALL.impl) {
+                return "<all>";
+            }
             return types.isEmpty() ? "<none>" : types.stream().map(Object::toString).collect(Collectors.joining(" & ", "[", "]"));
         }
     }
@@ -1663,6 +1721,9 @@ public final class TypeDescriptor {
 
         @Override
         public String toString() {
+            if (this == ANY.impl) {
+                return "<any>";
+            }
             return types.stream().map(Object::toString).collect(Collectors.joining(" | ", "[", "]"));
         }
     }

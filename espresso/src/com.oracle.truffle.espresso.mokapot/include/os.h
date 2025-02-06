@@ -44,6 +44,10 @@ typedef uint16_t jushort;
 typedef uint32_t juint;
 typedef uint64_t julong;
 
+#ifndef _GNU_SOURCE
+typedef unsigned int uint;
+#endif
+
 // Platform-independent error return values from OS functions
 enum OSReturn {
   OS_OK         =  0,        // Operation was successful
@@ -95,6 +99,7 @@ OS_DL_HANDLE os_dl_open(const char * path);
 const char *os_dl_error();
 void *os_dl_sym(OS_DL_HANDLE handle, const char *sym);
 OS_DL_HANDLE os_get_RTLD_DEFAULT();
+OS_DL_HANDLE os_get_ProcessHandle();
 
 // atomics
 void* os_atomic_load_ptr(void* OS_ATOMIC *ptr);

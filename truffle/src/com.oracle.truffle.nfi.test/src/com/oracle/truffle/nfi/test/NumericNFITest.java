@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2017, 2023, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -40,12 +40,18 @@
  */
 package com.oracle.truffle.nfi.test;
 
+import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.core.Is.is;
 
+import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.Collection;
 
+import org.hamcrest.BaseMatcher;
+import org.hamcrest.Description;
+import org.hamcrest.Matcher;
 import org.junit.Assert;
+import org.junit.Assume;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.Parameterized;
@@ -63,9 +69,6 @@ import com.oracle.truffle.nfi.test.interop.BoxedPrimitive;
 import com.oracle.truffle.nfi.test.interop.TestCallback;
 import com.oracle.truffle.tck.TruffleRunner;
 import com.oracle.truffle.tck.TruffleRunner.Inject;
-import org.hamcrest.BaseMatcher;
-import org.hamcrest.Description;
-import org.hamcrest.Matcher;
 
 @RunWith(Parameterized.class)
 @Parameterized.UseParametersRunnerFactory(TruffleRunner.ParametersFactory.class)
@@ -85,16 +88,60 @@ public class NumericNFITest extends NFITest {
         for (NativeSimpleType type : NUMERIC_TYPES) {
             ret.add(new Object[]{type});
         }
+        if (IS_AMD64 && !IS_WINDOWS) {
+            ret.add(new Object[]{NativeSimpleType.FP80});
+        } else if (IS_AARCH64 && !IS_WINDOWS && !IS_DARWIN) {
+            ret.add(new Object[]{NativeSimpleType.FP128});
+        }
         return ret;
     }
 
     @Parameter(0) public NativeSimpleType type;
 
-    final class NumberMatcher extends BaseMatcher<Object> {
+    static final class BigNumberMatcher extends BaseMatcher<Object> {
 
+        private final NativeSimpleType type;
+        private final BigInteger expected;
+
+        BigNumberMatcher(NativeSimpleType type, BigInteger expected) {
+            this.type = type;
+            this.expected = expected;
+        }
+
+        @Override
+        public boolean matches(Object item) {
+            try {
+                BigInteger asBigInteger = UNCACHED_INTEROP.asBigInteger(item);
+                return asBigInteger.equals(expected);
+            } catch (UnsupportedMessageException ex) {
+                return false;
+            }
+        }
+
+        @Override
+        public void describeMismatch(Object item, Description description) {
+            Object displayString = UNCACHED_INTEROP.toDisplayString(item);
+            super.describeMismatch(displayString, description);
+            try {
+                BigInteger value = UNCACHED_INTEROP.asBigInteger(item);
+                description.appendText(" (converts to ").appendValue(value).appendText(")");
+            } catch (UnsupportedMessageException ex) {
+            }
+        }
+
+        @Override
+        public void describeTo(Description description) {
+            description.appendValue(expected).appendText(" (type ").appendText(type.name()).appendText(")");
+        }
+    }
+
+    static final class NumberMatcher extends BaseMatcher<Object> {
+
+        private final NativeSimpleType type;
         private final long expected;
 
-        private NumberMatcher(long expected) {
+        NumberMatcher(NativeSimpleType type, long expected) {
+            this.type = type;
             this.expected = expected;
         }
 
@@ -121,6 +168,13 @@ public class NumericNFITest extends NFITest {
                             return UNCACHED_INTEROP.fitsInFloat(item);
                         case DOUBLE:
                             return UNCACHED_INTEROP.fitsInDouble(item);
+                        case FP80:
+                        case FP128:
+                            /*
+                             * Nothing concrete to check here, since FP80 potentially doesn't fit in
+                             * any numeric interop type.
+                             */
+                            return true;
                     }
                 }
             } catch (UnsupportedMessageException ex) {
@@ -131,7 +185,10 @@ public class NumericNFITest extends NFITest {
         @Override
         public boolean matches(Object item) {
             try {
-                return matchesType(item) && UNCACHED_INTEROP.asLong(item) == expected;
+                BigInteger asBigInteger = UNCACHED_INTEROP.asBigInteger(item);
+                long asLong = UNCACHED_INTEROP.asLong(item);
+                double asDouble = UNCACHED_INTEROP.asDouble(item);
+                return matchesType(item) && asLong == expected && asDouble == expected && asBigInteger.equals(BigInteger.valueOf(expected));
             } catch (UnsupportedMessageException ex) {
                 return false;
             }
@@ -139,9 +196,16 @@ public class NumericNFITest extends NFITest {
 
         @Override
         public void describeMismatch(Object item, Description description) {
-            super.describeMismatch(item, description);
+            Object displayString = UNCACHED_INTEROP.toDisplayString(item);
+            super.describeMismatch(displayString, description);
             if (!matchesType(item)) {
                 description.appendText(" (wrong type)");
+            } else {
+                try {
+                    long value = UNCACHED_INTEROP.asLong(item);
+                    description.appendText(" (converts to ").appendValue(value).appendText(")");
+                } catch (UnsupportedMessageException ex) {
+                }
             }
         }
 
@@ -152,14 +216,20 @@ public class NumericNFITest extends NFITest {
     }
 
     private Matcher<Object> number(long expected) {
-        return new NumberMatcher(expected);
+        return new NumberMatcher(type, expected);
+    }
+
+    private Matcher<Object> bigNumber(BigInteger expected) {
+        return new BigNumberMatcher(type, expected);
     }
 
     static long unboxNumber(Object arg) {
         Assert.assertTrue("isNumber", UNCACHED_INTEROP.isNumber(arg));
         Assert.assertTrue("fitsInLong", UNCACHED_INTEROP.fitsInLong(arg));
         try {
-            return UNCACHED_INTEROP.asLong(arg);
+            long asLong = UNCACHED_INTEROP.asLong(arg);
+            Assert.assertEquals("asDouble", asLong, (long) UNCACHED_INTEROP.asDouble(arg));
+            return asLong;
         } catch (UnsupportedMessageException ex) {
             throw new AssertionError(ex);
         }
@@ -178,7 +248,14 @@ public class NumericNFITest extends NFITest {
     @Test
     public void testIncrement(@Inject(TestIncrementNode.class) CallTarget callTarget) {
         Object ret = callTarget.call(42);
-        Assert.assertThat("return", ret, is(number(43)));
+        assertThat("return", ret, is(number(43)));
+    }
+
+    @Test
+    public void testIncrementBigInteger(@Inject(TestIncrementNode.class) CallTarget callTarget) {
+        Assume.assumeTrue(type == NativeSimpleType.FP80);
+        Object ret = callTarget.call(Long.MAX_VALUE);
+        assertThat("return", ret, is(bigNumber(BigInteger.valueOf(Long.MAX_VALUE).add(BigInteger.ONE))));
     }
 
     private long fixSign(long nr) {
@@ -197,7 +274,19 @@ public class NumericNFITest extends NFITest {
     @Test
     public void testIncrementNeg(@Inject(TestIncrementNode.class) CallTarget callTarget) {
         Object ret = callTarget.call(fixSign(-5));
-        Assert.assertThat("return", ret, is(number(fixSign(-4))));
+        assertThat("return", ret, is(number(fixSign(-4))));
+    }
+
+    @Test
+    public void testIncrementFromZero(@Inject(TestIncrementNode.class) CallTarget callTarget) {
+        Object ret = callTarget.call(0);
+        assertThat("return", ret, is(number(1)));
+    }
+
+    @Test
+    public void testIncrementToZero(@Inject(TestIncrementNode.class) CallTarget callTarget) {
+        Object ret = callTarget.call(fixSign(-1));
+        assertThat("return", ret, is(number(0)));
     }
 
     /**
@@ -208,7 +297,7 @@ public class NumericNFITest extends NFITest {
     @Test
     public void testBoxed(@Inject(TestIncrementNode.class) CallTarget callTarget) {
         Object ret = callTarget.call(new BoxedPrimitive(42));
-        Assert.assertThat("return", ret, is(number(43)));
+        assertThat("return", ret, is(number(43)));
     }
 
     /**
@@ -223,25 +312,25 @@ public class NumericNFITest extends NFITest {
     }
 
     private final Object callback = new TestCallback(1, (args) -> {
-        Assert.assertThat("argument", args[0], is(number(42 + 1)));
+        assertThat("argument", args[0], is(number(42 + 1)));
         return unboxNumber(args[0]) + 5;
     });
 
     @Test
     public void testCallback(@Inject(TestCallbackNode.class) CallTarget callTarget) {
         Object ret = callTarget.call(callback, 42);
-        Assert.assertThat("return", ret, is(number((42 + 6) * 2)));
+        assertThat("return", ret, is(number((42 + 6) * 2)));
     }
 
     private final Object negCallback = new TestCallback(1, (args) -> {
-        Assert.assertThat("argument", args[0], is(number(fixSign(-42 + 1))));
+        assertThat("argument", args[0], is(number(fixSign(-42 + 1))));
         return unboxNumber(args[0]) + 5;
     });
 
     @Test
     public void testCallbackNeg(@Inject(TestCallbackNode.class) CallTarget callTarget) {
         Object ret = callTarget.call(negCallback, fixSign(-42));
-        Assert.assertThat("return", ret, is(number(fixSign((-42 + 6) * 2))));
+        assertThat("return", ret, is(number(fixSign((-42 + 6) * 2))));
     }
 
     /**
@@ -270,7 +359,7 @@ public class NumericNFITest extends NFITest {
     @Test
     public void testCallbackRet(@Inject(TestCallbackRetNode.class) CallTarget callTarget) {
         Object ret = callTarget.call();
-        Assert.assertThat("return", ret, is(number(43)));
+        assertThat("return", ret, is(number(43)));
     }
 
     private String getPingPongSignature() {
@@ -292,7 +381,7 @@ public class NumericNFITest extends NFITest {
     private final Object wrap = new TestCallback(1, (args) -> {
         Object fn = args[0];
         Object wrapped = new TestCallback(1, (innerArgs) -> {
-            Assert.assertThat("argument", innerArgs[0], is(number(6)));
+            assertThat("argument", innerArgs[0], is(number(6)));
             try {
                 return UNCACHED_INTEROP.execute(fn, unboxNumber(innerArgs[0]) * 3);
             } catch (InteropException ex) {
@@ -305,6 +394,6 @@ public class NumericNFITest extends NFITest {
     @Test
     public void testPingPong(@Inject(TestPingPongNode.class) CallTarget callTarget) {
         Object ret = callTarget.call(wrap, 5);
-        Assert.assertThat("return", ret, is(number(38)));
+        assertThat("return", ret, is(number(38)));
     }
 }

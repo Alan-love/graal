@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2016, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2016, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -151,13 +151,13 @@ public abstract class AbstractInstrumentationTest extends AbstractPolyglotTest {
 
     @SuppressWarnings("static-method")
     protected final boolean isInitialized(Instrument instrument) {
-        Object instrumentImpl = ReflectionUtils.getField(instrument, "impl");
+        Object instrumentImpl = ReflectionUtils.getField(instrument, "receiver");
         return (Boolean) ReflectionUtils.getField(instrumentImpl, "initialized");
     }
 
     @SuppressWarnings("static-method")
     protected final boolean isCreated(Instrument instrument) {
-        Object instrumentImpl = ReflectionUtils.getField(instrument, "impl");
+        Object instrumentImpl = ReflectionUtils.getField(instrument, "receiver");
         return (Boolean) ReflectionUtils.getField(instrumentImpl, "created");
     }
 
@@ -172,22 +172,22 @@ public abstract class AbstractInstrumentationTest extends AbstractPolyglotTest {
     }
 
     static final com.oracle.truffle.api.source.Source sourceToImpl(Source source) {
-        return (com.oracle.truffle.api.source.Source) ReflectionUtils.getField(source, "impl");
+        return (com.oracle.truffle.api.source.Source) ReflectionUtils.getField(source, "receiver");
     }
 
     @SuppressWarnings("static-method")
     protected final com.oracle.truffle.api.source.SourceSection getSectionImpl(SourceSection sourceSection) {
-        return (com.oracle.truffle.api.source.SourceSection) ReflectionUtils.getField(sourceSection, "impl");
+        return (com.oracle.truffle.api.source.SourceSection) ReflectionUtils.getField(sourceSection, "receiver");
     }
 
     protected final SourceSection createSection(Source source, int charIndex, int length) {
         com.oracle.truffle.api.source.Source sourceImpl = getSourceImpl(source);
         com.oracle.truffle.api.source.SourceSection sectionImpl = sourceImpl.createSection(charIndex, length);
-        return TestAccessor.ACCESSOR.engineAccess().createSourceSection(getPolyglotEngine(), source, sectionImpl);
+        return (SourceSection) TestAccessor.ACCESSOR.engineAccess().createPolyglotSourceSection(getPolyglotEngine(), source, sectionImpl);
     }
 
     private Object getPolyglotEngine() {
-        return ReflectionUtils.getField(engine, "impl");
+        return ReflectionUtils.getField(engine, "receiver");
     }
 
     @After

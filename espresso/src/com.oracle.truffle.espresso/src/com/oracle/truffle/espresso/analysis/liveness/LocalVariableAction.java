@@ -23,8 +23,13 @@
 
 package com.oracle.truffle.espresso.analysis.liveness;
 
+import com.oracle.truffle.api.frame.VirtualFrame;
+import com.oracle.truffle.espresso.analysis.frame.EspressoFrameDescriptor.Builder;
+
 public abstract class LocalVariableAction {
-    public abstract void execute(long[] primitives, Object[] refs);
+    public abstract void execute(VirtualFrame frame);
+
+    public abstract void execute(Builder frame);
 
     public abstract LocalVariableAction merge(LocalVariableAction other);
 }

@@ -24,55 +24,81 @@
  */
 package com.oracle.svm.graal;
 
+import static com.oracle.svm.core.option.RuntimeOptionKey.RuntimeOptionKeyFlag.RelevantForCompilationIsolates;
 import static com.oracle.svm.core.util.VMError.shouldNotReachHere;
 
 import java.io.PrintStream;
 import java.util.EnumMap;
 import java.util.Map;
 
-import org.graalvm.compiler.code.CompilationResult;
-import org.graalvm.compiler.core.CompilationWrapper;
-import org.graalvm.compiler.core.CompilationWrapper.ExceptionAction;
-import org.graalvm.compiler.core.GraalCompiler;
-import org.graalvm.compiler.core.target.Backend;
-import org.graalvm.compiler.debug.DebugContext;
-import org.graalvm.compiler.debug.Indent;
-import org.graalvm.compiler.lir.asm.CompilationResultBuilderFactory;
-import org.graalvm.compiler.lir.phases.LIRSuites;
-import org.graalvm.compiler.nodes.StructuredGraph;
-import org.graalvm.compiler.options.Option;
-import org.graalvm.compiler.options.OptionValues;
-import org.graalvm.compiler.phases.OptimisticOptimizations;
-import org.graalvm.compiler.phases.tiers.Suites;
+import org.graalvm.collections.EconomicMap;
 import org.graalvm.nativeimage.ImageSingletons;
 
+import com.oracle.graal.pointsto.heap.ImageHeapConstant;
+import com.oracle.graal.pointsto.heap.ImageHeapScanner;
+import com.oracle.graal.pointsto.util.GraalAccess;
+import com.oracle.svm.common.option.CommonOptionParser;
 import com.oracle.svm.core.CPUFeatureAccess;
 import com.oracle.svm.core.SubstrateUtil;
 import com.oracle.svm.core.graal.code.SubstrateCompilationIdentifier;
 import com.oracle.svm.core.graal.code.SubstrateCompilationResult;
 import com.oracle.svm.core.graal.meta.RuntimeConfiguration;
 import com.oracle.svm.core.meta.SharedMethod;
+import com.oracle.svm.core.meta.SubstrateObjectConstant;
 import com.oracle.svm.core.option.RuntimeOptionKey;
+import com.oracle.svm.core.option.RuntimeOptionParser;
+import com.oracle.svm.core.util.VMError;
 import com.oracle.svm.graal.meta.SubstrateMethod;
 
+import jdk.graal.compiler.code.CompilationResult;
+import jdk.graal.compiler.core.CompilationWatchDog;
+import jdk.graal.compiler.core.CompilationWrapper;
+import jdk.graal.compiler.core.CompilationWrapper.ExceptionAction;
+import jdk.graal.compiler.core.GraalCompiler;
+import jdk.graal.compiler.core.common.CompilationIdentifier;
+import jdk.graal.compiler.core.target.Backend;
+import jdk.graal.compiler.debug.DebugContext;
+import jdk.graal.compiler.debug.Indent;
+import jdk.graal.compiler.debug.TTY;
+import jdk.graal.compiler.lir.asm.CompilationResultBuilderFactory;
+import jdk.graal.compiler.lir.phases.LIRSuites;
+import jdk.graal.compiler.nodes.StructuredGraph;
+import jdk.graal.compiler.nodes.spi.IdentityHashCodeProvider;
+import jdk.graal.compiler.options.Option;
+import jdk.graal.compiler.options.OptionKey;
+import jdk.graal.compiler.options.OptionValues;
+import jdk.graal.compiler.phases.OptimisticOptimizations;
+import jdk.graal.compiler.phases.tiers.Suites;
+import jdk.graal.compiler.phases.util.Providers;
 import jdk.vm.ci.code.Architecture;
+import jdk.vm.ci.meta.ConstantReflectionProvider;
+import jdk.vm.ci.meta.JavaConstant;
 
 public class SubstrateGraalUtils {
 
     /** Does the compilation of the method and returns the compilation result. */
     public static CompilationResult compile(DebugContext debug, final SubstrateMethod method) {
-        return doCompile(debug, GraalSupport.getRuntimeConfig(), GraalSupport.getSuites(), GraalSupport.getLIRSuites(), method);
+        return doCompile(debug, TruffleRuntimeCompilationSupport.getRuntimeConfig(), TruffleRuntimeCompilationSupport.getLIRSuites(), method);
     }
 
     private static final Map<ExceptionAction, Integer> compilationProblemsPerAction = new EnumMap<>(ExceptionAction.class);
 
-    public static CompilationResult doCompile(DebugContext initialDebug, RuntimeConfiguration runtimeConfig, Suites suites, LIRSuites lirSuites, final SubstrateMethod method) {
+    private static final CompilationWatchDog.EventHandler COMPILATION_WATCH_DOG_EVENT_HANDLER = new CompilationWatchDog.EventHandler() {
+        @Override
+        public void onStuckCompilation(CompilationWatchDog watchDog, Thread watched, CompilationIdentifier compilation, StackTraceElement[] stackTrace, long stuckTime) {
+            CompilationWatchDog.EventHandler.super.onStuckCompilation(watchDog, watched, compilation, stackTrace, stuckTime);
+            TTY.println("Compilation %s on %s appears stuck - exiting VM", compilation, watched);
+            System.exit(STUCK_COMPILATION_EXIT_CODE);
+        }
+    };
+
+    public static CompilationResult doCompile(DebugContext initialDebug, RuntimeConfiguration runtimeConfig, LIRSuites lirSuites, final SubstrateMethod method) {
         updateGraalArchitectureWithHostCPUFeatures(runtimeConfig.lookupBackend(method));
 
         String methodString = method.format("%H.%n(%p)");
-        SubstrateCompilationIdentifier compilationId = new SubstrateCompilationIdentifier();
+        SubstrateCompilationIdentifier compilationId = new SubstrateCompilationIdentifier(method);
 
-        return new CompilationWrapper<CompilationResult>(GraalSupport.get().getDebugOutputDirectory(), compilationProblemsPerAction) {
+        return new CompilationWrapper<CompilationResult>(TruffleRuntimeCompilationSupport.get().getDebugOutputDirectory(), compilationProblemsPerAction) {
             @SuppressWarnings({"unchecked", "unused"})
             <E extends Throwable> RuntimeException silenceThrowable(Class<E> type, Throwable ex) throws E {
                 throw (E) ex;
@@ -84,9 +110,21 @@ public class SubstrateGraalUtils {
             }
 
             @Override
+            protected void parseRetryOptions(String[] options, EconomicMap<OptionKey<?>, Object> values) {
+                // Use name=value boolean format for compatibility with Graal options
+                CommonOptionParser.BooleanOptionFormat booleanFormat = CommonOptionParser.BooleanOptionFormat.NAME_VALUE;
+                for (String option : options) {
+                    RuntimeOptionParser.singleton().parseOptionAtRuntime(option, "", booleanFormat, values, false);
+                }
+            }
+
+            @SuppressWarnings("try")
+            @Override
             protected CompilationResult performCompilation(DebugContext debug) {
-                StructuredGraph graph = GraalSupport.decodeGraph(debug, null, compilationId, method);
-                return compileGraph(runtimeConfig, suites, lirSuites, method, graph);
+                try (CompilationWatchDog watchdog = CompilationWatchDog.watch(compilationId, debug.getOptions(), false, COMPILATION_WATCH_DOG_EVENT_HANDLER)) {
+                    StructuredGraph graph = TruffleRuntimeCompilationSupport.decodeGraph(debug, null, compilationId, method, null);
+                    return compileGraph(runtimeConfig, TruffleRuntimeCompilationSupport.getMatchingSuitesForGraph(graph), lirSuites, method, graph);
+                }
             }
 
             @Override
@@ -97,7 +135,7 @@ public class SubstrateGraalUtils {
             @SuppressWarnings("hiding")
             @Override
             protected DebugContext createRetryDebugContext(DebugContext initialDebug, OptionValues options, PrintStream logStream) {
-                return GraalSupport.get().openDebugContext(options, compilationId, method, logStream);
+                return TruffleRuntimeCompilationSupport.get().openDebugContext(options, compilationId, method, logStream);
             }
 
             @Override
@@ -127,7 +165,6 @@ public class SubstrateGraalUtils {
             architectureInitialized = true;
             CPUFeatureAccess cpuFeatureAccess = ImageSingletons.lookup(CPUFeatureAccess.class);
             if (cpuFeatureAccess != null) {
-                cpuFeatureAccess.verifyHostSupportsArchitecture(graalBackend.getCodeCache().getTarget().arch);
                 Architecture architecture = graalBackend.getCodeCache().getTarget().arch;
                 cpuFeatureAccess.enableFeatures(architecture);
             }
@@ -135,18 +172,18 @@ public class SubstrateGraalUtils {
     }
 
     public static CompilationResult compileGraph(final SharedMethod method, final StructuredGraph graph) {
-        return compileGraph(GraalSupport.getRuntimeConfig(), GraalSupport.getSuites(), GraalSupport.getLIRSuites(), method, graph);
+        return compileGraph(TruffleRuntimeCompilationSupport.getRuntimeConfig(), TruffleRuntimeCompilationSupport.getMatchingSuitesForGraph(graph), TruffleRuntimeCompilationSupport.getLIRSuites(),
+                        method, graph);
     }
 
     public static class Options {
         @Option(help = "Force-dump graphs before compilation")//
-        public static final RuntimeOptionKey<Boolean> ForceDumpGraphsBeforeCompilation = new RuntimeOptionKey<>(false);
+        public static final RuntimeOptionKey<Boolean> ForceDumpGraphsBeforeCompilation = new RuntimeOptionKey<>(false, RelevantForCompilationIsolates);
     }
 
     @SuppressWarnings("try")
     private static CompilationResult compileGraph(RuntimeConfiguration runtimeConfig, Suites suites, LIRSuites lirSuites, final SharedMethod method, final StructuredGraph graph) {
         assert runtimeConfig != null : "no runtime";
-
         if (Options.ForceDumpGraphsBeforeCompilation.getValue()) {
             /*
              * forceDump is often used during debugging, and we want to make sure that it keeps
@@ -167,10 +204,57 @@ public class SubstrateGraalUtils {
 
             try (Indent indent2 = debug.logAndIndent("do compilation")) {
                 SubstrateCompilationResult result = new SubstrateCompilationResult(graph.compilationId(), method.format("%H.%n(%p)"));
-                GraalCompiler.compileGraph(graph, method, backend.getProviders(), backend, null, optimisticOpts, null, suites, lirSuites, result,
-                                CompilationResultBuilderFactory.Default, false);
+                Providers providers = backend.getProviders();
+                GraalCompiler.compile(new GraalCompiler.Request<>(graph,
+                                method,
+                                providers,
+                                backend,
+                                null,
+                                optimisticOpts,
+                                null,
+                                suites,
+                                lirSuites,
+                                result,
+                                CompilationResultBuilderFactory.Default,
+                                false));
                 return result;
             }
         }
     }
+
+    /** Prepares a hosted {@link JavaConstant} for runtime compilation. */
+    public static JavaConstant hostedToRuntime(JavaConstant constant, ConstantReflectionProvider constantReflection) {
+        if (constant instanceof ImageHeapConstant heapConstant) {
+            return hostedToRuntime(heapConstant, constantReflection);
+        }
+        return constant;
+    }
+
+    /**
+     * Prepares a hosted {@link ImageHeapConstant} for runtime compilation: it unwraps the host
+     * {@link JavaConstant} and wraps the hosted object into a {@link SubstrateObjectConstant}. We
+     * reuse the identity hash code of the heap constant.
+     */
+    public static JavaConstant hostedToRuntime(ImageHeapConstant heapConstant, ConstantReflectionProvider constantReflection) {
+        JavaConstant hostedConstant = heapConstant.getHostedObject();
+        VMError.guarantee(hostedConstant.getJavaKind().isObject() && !hostedConstant.isDefaultForKind() && !(hostedConstant instanceof ImageHeapConstant),
+                        "Expected to find host object JavaConstant, found %s", hostedConstant);
+        Object hostedObject = GraalAccess.getOriginalSnippetReflection().asObject(Object.class, hostedConstant);
+        return SubstrateObjectConstant.forObject(hostedObject, ((IdentityHashCodeProvider) constantReflection).identityHashCode(heapConstant));
+    }
+
+    /**
+     * Transforms a {@link SubstrateObjectConstant} from an encoded graph into an
+     * {@link ImageHeapConstant} for hosted processing: it unwraps the hosted object from the
+     * {@link SubstrateObjectConstant}, wraps it into a host {@link JavaConstant}, then redirects
+     * the lookup through the {@link ImageHeapScanner}.
+     */
+    public static JavaConstant runtimeToHosted(JavaConstant constant, ImageHeapScanner scanner) {
+        if (constant instanceof SubstrateObjectConstant) {
+            JavaConstant hostedConstant = GraalAccess.getOriginalSnippetReflection().forObject(SubstrateObjectConstant.asObject(constant));
+            return scanner.getImageHeapConstant(hostedConstant);
+        }
+        return constant;
+    }
+
 }

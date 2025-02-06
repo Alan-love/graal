@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, 2021, Oracle and/or its affiliates.
+ * Copyright (c) 2019, 2023, Oracle and/or its affiliates.
  *
  * All rights reserved.
  *
@@ -30,8 +30,10 @@
 package com.oracle.truffle.llvm.runtime;
 
 import com.oracle.truffle.api.Assumption;
-import com.oracle.truffle.api.Truffle;
 import com.oracle.truffle.api.CompilerDirectives.CompilationFinal;
+import com.oracle.truffle.api.Truffle;
+import com.oracle.truffle.api.dsl.Idempotent;
+import com.oracle.truffle.llvm.runtime.IDGenerater.BitcodeID;
 import com.oracle.truffle.llvm.runtime.LLVMFunctionCode.Function;
 import com.oracle.truffle.llvm.runtime.debug.scope.LLVMSourceLocation;
 import com.oracle.truffle.llvm.runtime.global.LLVMGlobal;
@@ -55,11 +57,17 @@ public final class LLVMFunction extends LLVMSymbol {
     private final Assumption fixedCodeAssumption = Truffle.getRuntime().createAssumption();
     @CompilationFinal private LLVMFunctionCode fixedCode;
 
-    public static LLVMFunction create(String name, Function function, FunctionType type, int bitcodeID, int symbolIndex, boolean exported, String path, boolean externalWeak) {
+    /**
+     * Used in {@link com.oracle.truffle.llvm.runtime.nodes.func.LLVMDispatchNode} to bind it with
+     * the eagerly initialized fixed signature.
+     */
+    @CompilationFinal private Object nfiSymbol;
+
+    public static LLVMFunction create(String name, Function function, FunctionType type, BitcodeID bitcodeID, int symbolIndex, boolean exported, String path, boolean externalWeak) {
         return new LLVMFunction(name, function, type, bitcodeID, symbolIndex, exported, path, externalWeak);
     }
 
-    public LLVMFunction(String name, Function function, FunctionType type, int bitcodeID, int symbolIndex, boolean exported, String path, boolean externalWeak) {
+    public LLVMFunction(String name, Function function, FunctionType type, BitcodeID bitcodeID, int symbolIndex, boolean exported, String path, boolean externalWeak) {
         super(name, bitcodeID, symbolIndex, exported, externalWeak);
         this.type = type;
         this.function = function;
@@ -115,6 +123,7 @@ public final class LLVMFunction extends LLVMSymbol {
         return fixedCodeAssumption;
     }
 
+    @Idempotent
     public LLVMFunctionCode getFixedCode() {
         return fixedCode;
     }
@@ -137,5 +146,33 @@ public final class LLVMFunction extends LLVMSymbol {
             fixedCode = null;
             fixedCodeAssumption.invalidate();
         }
+    }
+
+    @Override
+    public boolean isElemPtrExpression() {
+        return false;
+    }
+
+    @Override
+    public LLVMElemPtrSymbol asElemPtrExpression() {
+        throw new IllegalStateException("Function " + getName() + " is not a getElementPointer symbol.");
+    }
+
+    public void setNFISymbol(Object symbol) {
+        this.nfiSymbol = symbol;
+    }
+
+    public Object getNFISymbol() {
+        return this.nfiSymbol;
+    }
+
+    @Override
+    public boolean isThreadLocalSymbol() {
+        return false;
+    }
+
+    @Override
+    public LLVMThreadLocalSymbol asThreadLocalSymbol() {
+        throw new IllegalStateException("GetElementPointerConstant " + getName() + " has to be resolved and might not be a thread local global variable.");
     }
 }

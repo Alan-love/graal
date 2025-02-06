@@ -24,12 +24,11 @@
  */
 package com.oracle.svm.core.meta;
 
-import org.graalvm.nativeimage.c.function.CFunction;
-import org.graalvm.nativeimage.c.function.InvokeCFunctionPointer;
-import org.graalvm.util.DirectAnnotationAccess;
-
-import com.oracle.svm.core.annotate.Uninterruptible;
+import com.oracle.svm.core.Uninterruptible;
+import com.oracle.svm.core.code.ImageCodeInfo;
 import com.oracle.svm.core.deopt.Deoptimizer;
+import com.oracle.svm.core.graal.code.SubstrateCallingConventionKind;
+import com.oracle.svm.core.graal.code.SubstrateCallingConventionType;
 
 import jdk.vm.ci.meta.ResolvedJavaMethod;
 
@@ -38,11 +37,23 @@ import jdk.vm.ci.meta.ResolvedJavaMethod;
  */
 public interface SharedMethod extends ResolvedJavaMethod {
 
+    boolean isUninterruptible();
+
+    boolean needSafepointCheck();
+
     /**
      * Returns true if this method is a native entry point, i.e., called from C code. The method
      * must not be called from Java code then.
      */
     boolean isEntryPoint();
+
+    boolean isSnippet();
+
+    boolean isForeignCallTarget();
+
+    SubstrateCallingConventionKind getCallingConventionKind();
+
+    SubstrateCallingConventionType getCustomCallingConventionType();
 
     boolean hasCalleeSavedRegisters();
 
@@ -60,40 +71,16 @@ public interface SharedMethod extends ResolvedJavaMethod {
      */
     Deoptimizer.StubType getDeoptStubType();
 
-    int getCodeOffsetInImage();
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    ImageCodeInfo getImageCodeInfo();
 
-    int getDeoptOffsetInImage();
+    boolean hasImageCodeOffset();
 
-    /**
-     * Returns whether the method is {@link Uninterruptible}, either by explicit annotation of the
-     * method or implicitly due to other annotations or flags.
-     */
-    default boolean isUninterruptible() {
-        if (DirectAnnotationAccess.isAnnotationPresent(this, Uninterruptible.class)) {
-            /* Explicit annotated method, so definitely uninterruptible. */
-            return true;
-        }
+    int getImageCodeOffset();
 
-        CFunction cFunctionAnnotation = DirectAnnotationAccess.getAnnotation(this, CFunction.class);
-        InvokeCFunctionPointer cFunctionPointerAnnotation = DirectAnnotationAccess.getAnnotation(this, InvokeCFunctionPointer.class);
-        if ((cFunctionAnnotation != null && cFunctionAnnotation.transition() == CFunction.Transition.NO_TRANSITION) ||
-                        (cFunctionPointerAnnotation != null && cFunctionPointerAnnotation.transition() == CFunction.Transition.NO_TRANSITION)) {
-            /*
-             * If a method transfers from Java to C without a transition, then it is implicitly
-             * treated as uninterruptible. This avoids annotating many methods with multiple
-             * annotations.
-             */
-            return true;
-        }
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    int getImageCodeDeoptOffset();
 
-        if (isEntryPoint()) {
-            /*
-             * The synthetic graphs for C-to-Java transition set up the the fixed registers used for
-             * safepoint an stack overflow checks, so they must be uninterruptible themselves.
-             */
-            return true;
-        }
-
-        return false;
-    }
+    /** Always call this method indirectly, even if it is normally called directly. */
+    boolean forceIndirectCall();
 }

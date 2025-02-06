@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017, 2020, Oracle and/or its affiliates.
+ * Copyright (c) 2017, 2023, Oracle and/or its affiliates.
  *
  * All rights reserved.
  *
@@ -32,7 +32,6 @@ package com.oracle.truffle.llvm.runtime.debug.value;
 import java.math.BigInteger;
 import java.util.Objects;
 
-import com.oracle.truffle.api.CompilerDirectives;
 import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
 import com.oracle.truffle.api.interop.InteropLibrary;
 import com.oracle.truffle.api.interop.UnsupportedMessageException;
@@ -457,6 +456,17 @@ public abstract class LLVMDebugObject extends LLVMDebuggerValue {
 
         @ExportMessage
         @TruffleBoundary
+        boolean fitsInBigInteger() {
+            Object v = getValue();
+            if (v instanceof BigInteger) {
+                return true;
+            } else {
+                return UNCACHED_INTEROP.fitsInBigInteger(v);
+            }
+        }
+
+        @ExportMessage
+        @TruffleBoundary
         boolean fitsInFloat() {
             Object v = getValue();
             if (v instanceof BigInteger) {
@@ -518,6 +528,17 @@ public abstract class LLVMDebugObject extends LLVMDebuggerValue {
                 return ((BigInteger) v).longValue();
             } else {
                 return UNCACHED_INTEROP.asLong(v);
+            }
+        }
+
+        @ExportMessage
+        @TruffleBoundary
+        BigInteger asBigInteger() throws UnsupportedMessageException {
+            Object v = getValue();
+            if (v instanceof BigInteger) {
+                return new BigInteger(((BigInteger) v).toByteArray());
+            } else {
+                return UNCACHED_INTEROP.asBigInteger(v);
             }
         }
 
@@ -621,7 +642,6 @@ public abstract class LLVMDebugObject extends LLVMDebuggerValue {
                         return value.readUnknown(offset, size);
                 }
             } catch (IllegalStateException e) {
-                CompilerDirectives.transferToInterpreter();
                 return e.getMessage();
             }
         }

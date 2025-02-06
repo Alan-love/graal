@@ -31,7 +31,6 @@ package com.oracle.truffle.llvm.runtime.nodes.asm.syscall;
 
 import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
 import com.oracle.truffle.api.dsl.Cached;
-import com.oracle.truffle.api.dsl.CachedContext;
 import com.oracle.truffle.api.dsl.NodeChild;
 import com.oracle.truffle.api.dsl.Specialization;
 import com.oracle.truffle.api.nodes.UnexpectedResultException;
@@ -52,28 +51,27 @@ public abstract class LLVMSyscallNode extends LLVMExpressionNode {
     protected static final int NUM_SYSCALLS = 332;
 
     protected LLVMSyscallOperationNode createNode(long syscallNum) {
-        return LLVMLanguage.getLanguage().getCapability(PlatformCapability.class).createSyscallNode(syscallNum);
+        return LLVMLanguage.get(null).getCapability(PlatformCapability.class).createSyscallNode(syscallNum);
     }
 
     @Specialization(guards = "syscallNum == cachedSyscallNum", limit = "NUM_SYSCALLS", rewriteOn = UnexpectedResultException.class)
     protected long cachedSyscall(@SuppressWarnings("unused") long syscallNum, Object arg1, Object arg2, Object arg3, Object arg4, Object arg5, Object arg6,
                     @Cached("syscallNum") @SuppressWarnings("unused") long cachedSyscallNum,
-                    @Cached("createNode(syscallNum)") LLVMSyscallOperationNode node,
-                    @CachedContext(LLVMLanguage.class) LLVMContext context) throws UnexpectedResultException {
-        if (context.syscallTraceStream() != null) {
-            trace(context, "[sulong] syscall: %s (%s, %s, %s, %s, %s, %s)\n", getNodeName(node), arg1, arg2, arg3, arg4, arg5, arg6);
+                    @Cached("createNode(syscallNum)") LLVMSyscallOperationNode node) throws UnexpectedResultException {
+        if (LLVMContext.logSysCallsEnabled()) {
+            trace("[sulong] syscall: %s (%s, %s, %s, %s, %s, %s)\n", getNodeName(node), arg1, arg2, arg3, arg4, arg5, arg6);
         }
 
         try {
             long result = node.executeLong(arg1, arg2, arg3, arg4, arg5, arg6);
-            if (context.syscallTraceStream() != null) {
-                trace(context, "         result: %d\n", result);
+            if (LLVMContext.logSysCallsEnabled()) {
+                trace("         result: %d\n", result);
             }
             return result;
         } catch (UnexpectedResultException ex) {
             Object result = ex.getResult();
-            if (context.syscallTraceStream() != null) {
-                trace(context, "         result: %s\n", result);
+            if (LLVMContext.logSysCallsEnabled()) {
+                trace("         result: %s\n", result);
             }
             throw ex;
         }
@@ -82,14 +80,13 @@ public abstract class LLVMSyscallNode extends LLVMExpressionNode {
     @Specialization(guards = "syscallNum == cachedSyscallNum", limit = "NUM_SYSCALLS", replaces = "cachedSyscall")
     protected Object cachedSyscallGeneric(@SuppressWarnings("unused") long syscallNum, Object arg1, Object arg2, Object arg3, Object arg4, Object arg5, Object arg6,
                     @Cached("syscallNum") @SuppressWarnings("unused") long cachedSyscallNum,
-                    @Cached("createNode(syscallNum)") LLVMSyscallOperationNode node,
-                    @CachedContext(LLVMLanguage.class) LLVMContext context) {
-        if (context.syscallTraceStream() != null) {
-            trace(context, "[sulong] syscall: %s (%s, %s, %s, %s, %s, %s)\n", getNodeName(node), arg1, arg2, arg3, arg4, arg5, arg6);
+                    @Cached("createNode(syscallNum)") LLVMSyscallOperationNode node) {
+        if (LLVMContext.logSysCallsEnabled()) {
+            trace("[sulong] syscall: %s (%s, %s, %s, %s, %s, %s)\n", getNodeName(node), arg1, arg2, arg3, arg4, arg5, arg6);
         }
         Object result = node.executeGeneric(arg1, arg2, arg3, arg4, arg5, arg6);
-        if (context.syscallTraceStream() != null) {
-            trace(context, "         result: %s\n", result);
+        if (LLVMContext.logSysCallsEnabled()) {
+            trace("         result: %s\n", result);
         }
         return result;
     }
@@ -107,7 +104,7 @@ public abstract class LLVMSyscallNode extends LLVMExpressionNode {
     }
 
     @TruffleBoundary
-    private static void trace(LLVMContext context, String format, Object... args) {
-        context.syscallTraceStream().printf(format, args);
+    private static void trace(String format, Object... args) {
+        LLVMContext.logSysCall(String.format(format, args));
     }
 }

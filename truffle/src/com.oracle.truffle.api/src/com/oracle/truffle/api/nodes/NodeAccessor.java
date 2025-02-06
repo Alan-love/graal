@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2012, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -40,6 +40,7 @@
  */
 package com.oracle.truffle.api.nodes;
 
+import java.lang.invoke.MethodHandles.Lookup;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.locks.Lock;
@@ -50,6 +51,7 @@ import com.oracle.truffle.api.RootCallTarget;
 import com.oracle.truffle.api.TruffleLanguage;
 import com.oracle.truffle.api.TruffleStackTraceElement;
 import com.oracle.truffle.api.frame.Frame;
+import com.oracle.truffle.api.frame.FrameDescriptor;
 import com.oracle.truffle.api.impl.Accessor;
 
 final class NodeAccessor extends Accessor {
@@ -59,6 +61,7 @@ final class NodeAccessor extends Accessor {
     static final InteropSupport INTEROP = ACCESSOR.interopSupport();
     static final ExceptionSupport EXCEPTION = ACCESSOR.exceptionSupport();
     static final EngineSupport ENGINE = ACCESSOR.engineSupport();
+    static final HostSupport HOST = ACCESSOR.hostSupport();
     static final LanguageSupport LANGUAGE = ACCESSOR.languageSupport();
     static final RuntimeSupport RUNTIME = ACCESSOR.runtimeSupport();
     static final InstrumentSupport INSTRUMENT = ACCESSOR.instrumentSupport();
@@ -69,13 +72,13 @@ final class NodeAccessor extends Accessor {
     static final class AccessNodes extends NodeSupport {
 
         @Override
-        public boolean isInstrumentable(RootNode rootNode) {
-            return rootNode.isInstrumentable();
+        public Lookup nodeLookup() {
+            return Node.lookup();
         }
 
         @Override
-        public void setCallTarget(RootNode rootNode, RootCallTarget callTarget) {
-            rootNode.setCallTarget(callTarget);
+        public boolean isInstrumentable(RootNode rootNode) {
+            return rootNode.isInstrumentable();
         }
 
         @Override
@@ -84,8 +87,8 @@ final class NodeAccessor extends Accessor {
         }
 
         @Override
-        public RootNode cloneUninitialized(RootNode rootNode) {
-            return rootNode.cloneUninitialized();
+        public RootNode cloneUninitialized(CallTarget sourceCallTarget, RootNode rootNode, RootNode uninitializedRootNode) {
+            return rootNode.cloneUninitializedImpl(sourceCallTarget, uninitializedRootNode);
         }
 
         @Override
@@ -94,23 +97,28 @@ final class NodeAccessor extends Accessor {
         }
 
         @Override
-        public Object getPolyglotLanguage(LanguageInfo languageInfo) {
-            return languageInfo.getPolyglotLanguage();
+        public int computeSize(RootNode rootNode) {
+            return rootNode.computeSize();
         }
 
         @Override
-        public LanguageInfo createLanguage(Object polyglotLanguage, String id, String name, String version, String defaultMimeType, Set<String> mimeTypes, boolean internal, boolean interactive) {
-            return new LanguageInfo(polyglotLanguage, id, name, version, defaultMimeType, mimeTypes, internal, interactive);
+        public Object getLanguageCache(LanguageInfo languageInfo) {
+            return languageInfo.getLanguageCache();
         }
 
         @Override
-        public Object getPolyglotEngine(RootNode rootNode) {
-            return rootNode.getEngine();
+        public LanguageInfo createLanguage(Object cache, String id, String name, String version, String defaultMimeType, Set<String> mimeTypes, boolean internal, boolean interactive) {
+            return new LanguageInfo(cache, id, name, version, defaultMimeType, mimeTypes, internal, interactive);
         }
 
         @Override
-        public void setPolyglotEngine(RootNode rootNode, Object engine) {
-            rootNode.setEngine(engine);
+        public void setSharingLayer(RootNode rootNode, Object layer) {
+            rootNode.setSharingLayer(layer);
+        }
+
+        @Override
+        public Object getSharingLayer(RootNode rootNode) {
+            return rootNode.getSharingLayer();
         }
 
         @Override
@@ -122,6 +130,11 @@ final class NodeAccessor extends Accessor {
         public List<TruffleStackTraceElement> findAsynchronousFrames(CallTarget target, Frame frame) {
             CompilerAsserts.neverPartOfCompilation();
             return ((RootCallTarget) target).getRootNode().findAsynchronousFrames(frame);
+        }
+
+        @Override
+        public void prepareForInstrumentation(RootNode root, Set<Class<?>> tags) {
+            root.prepareForInstrumentation(tags);
         }
 
         @Override
@@ -141,7 +154,7 @@ final class NodeAccessor extends Accessor {
         }
 
         @Override
-        public void applyPolyglotEngine(RootNode from, RootNode to) {
+        public void applySharingLayer(RootNode from, RootNode to) {
             to.applyEngineRef(from);
         }
 
@@ -156,8 +169,13 @@ final class NodeAccessor extends Accessor {
         }
 
         @Override
-        public Object translateStackTraceElement(TruffleStackTraceElement stackTraceLement) {
-            return stackTraceLement.getTarget().getRootNode().translateStackTraceElement(stackTraceLement);
+        public FrameDescriptor getParentFrameDescriptor(RootNode rootNode) {
+            return rootNode.getParentFrameDescriptor();
+        }
+
+        @Override
+        public Object translateStackTraceElement(TruffleStackTraceElement stackTraceElement) {
+            return stackTraceElement.getTarget().getRootNode().translateStackTraceElement(stackTraceElement);
         }
 
         @Override
@@ -169,6 +187,44 @@ final class NodeAccessor extends Accessor {
         public boolean countsTowardsStackTraceLimit(RootNode rootNode) {
             return rootNode.countsTowardsStackTraceLimit();
         }
+
+        @Override
+        public CallTarget getCallTargetWithoutInitialization(RootNode root) {
+            return root.getCallTargetWithoutInitialization();
+        }
+
+        @Override
+        public EncapsulatingNodeReference createEncapsulatingNodeReference(Thread thread) {
+            return new EncapsulatingNodeReference(thread);
+        }
+
+        @Override
+        public boolean isSameFrame(RootNode root, Frame frame1, Frame frame2) {
+            return root.isSameFrame(frame1, frame2);
+        }
+
+        @Override
+        public int findBytecodeIndex(RootNode rootNode, Node callNode, Frame frame) {
+            return rootNode.findBytecodeIndex(callNode, frame);
+        }
+
+        @Override
+        public boolean isCaptureFramesForTrace(RootNode rootNode, boolean compiled) {
+            return rootNode.isCaptureFramesForTrace(compiled);
+        }
+
+        @Override
+        public boolean prepareForCompilation(RootNode rootNode, boolean rootCompilation, int compilationTier, boolean lastTier) {
+            return rootNode.prepareForCompilation(rootCompilation, compilationTier, lastTier);
+        }
+
+        @Override
+        public Node findInstrumentableCallNode(RootNode root, Node callNode, Frame frame, int bytecodeIndex) {
+            Node node = root.findInstrumentableCallNode(callNode, frame, bytecodeIndex);
+            assert node == null || node.getRootNode() != null : "Invariant violated: Returned instrumentable call node is not adopted.";
+            return node;
+        }
+
     }
 
 }

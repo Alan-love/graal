@@ -27,6 +27,7 @@ import com.oracle.truffle.api.dsl.Cached;
 import com.oracle.truffle.api.dsl.GenerateUncached;
 import com.oracle.truffle.api.dsl.Specialization;
 import com.oracle.truffle.api.interop.ArityException;
+import com.oracle.truffle.api.interop.UnknownIdentifierException;
 import com.oracle.truffle.espresso.impl.ArrayKlass;
 import com.oracle.truffle.espresso.impl.Klass;
 import com.oracle.truffle.espresso.impl.Method;
@@ -38,7 +39,7 @@ import com.oracle.truffle.espresso.meta.Meta;
 public abstract class LookupVirtualMethodNode extends AbstractLookupNode {
     static final int LIMIT = 2;
 
-    public abstract Method execute(Klass klass, String methodName, int arity) throws ArityException;
+    public abstract Method[] execute(Klass klass, String methodName, int arity) throws ArityException, UnknownIdentifierException;
 
     public boolean isInvocable(Klass klass, String member) {
         return isInvocable(klass, member, true, false);
@@ -46,7 +47,7 @@ public abstract class LookupVirtualMethodNode extends AbstractLookupNode {
 
     @SuppressWarnings("unused")
     @Specialization
-    Method doPrimitive(PrimitiveKlass klass,
+    Method[] doPrimitive(PrimitiveKlass klass,
                     String methodName,
                     int arity) {
         return null;
@@ -56,19 +57,19 @@ public abstract class LookupVirtualMethodNode extends AbstractLookupNode {
     @Specialization(guards = {
                     "methodName.equals(cachedMethodName)",
                     "arity == cachedArity"}, limit = "LIMIT")
-    Method doArrayCached(ArrayKlass klass,
+    Method[] doArrayCached(ArrayKlass klass,
                     String methodName,
                     int arity,
                     @Cached("methodName") String cachedMethodName,
                     @Cached("arity") int cachedArity,
-                    @Cached("doGeneric(getJLObject(klass.getMeta()), methodName, arity)") Method method) {
-        return method;
+                    @Cached("doGeneric(getJLObject(klass.getMeta()), methodName, arity)") Method[] methods) {
+        return methods;
     }
 
     @Specialization(replaces = "doArrayCached")
-    Method doArrayGeneric(ArrayKlass klass,
+    Method[] doArrayGeneric(ArrayKlass klass,
                     String methodName,
-                    int arity) throws ArityException {
+                    int arity) throws ArityException, UnknownIdentifierException {
         return doGeneric(getJLObject(klass.getMeta()), methodName, arity);
     }
 
@@ -77,18 +78,18 @@ public abstract class LookupVirtualMethodNode extends AbstractLookupNode {
                     "klass.equals(cachedKlass.getKlass())",
                     "methodName.equals(cachedMethodName)",
                     "arity == cachedArity"}, limit = "LIMIT", assumptions = "cachedKlass.getAssumption()")
-    Method doCached(ObjectKlass klass,
+    Method[] doCached(ObjectKlass klass,
                     String methodName,
                     int arity,
                     @Cached("klass.getKlassVersion()") ObjectKlass.KlassVersion cachedKlass,
                     @Cached("methodName") String cachedMethodName,
                     @Cached("arity") int cachedArity,
-                    @Cached("doGeneric(cachedKlass.getKlass(), methodName, arity)") Method method) {
-        return method;
+                    @Cached("doGeneric(cachedKlass.getKlass(), methodName, arity)") Method[] methods) {
+        return methods;
     }
 
     @Specialization(replaces = "doCached")
-    Method doGeneric(ObjectKlass klass, String key, int arity) throws ArityException {
+    Method[] doGeneric(ObjectKlass klass, String key, int arity) throws ArityException, UnknownIdentifierException {
         return doLookup(klass, key, true, false, arity);
     }
 
@@ -101,7 +102,7 @@ public abstract class LookupVirtualMethodNode extends AbstractLookupNode {
     }
 
     @Override
-    Method[] getMethodArray(Klass k) {
+    Method.MethodVersion[] getMethodArray(Klass k) {
         assert k instanceof ObjectKlass;
         return ((ObjectKlass) k).getVTable();
     }

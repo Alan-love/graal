@@ -26,13 +26,6 @@ import java.nio.file.Path;
 import java.util.Collections;
 import java.util.Objects;
 
-import com.oracle.truffle.espresso.ffi.Buffer;
-import com.oracle.truffle.espresso.ffi.NativeAccess;
-import com.oracle.truffle.espresso.ffi.NativeType;
-import com.oracle.truffle.espresso.ffi.TruffleByteBuffer;
-import org.graalvm.home.HomeFinder;
-
-import com.oracle.truffle.api.CompilerAsserts;
 import com.oracle.truffle.api.CompilerDirectives;
 import com.oracle.truffle.api.TruffleLanguage;
 import com.oracle.truffle.api.dsl.Cached;
@@ -47,10 +40,15 @@ import com.oracle.truffle.api.library.ExportLibrary;
 import com.oracle.truffle.api.library.ExportMessage;
 import com.oracle.truffle.api.profiles.BranchProfile;
 import com.oracle.truffle.espresso.EspressoLanguage;
+import com.oracle.truffle.espresso.ffi.Buffer;
+import com.oracle.truffle.espresso.ffi.NativeAccess;
 import com.oracle.truffle.espresso.ffi.NativeSignature;
+import com.oracle.truffle.espresso.ffi.NativeType;
 import com.oracle.truffle.espresso.ffi.Pointer;
+import com.oracle.truffle.espresso.ffi.TruffleByteBuffer;
 import com.oracle.truffle.espresso.impl.EmptyKeysArray;
 import com.oracle.truffle.espresso.meta.EspressoError;
+import com.oracle.truffle.espresso.substitutions.Collect;
 
 /**
  * Isolated native linking namespace based on glibc's dlmopen.
@@ -69,7 +67,7 @@ import com.oracle.truffle.espresso.meta.EspressoError;
  * workaround.
  * </ul>
  */
-final class NFIIsolatedNativeAccess extends NFINativeAccess {
+public final class NFIIsolatedNativeAccess extends NFINativeAccess {
 
     private final @Pointer TruffleObject edenLibrary;
     private final @Pointer TruffleObject malloc;
@@ -82,8 +80,7 @@ final class NFIIsolatedNativeAccess extends NFINativeAccess {
     NFIIsolatedNativeAccess(TruffleLanguage.Env env) {
         super(env);
         // libeden.so must be the first library loaded in the isolated namespace.
-        Path espressoHome = HomeFinder.getInstance().getLanguageHomes().get(EspressoLanguage.ID);
-        Path espressoLibraryPath = espressoHome.resolve("lib");
+        Path espressoLibraryPath = EspressoLanguage.getEspressoLibs(env);
         this.edenLibrary = loadLibrary(Collections.singletonList(espressoLibraryPath), "eden", true);
         this.malloc = lookupAndBindSymbol(edenLibrary, "malloc", NativeSignature.create(NativeType.POINTER, NativeType.LONG));
         this.realloc = lookupAndBindSymbol(edenLibrary, "realloc", NativeSignature.create(NativeType.POINTER, NativeType.POINTER, NativeType.LONG));
@@ -105,14 +102,14 @@ final class NFIIsolatedNativeAccess extends NFINativeAccess {
             assert InteropLibrary.getUncached().isPointer(result);
             return result;
         } catch (UnsupportedTypeException | ArityException | UnsupportedMessageException e) {
+            CompilerDirectives.transferToInterpreterAndInvalidate();
             throw EspressoError.shouldNotReachHere(e);
         }
     }
 
     @Override
-    public @Pointer TruffleObject loadLibrary(Path libraryPath) {
-        CompilerAsserts.neverPartOfCompilation();
-        String nfiSource = String.format("load(RTLD_LAZY|ISOLATED_NAMESPACE) '%s'", libraryPath);
+    protected @Pointer TruffleObject loadLibrary0(Path libraryPath) {
+        String nfiSource = String.format("load(RTLD_LAZY|RTLD_LOCAL|ISOLATED_NAMESPACE) '%s'", libraryPath);
         return loadLibraryHelper(nfiSource);
     }
 
@@ -160,7 +157,7 @@ final class NFIIsolatedNativeAccess extends NFINativeAccess {
                 }
                 return result;
             } catch (UnsupportedTypeException | ArityException | UnsupportedMessageException e) {
-                CompilerDirectives.transferToInterpreter();
+                CompilerDirectives.transferToInterpreterAndInvalidate();
                 throw EspressoError.shouldNotReachHere(e);
             }
         }
@@ -179,7 +176,7 @@ final class NFIIsolatedNativeAccess extends NFINativeAccess {
         }
         try {
             @Pointer
-            TruffleObject address = (TruffleObject) uncachedInterop.execute(malloc, size);
+            TruffleObject address = (TruffleObject) UNCACHED_INTEROP.execute(malloc, size);
             if (InteropLibrary.getUncached().isNull(address)) {
                 // malloc returned NULL
                 return null;
@@ -195,7 +192,7 @@ final class NFIIsolatedNativeAccess extends NFINativeAccess {
     public void freeMemory(@Pointer TruffleObject buffer) {
         assert InteropLibrary.getUncached().isPointer(buffer);
         try {
-            uncachedInterop.execute(free, buffer);
+            UNCACHED_INTEROP.execute(free, buffer);
         } catch (UnsupportedTypeException | ArityException | UnsupportedMessageException e) {
             CompilerDirectives.transferToInterpreterAndInvalidate();
             throw EspressoError.shouldNotReachHere(e);
@@ -210,7 +207,7 @@ final class NFIIsolatedNativeAccess extends NFINativeAccess {
         assert InteropLibrary.getUncached().isPointer(buffer);
         try {
             @Pointer
-            TruffleObject address = (TruffleObject) uncachedInterop.execute(realloc, buffer, newSize);
+            TruffleObject address = (TruffleObject) UNCACHED_INTEROP.execute(realloc, buffer, newSize);
             if (InteropLibrary.getUncached().isNull(address)) {
                 // realloc returned NULL
                 return null;
@@ -225,17 +222,21 @@ final class NFIIsolatedNativeAccess extends NFINativeAccess {
     @Override
     public void prepareThread() {
         try {
-            uncachedInterop.execute(ctypeInit);
+            UNCACHED_INTEROP.execute(ctypeInit);
         } catch (UnsupportedTypeException | ArityException | UnsupportedMessageException e) {
-            CompilerDirectives.transferToInterpreter();
+            CompilerDirectives.transferToInterpreterAndInvalidate();
             throw EspressoError.shouldNotReachHere(e);
         }
     }
 
+    @Collect(NativeAccess.class)
     public static final class Provider implements NativeAccess.Provider {
+
+        public static final String ID = "nfi-dlmopen";
+
         @Override
         public String id() {
-            return "nfi-dlmopen";
+            return ID;
         }
 
         @Override

@@ -24,15 +24,22 @@
  */
 package com.oracle.svm.core.image;
 
+import jdk.vm.ci.meta.JavaConstant;
+
 public interface ImageHeapObject {
     long getSize();
 
     Object getObject();
 
+    Class<?> getObjectClass();
+
+    JavaConstant getConstant();
+
     void setHeapPartition(ImageHeapPartition value);
 
     void setOffsetInPartition(long value);
 
+    /** Returns the heap-base relative offset of this object. */
     long getOffset();
 
     ImageHeapPartition getPartition();

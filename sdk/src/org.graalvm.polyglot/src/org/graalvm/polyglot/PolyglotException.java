@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2017, 2025, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -40,11 +40,14 @@
  */
 package org.graalvm.polyglot;
 
+import java.io.IOException;
+import java.io.NotSerializableException;
+import java.io.ObjectOutputStream;
 import java.io.PrintStream;
 import java.io.PrintWriter;
 import java.time.Duration;
 
-import org.graalvm.polyglot.impl.AbstractPolyglotImpl.AbstractExceptionImpl;
+import org.graalvm.polyglot.impl.AbstractPolyglotImpl.AbstractExceptionDispatch;
 import org.graalvm.polyglot.impl.AbstractPolyglotImpl.AbstractStackFrameImpl;
 
 /**
@@ -85,15 +88,51 @@ import org.graalvm.polyglot.impl.AbstractPolyglotImpl.AbstractStackFrameImpl;
 @SuppressWarnings("serial")
 public final class PolyglotException extends RuntimeException {
 
-    final AbstractExceptionImpl impl;
+    final AbstractExceptionDispatch dispatch;
+    final Object impl;
+    /**
+     * Holds a polyglot object that threw a {@code PolyglotException}, ensuring that the garbage
+     * collector does not collect the polyglot object while the {@code PolyglotException} is still
+     * reachable.
+     * <ul>
+     * <li>If the exception is thrown by a {@link Context}, this field holds the creator
+     * {@link Context}.</li>
+     * <li>If the exception is thrown by an {@link Engine}, this field holds the
+     * {@link Engine}.</li>
+     * <li>If the exception is thrown by a polyglot, this field is {@code null}.</li>
+     * </ul>
+     */
+    final Object anchor;
 
-    PolyglotException(String message, AbstractExceptionImpl impl) {
+    PolyglotException(String message, AbstractExceptionDispatch dispatch, Object receiver, Object anchor) {
         super(message);
-        this.impl = impl;
-        impl.onCreate(this);
+        this.dispatch = dispatch;
+        this.impl = receiver;
+        this.anchor = anchor;
+        dispatch.onCreate(receiver, this);
         // we need to materialize the stack if this exception is printed as cause of another error.
         // unfortunately we cannot detect this easily
         super.setStackTrace(getStackTrace());
+    }
+
+    /**
+     * Returns a short description of this exception. The result is the concatenation of:
+     * <ul>
+     * <li>the qualified name of the metaobject of the guest exception, if this object represents
+     * one, and it has a metaobject. Otherwise, the {@linkplain Class#getName() name} of the
+     * {@link PolyglotException} class.
+     * <li>": " (a colon and a space)
+     * <li>the result of invoking this object's {@link #getMessage} method
+     * </ul>
+     * If {@code getMessage} returns {@code null}, then just the class name is returned.
+     *
+     * @return a string representation of this exception.
+     *
+     * @since 25.0
+     */
+    @Override
+    public String toString() {
+        return dispatch.toString(impl);
     }
 
     /**
@@ -103,7 +142,7 @@ public final class PolyglotException extends RuntimeException {
      */
     @Override
     public void printStackTrace() {
-        impl.printStackTrace(System.err);
+        dispatch.printStackTrace(impl, System.err);
     }
 
     /**
@@ -114,7 +153,7 @@ public final class PolyglotException extends RuntimeException {
 
     @Override
     public void printStackTrace(PrintStream s) {
-        impl.printStackTrace(s);
+        dispatch.printStackTrace(impl, s);
     }
 
     /**
@@ -124,7 +163,7 @@ public final class PolyglotException extends RuntimeException {
      */
     @Override
     public void printStackTrace(PrintWriter s) {
-        impl.printStackTrace(s);
+        dispatch.printStackTrace(impl, s);
     }
 
     /**
@@ -148,19 +187,19 @@ public final class PolyglotException extends RuntimeException {
      */
     @Override
     public StackTraceElement[] getStackTrace() {
-        return impl.getStackTrace();
+        return dispatch.getStackTrace(impl);
     }
 
     /**
      * Gets a user readable message for the polyglot exception. In case the exception is
      * {@link #isInternalError() internal} then the original java class name is included in the
-     * message. The message never returns <code>null</code>.
+     * message. The message may return <code>null</code> if no message is available.
      *
      * @since 19.0
      */
     @Override
     public String getMessage() {
-        return impl.getMessage();
+        return dispatch.getMessage(impl);
     }
 
     /**
@@ -170,7 +209,7 @@ public final class PolyglotException extends RuntimeException {
      * @since 19.0
      */
     public SourceSection getSourceLocation() {
-        return impl.getSourceLocation();
+        return (SourceSection) dispatch.getSourceLocation(impl);
     }
 
     /**
@@ -224,8 +263,9 @@ public final class PolyglotException extends RuntimeException {
      * @see StackFrame
      * @since 19.0
      */
+    @SuppressWarnings("unchecked")
     public Iterable<StackFrame> getPolyglotStackTrace() {
-        return impl.getPolyglotStackTrace();
+        return (Iterable<StackFrame>) (Iterable<?>) dispatch.getPolyglotStackTrace(impl);
     }
 
     /**
@@ -236,7 +276,7 @@ public final class PolyglotException extends RuntimeException {
      * @since 19.0
      */
     public boolean isHostException() {
-        return impl.isHostException();
+        return dispatch.isHostException(impl);
     }
 
     /**
@@ -247,7 +287,7 @@ public final class PolyglotException extends RuntimeException {
      * @since 19.0
      */
     public boolean isGuestException() {
-        return !impl.isHostException();
+        return !dispatch.isHostException(impl);
     }
 
     /**
@@ -261,7 +301,7 @@ public final class PolyglotException extends RuntimeException {
      * @since 19.0
      */
     public Throwable asHostException() {
-        return impl.asHostException();
+        return dispatch.asHostException(impl);
     }
 
     /**
@@ -273,7 +313,7 @@ public final class PolyglotException extends RuntimeException {
      * @since 19.0
      */
     public boolean isInternalError() {
-        return impl.isInternalError();
+        return dispatch.isInternalError(impl);
     }
 
     /**
@@ -298,7 +338,7 @@ public final class PolyglotException extends RuntimeException {
      * @since 20.2
      */
     public boolean isResourceExhausted() {
-        return impl.isResourceExhausted();
+        return dispatch.isResourceExhausted(impl);
     }
 
     /**
@@ -310,7 +350,7 @@ public final class PolyglotException extends RuntimeException {
      * @since 19.0
      */
     public boolean isCancelled() {
-        return impl.isCancelled();
+        return dispatch.isCancelled(impl);
     }
 
     /**
@@ -321,18 +361,19 @@ public final class PolyglotException extends RuntimeException {
      * @since 20.3
      */
     public boolean isInterrupted() {
-        return impl.isInterrupted();
+        return dispatch.isInterrupted(impl);
     }
 
     /**
      * Returns <code>true</code> if this exception is caused by an attempt of a guest language
-     * program to exit the application using a builtin command. The provided exit code can be
-     * accessed using {@link #getExitStatus()}.
+     * program to exit the application. The provided exit code can be accessed using
+     * {@link #getExitStatus()}. This can be the result of either the soft or the hard exit.
      *
      * @since 19.0
+     * @see Context
      */
     public boolean isExit() {
-        return impl.isExit();
+        return dispatch.isExit(impl);
     }
 
     /**
@@ -342,7 +383,7 @@ public final class PolyglotException extends RuntimeException {
      * @since 19.0
      */
     public boolean isSyntaxError() {
-        return impl.isSyntaxError();
+        return dispatch.isSyntaxError(impl);
     }
 
     /**
@@ -361,7 +402,7 @@ public final class PolyglotException extends RuntimeException {
      * @since 19.0
      */
     public boolean isIncompleteSource() {
-        return impl.isIncompleteSource();
+        return dispatch.isIncompleteSource(impl);
     }
 
     /**
@@ -371,18 +412,25 @@ public final class PolyglotException extends RuntimeException {
      * @since 19.0
      */
     public Value getGuestObject() {
-        return impl.getGuestObject();
+        return (Value) dispatch.getGuestObject(impl);
     }
 
     /**
      * Returns the exit status if this exception indicates that the application was {@link #isExit()
-     * exited}. The exit status is intended to be passed to {@link System#exit(int)}.
+     * exited}. The exit status is intended to be passed to {@link System#exit(int)}. In case of
+     * hard exit the application can be configured to call {@link System#exit(int)} directly using
+     * {@link Context.Builder#useSystemExit(boolean)}.
      *
-     * @see #isExit()
+     * @see Context
      * @since 19.0
      */
     public int getExitStatus() {
-        return impl.getExitStatus();
+        return dispatch.getExitStatus(impl);
+    }
+
+    @SuppressWarnings({"static-method", "unused"})
+    private void writeObject(ObjectOutputStream outputStream) throws IOException {
+        throw new NotSerializableException(PolyglotException.class.getSimpleName() + " serialization is not supported.");
     }
 
     /**
@@ -437,7 +485,20 @@ public final class PolyglotException extends RuntimeException {
          * @since 19.0
          */
         public SourceSection getSourceLocation() {
-            return impl.getSourceLocation();
+            return (SourceSection) impl.getSourceLocation();
+        }
+
+        /**
+         * Returns the bytecode index of this frame if available, or a negative number if no
+         * bytecode index is available. The bytecode index is an internal identifier of the current
+         * execution location. The bytecode index is typically only provided by languages that are
+         * internally implemented as bytecode interpreter. This information is exposed for debugging
+         * or testing purposes and should not be relied upon for anything else.
+         *
+         * @since 24.1
+         */
+        public int getBytecodeIndex() {
+            return impl.getBytecodeIndex();
         }
 
         /**
@@ -458,7 +519,7 @@ public final class PolyglotException extends RuntimeException {
          * @since 19.0
          */
         public Language getLanguage() {
-            return impl.getLanguage();
+            return (Language) impl.getLanguage();
         }
 
         /**

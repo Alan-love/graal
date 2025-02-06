@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2019, 2022, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -22,10 +22,12 @@
  */
 package com.oracle.truffle.espresso.jdwp.api;
 
+import com.oracle.truffle.api.TruffleLogger;
 import com.oracle.truffle.api.debug.DebugScope;
 import com.oracle.truffle.api.debug.DebugStackFrame;
 import com.oracle.truffle.api.debug.DebugValue;
 import com.oracle.truffle.api.frame.Frame;
+import com.oracle.truffle.api.instrumentation.InstrumentableNode;
 import com.oracle.truffle.api.interop.InteropException;
 import com.oracle.truffle.api.interop.InteropLibrary;
 import com.oracle.truffle.api.interop.NodeLibrary;
@@ -33,10 +35,8 @@ import com.oracle.truffle.api.interop.UnknownIdentifierException;
 import com.oracle.truffle.api.interop.UnsupportedMessageException;
 import com.oracle.truffle.api.nodes.Node;
 import com.oracle.truffle.api.nodes.RootNode;
-import com.oracle.truffle.espresso.jdwp.impl.JDWPLogger;
 
 public final class CallFrame {
-
     private static final InteropLibrary INTEROP = InteropLibrary.getFactory().getUncached();
     public static final Object INVALID_VALUE = new Object();
 
@@ -47,14 +47,16 @@ public final class CallFrame {
     private final long codeIndex;
     private final long threadId;
     private final Frame frame;
+    private final Node currentNode;
     private final RootNode rootNode;
     private final DebugStackFrame debugStackFrame;
     private final DebugScope debugScope;
     private final JDWPContext context;
     private Object scope;
+    private final TruffleLogger logger;
 
-    public CallFrame(long threadId, byte typeTag, long classId, MethodRef method, long methodId, long codeIndex, Frame frame, RootNode rootNode,
-                    DebugStackFrame debugStackFrame, JDWPContext context) {
+    public CallFrame(long threadId, byte typeTag, long classId, MethodRef method, long methodId, long codeIndex, Frame frame, Node currentNode, RootNode rootNode,
+                    DebugStackFrame debugStackFrame, JDWPContext context, TruffleLogger logger) {
         this.threadId = threadId;
         this.typeTag = typeTag;
         this.classId = classId;
@@ -62,14 +64,17 @@ public final class CallFrame {
         this.methodId = methodId;
         this.codeIndex = method != null && method.isObsolete() ? -1 : codeIndex;
         this.frame = frame;
+        this.currentNode = currentNode;
         this.rootNode = rootNode;
         this.debugStackFrame = debugStackFrame;
         this.debugScope = debugStackFrame != null ? debugStackFrame.getScope() : null;
         this.context = context;
+        this.logger = logger;
     }
 
-    public CallFrame(long threadId, byte typeTag, long classId, long methodId, long codeIndex) {
-        this(threadId, typeTag, classId, null, methodId, codeIndex, null, null, null, null);
+    // used for tests in comparisons only
+    public CallFrame(long threadId, byte typeTag, long classId, long methodId, long codeIndex, TruffleLogger logger) {
+        this(threadId, typeTag, classId, null, methodId, codeIndex, null, null, null, null, null, logger);
     }
 
     public byte getTypeTag() {
@@ -109,10 +114,17 @@ public final class CallFrame {
 
     public Object getThisValue() {
         Object theScope = getScope();
+        if (theScope == null) {
+            return null;
+        }
         try {
-            return theScope != null ? INTEROP.readMember(theScope, "this") : null;
+            // See com.oracle.truffle.espresso.EspressoScope.createVariables
+            if (INTEROP.isMemberReadable(theScope, "this")) {
+                return INTEROP.readMember(theScope, "this");
+            }
+            return INTEROP.readMember(theScope, "0");
         } catch (UnsupportedMessageException | UnknownIdentifierException e) {
-            JDWPLogger.log("Unable to read 'this' value from method: %s", JDWPLogger.LogLevel.ALL, getMethod());
+            logger.warning(() -> "Unable to read 'this' value from method: " + getMethod() + " with currentNode: " + currentNode.getClass());
             return INVALID_VALUE;
         }
     }
@@ -130,7 +142,7 @@ public final class CallFrame {
         try {
             INTEROP.writeMember(theScope, identifier, value);
         } catch (Exception e) {
-            JDWPLogger.log("Unable to write member %s from variables", JDWPLogger.LogLevel.ALL, identifier);
+            logger.warning(() -> "Unable to write member " + identifier + " from variables");
         }
     }
 
@@ -142,16 +154,16 @@ public final class CallFrame {
         if (scope != null) {
             return scope;
         }
-        Node instrumentableNode = context.getInstrumentableNode(rootNode);
-
-        if (instrumentableNode == null) {
-            JDWPLogger.log("Unable to get instrumentable node for root %s", JDWPLogger.LogLevel.ALL, rootNode);
-        } else {
+        // look for instrumentable node that should have scope
+        Node node = InstrumentableNode.findInstrumentableParent(currentNode);
+        if (node != null && NodeLibrary.getUncached().hasScope(node, frame)) {
             try {
-                scope = NodeLibrary.getUncached().getScope(instrumentableNode, frame, true);
+                scope = NodeLibrary.getUncached().getScope(node, frame, true);
             } catch (UnsupportedMessageException e) {
-                JDWPLogger.log("Unable to get scope for %s", JDWPLogger.LogLevel.ALL, instrumentableNode.getClass());
+                logger.warning(() -> "Unable to get scope for " + currentNode.getClass());
             }
+        } else {
+            logger.warning(() -> "Unable to get scope for " + currentNode.getClass());
         }
         return scope;
     }

@@ -27,14 +27,15 @@ package com.oracle.graal.pointsto.flow.context.object;
 import java.util.ArrayList;
 import java.util.List;
 
-import com.oracle.graal.pointsto.BigBang;
+import com.oracle.graal.pointsto.PointsToAnalysis;
+import com.oracle.graal.pointsto.heap.ImageHeapRelocatableConstant;
 import com.oracle.graal.pointsto.meta.AnalysisType;
 
 import jdk.vm.ci.meta.JavaConstant;
 
 /**
- * A context sensitive analysis object that represents a constant. The context for this analysis
- * object is the constant it wraps.
+ * A context-sensitive analysis object that represents a constant. The implicit context for this
+ * analysis object is the constant that it wraps.
  */
 public class ConstantContextSensitiveObject extends ContextSensitiveAnalysisObject {
 
@@ -68,17 +69,20 @@ public class ConstantContextSensitiveObject extends ContextSensitiveAnalysisObje
      * Constructor used for the merged constant object, i.e., after the number of individual
      * constant objects for a type has reached the maximum number of recorded constants threshold.
      */
-    public ConstantContextSensitiveObject(BigBang bb, AnalysisType type) {
+    public ConstantContextSensitiveObject(PointsToAnalysis bb, AnalysisType type) {
         this(bb, type, null);
     }
 
-    public ConstantContextSensitiveObject(BigBang bb, AnalysisType type, JavaConstant constant) {
+    public ConstantContextSensitiveObject(PointsToAnalysis bb, AnalysisType type, JavaConstant constant) {
         super(bb.getUniverse(), type, AnalysisObjectKind.ConstantContextSensitive);
-        assert bb.trackConcreteAnalysisObjects(type);
+        assert bb.trackConcreteAnalysisObjects(type) : type;
+        assert !(constant instanceof ImageHeapRelocatableConstant) : "relocatable constants have an unknown state and should not be represented by a constant type state: " + constant;
         this.constant = constant;
+        bb.profileConstantObject(type);
     }
 
-    public JavaConstant getConstant() {
+    @Override
+    public JavaConstant asConstant() {
         return constant;
     }
 
@@ -94,8 +98,8 @@ public class ConstantContextSensitiveObject extends ContextSensitiveAnalysisObje
 
     /** The object has been in contact with an context insensitive object in an union operation. */
     @Override
-    public void noteMerge(BigBang bb) {
-        assert bb.analysisPolicy().isMergingEnabled();
+    public void noteMerge(PointsToAnalysis bb) {
+        assert bb.analysisPolicy().isMergingEnabled() : "policy mismatch";
 
         if (!merged) {
             if (!isEmptyObjectArrayConstant(bb)) {
@@ -122,12 +126,12 @@ public class ConstantContextSensitiveObject extends ContextSensitiveAnalysisObje
     }
 
     @Override
-    public boolean isEmptyObjectArrayConstant(BigBang bb) {
+    public boolean isEmptyObjectArrayConstant(PointsToAnalysis bb) {
         if (this.isMergedConstantObject()) {
             return false;
         }
 
-        return AnalysisObject.isEmptyObjectArrayConstant(bb, getConstant());
+        return AnalysisObject.isEmptyObjectArrayConstant(bb, asConstant());
     }
 
     @Override
@@ -137,7 +141,7 @@ public class ConstantContextSensitiveObject extends ContextSensitiveAnalysisObje
         if (constant == null) {
             result.append("MERGED CONSTANT");
         } else {
-            // result.append(constant);
+            result.append(constant);
         }
         return result.toString();
     }

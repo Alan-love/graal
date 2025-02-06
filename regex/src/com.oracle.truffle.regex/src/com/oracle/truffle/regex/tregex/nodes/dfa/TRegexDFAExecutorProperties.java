@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2022, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -50,7 +50,8 @@ public final class TRegexDFAExecutorProperties {
     private final boolean allowSimpleCG;
     @CompilationFinal private boolean simpleCG;
     @CompilationFinal private boolean simpleCGMustCopy;
-    private final boolean regressionTestMode;
+    @CompilationFinal private boolean canFindStart;
+    private final boolean trackLastGroup;
     private final int minResultLength;
 
     public TRegexDFAExecutorProperties(
@@ -58,13 +59,13 @@ public final class TRegexDFAExecutorProperties {
                     boolean searching,
                     boolean genericCG,
                     boolean allowSimpleCG,
-                    boolean regressionTestMode,
+                    boolean trackLastGroup,
                     int minResultLength) {
         this.forward = forward;
         this.searching = searching;
         this.genericCG = genericCG;
         this.allowSimpleCG = allowSimpleCG;
-        this.regressionTestMode = regressionTestMode;
+        this.trackLastGroup = trackLastGroup;
         this.minResultLength = minResultLength;
     }
 
@@ -115,8 +116,16 @@ public final class TRegexDFAExecutorProperties {
         this.simpleCGMustCopy = simpleCGMustCopy;
     }
 
-    public boolean isRegressionTestMode() {
-        return regressionTestMode;
+    public boolean canFindStart() {
+        return canFindStart;
+    }
+
+    public void setCanFindStart(boolean canFindStart) {
+        this.canFindStart = canFindStart;
+    }
+
+    public boolean tracksLastGroup() {
+        return trackLastGroup;
     }
 
     public int getMinResultLength() {

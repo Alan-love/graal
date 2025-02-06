@@ -24,45 +24,36 @@
  */
 package com.oracle.svm.core.os;
 
-import static org.graalvm.word.WordFactory.nullPointer;
-import static org.graalvm.word.WordFactory.zero;
+import static jdk.graal.compiler.word.Word.nullPointer;
+import static jdk.graal.compiler.word.Word.zero;
 
-import org.graalvm.nativeimage.CurrentIsolate;
-import org.graalvm.nativeimage.ImageSingletons;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
 import org.graalvm.nativeimage.c.type.WordPointer;
-import org.graalvm.nativeimage.hosted.Feature;
-import org.graalvm.word.Pointer;
-import org.graalvm.word.PointerBase;
-import org.graalvm.word.UnsignedWord;
-import org.graalvm.word.WordFactory;
 
+import com.oracle.svm.core.IsolateArguments;
 import com.oracle.svm.core.Isolates;
 import com.oracle.svm.core.SubstrateOptions;
-import com.oracle.svm.core.annotate.AutomaticFeature;
-import com.oracle.svm.core.annotate.Uninterruptible;
-import com.oracle.svm.core.c.function.CEntryPointCreateIsolateParameters;
+import com.oracle.svm.core.Uninterruptible;
 import com.oracle.svm.core.c.function.CEntryPointErrors;
-import com.oracle.svm.core.c.function.CEntryPointSetup;
-import com.oracle.svm.core.util.UnsignedUtils;
+import com.oracle.svm.core.snippets.KnownIntrinsics;
 
-public class OSCommittedMemoryProvider extends AbstractCommittedMemoryProvider {
+public class OSCommittedMemoryProvider extends ChunkBasedCommittedMemoryProvider {
     @Platforms(Platform.HOSTED_ONLY.class)
     public OSCommittedMemoryProvider() {
     }
 
     @Override
     @Uninterruptible(reason = "Still being initialized.")
-    public int initialize(WordPointer isolatePointer, CEntryPointCreateIsolateParameters parameters) {
+    public int initialize(WordPointer heapBasePointer, IsolateArguments arguments) {
         if (!SubstrateOptions.SpawnIsolates.getValue()) {
             int result = protectSingleIsolateImageHeap();
             if (result == CEntryPointErrors.NO_ERROR) {
-                isolatePointer.write(CEntryPointSetup.SINGLE_ISOLATE_SENTINEL);
+                heapBasePointer.write(Isolates.IMAGE_HEAP_BEGIN.get());
             }
             return result;
         }
-        return ImageHeapProvider.get().initialize(nullPointer(), zero(), isolatePointer, nullPointer());
+        return ImageHeapProvider.get().initialize(nullPointer(), zero(), heapBasePointer, nullPointer());
     }
 
     @Override
@@ -71,73 +62,6 @@ public class OSCommittedMemoryProvider extends AbstractCommittedMemoryProvider {
         if (!SubstrateOptions.SpawnIsolates.getValue()) {
             return CEntryPointErrors.NO_ERROR;
         }
-
-        PointerBase heapBase = Isolates.getHeapBase(CurrentIsolate.getIsolate());
-        return ImageHeapProvider.get().freeImageHeap(heapBase);
-    }
-
-    @Override
-    public Pointer allocate(UnsignedWord size, UnsignedWord alignment, boolean executable) {
-        int access = VirtualMemoryProvider.Access.READ | VirtualMemoryProvider.Access.WRITE;
-        if (executable) {
-            access |= VirtualMemoryProvider.Access.EXECUTE;
-        }
-        Pointer reserved = WordFactory.nullPointer();
-        if (!UnsignedUtils.isAMultiple(getGranularity(), alignment)) {
-            reserved = VirtualMemoryProvider.get().reserve(size, alignment);
-            if (reserved.isNull()) {
-                return nullPointer();
-            }
-        }
-        Pointer committed = VirtualMemoryProvider.get().commit(reserved, size, access);
-        if (committed.isNull()) {
-            if (reserved.isNonNull()) {
-                VirtualMemoryProvider.get().free(reserved, size);
-            }
-            return nullPointer();
-        }
-        assert reserved.isNull() || reserved.equal(committed);
-        tracker.track(size);
-        return committed;
-    }
-
-    @Override
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    public boolean free(PointerBase start, UnsignedWord nbytes, UnsignedWord alignment, boolean executable) {
-        if (VirtualMemoryProvider.get().free(start, nbytes) == 0) {
-            tracker.untrack(nbytes);
-            return true;
-        }
-        return false;
-    }
-
-    private final VirtualMemoryTracker tracker = new VirtualMemoryTracker();
-
-    protected static class VirtualMemoryTracker {
-
-        private UnsignedWord totalAllocated;
-
-        protected VirtualMemoryTracker() {
-            this.totalAllocated = WordFactory.zero();
-        }
-
-        public void track(UnsignedWord size) {
-            totalAllocated = totalAllocated.add(size);
-        }
-
-        @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-        public void untrack(UnsignedWord size) {
-            totalAllocated = totalAllocated.subtract(size);
-        }
-    }
-}
-
-@AutomaticFeature
-class OSCommittedMemoryProviderFeature implements Feature {
-    @Override
-    public void beforeAnalysis(BeforeAnalysisAccess access) {
-        if (!ImageSingletons.contains(CommittedMemoryProvider.class)) {
-            ImageSingletons.add(CommittedMemoryProvider.class, new OSCommittedMemoryProvider());
-        }
+        return ImageHeapProvider.get().freeImageHeap(KnownIntrinsics.heapBase());
     }
 }

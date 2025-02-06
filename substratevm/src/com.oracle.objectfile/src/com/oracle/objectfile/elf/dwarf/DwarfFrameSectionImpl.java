@@ -1,6 +1,6 @@
 /*
  * Copyright (c) 2020, 2020, Oracle and/or its affiliates. All rights reserved.
- * Copyright (c) 2020, Red Hat Inc. All rights reserved.
+ * Copyright (c) 2020, 2020, Red Hat Inc. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -26,12 +26,12 @@
 
 package com.oracle.objectfile.elf.dwarf;
 
-import com.oracle.objectfile.LayoutDecision;
-import com.oracle.objectfile.debugentry.ClassEntry;
-import com.oracle.objectfile.debugentry.PrimaryEntry;
-import com.oracle.objectfile.debugentry.Range;
+import com.oracle.objectfile.debugentry.CompiledMethodEntry;
+import com.oracle.objectfile.debugentry.range.Range;
 import com.oracle.objectfile.debuginfo.DebugInfoProvider;
-import org.graalvm.compiler.debug.DebugContext;
+import com.oracle.objectfile.elf.dwarf.constants.DwarfFrameValue;
+import com.oracle.objectfile.elf.dwarf.constants.DwarfSectionName;
+import jdk.graal.compiler.debug.DebugContext;
 
 import java.util.List;
 
@@ -42,13 +42,11 @@ public abstract class DwarfFrameSectionImpl extends DwarfSectionImpl {
 
     private static final int PADDING_NOPS_ALIGNMENT = 8;
 
-    public DwarfFrameSectionImpl(DwarfDebugInfo dwarfSections) {
-        super(dwarfSections);
-    }
+    private static final int CFA_CIE_id_default = -1;
 
-    @Override
-    public String getSectionName() {
-        return DwarfDebugInfo.DW_FRAME_SECTION_NAME;
+    public DwarfFrameSectionImpl(DwarfDebugInfo dwarfSections) {
+        // debug_frame section depends on debug_line section
+        super(dwarfSections, DwarfSectionName.DW_FRAME_SECTION, DwarfSectionName.DW_LINE_SECTION);
     }
 
     @Override
@@ -58,7 +56,8 @@ public abstract class DwarfFrameSectionImpl extends DwarfSectionImpl {
         int pos = 0;
 
         /*
-         * The frame section contains one CIE at offset 0 followed by an FIE for each method.
+         * The frame section contains one CIE at offset 0 followed by an FIE for each compiled
+         * method.
          */
         pos = writeCIE(null, pos);
         pos = writeMethodFrames(null, pos);
@@ -100,7 +99,7 @@ public abstract class DwarfFrameSectionImpl extends DwarfSectionImpl {
          *
          * <li><code>uint32 : length ............... length of remaining fields in this CIE</code>
          *
-         * <li><code>uint32 : CIE_id ................ unique id for CIE == 0xffffff</code>
+         * <li><code>uint32 : CIE_id ................ unique id for CIE == 0xffffffff</code>
          *
          * <li><code>uint8 : version ................ == 1</code>
          *
@@ -117,81 +116,49 @@ public abstract class DwarfFrameSectionImpl extends DwarfSectionImpl {
          * </ul>
          */
         int pos = p;
-        if (buffer == null) {
-            pos += putInt(0, scratch, 0);
-            pos += putInt(DwarfDebugInfo.DW_CFA_CIE_id, scratch, 0);
-            pos += putByte(DwarfDebugInfo.DW_CFA_CIE_version, scratch, 0);
-            pos += putAsciiStringBytes("", scratch, 0);
-            pos += putULEB(1, scratch, 0);
-            pos += putSLEB(-8, scratch, 0);
-            pos += putByte((byte) getReturnPCIdx(), scratch, 0);
-            /*
-             * Write insns to set up empty frame.
-             */
-            pos = writeInitialInstructions(buffer, pos);
-            /*
-             * Pad to word alignment.
-             */
-            pos = writePaddingNops(buffer, pos);
-            /*
-             * No need to write length.
-             */
-            return pos;
-        } else {
-            int lengthPos = pos;
-            pos = putInt(0, buffer, pos);
-            pos = putInt(DwarfDebugInfo.DW_CFA_CIE_id, buffer, pos);
-            pos = putByte(DwarfDebugInfo.DW_CFA_CIE_version, buffer, pos);
-            pos = putAsciiStringBytes("", buffer, pos);
-            pos = putULEB(1, buffer, pos);
-            pos = putSLEB(-8, buffer, pos);
-            pos = putByte((byte) getReturnPCIdx(), buffer, pos);
-            /*
-             * write insns to set up empty frame
-             */
-            pos = writeInitialInstructions(buffer, pos);
-            /*
-             * Pad to word alignment.
-             */
-            pos = writePaddingNops(buffer, pos);
-            patchLength(lengthPos, buffer, pos);
-            return pos;
-        }
+        int lengthPos = pos;
+        pos = writeInt(0, buffer, pos);
+        pos = writeInt(CFA_CIE_id_default, buffer, pos);
+        pos = writeCIEVersion(buffer, pos);
+        pos = writeByte((byte) 0, buffer, pos);
+        pos = writeULEB(1, buffer, pos);
+        pos = writeSLEB(-8, buffer, pos);
+        pos = writeByte((byte) getReturnPCIdx(), buffer, pos);
+        /*
+         * Write insns to set up empty frame.
+         */
+        pos = writeInitialInstructions(buffer, pos);
+        /*
+         * Pad to word alignment.
+         */
+        pos = writePaddingNops(buffer, pos);
+        patchLength(lengthPos, buffer, pos);
+        return pos;
+    }
+
+    private int writeCIEVersion(byte[] buffer, int pos) {
+        return writeByte(DwarfFrameValue.DW_CFA_CIE_version.value(), buffer, pos);
+    }
+
+    private int writeMethodFrame(CompiledMethodEntry compiledEntry, byte[] buffer, int p) {
+        int pos = p;
+        int lengthPos = pos;
+        Range range = compiledEntry.getPrimary();
+        long lo = range.getLo();
+        long hi = range.getHi();
+        pos = writeFDEHeader((int) lo, (int) hi, buffer, pos);
+        pos = writeFDEs(compiledEntry.getFrameSize(), compiledEntry.getFrameSizeInfos(), buffer, pos);
+        pos = writePaddingNops(buffer, pos);
+        patchLength(lengthPos, buffer, pos);
+        return pos;
     }
 
     private int writeMethodFrames(byte[] buffer, int p) {
-        int pos = p;
-        /* write frames for normal methods */
-        for (ClassEntry classEntry : getPrimaryClasses()) {
-            for (PrimaryEntry primaryEntry : classEntry.getPrimaryEntries()) {
-                Range range = primaryEntry.getPrimary();
-                if (!range.isDeoptTarget()) {
-                    long lo = range.getLo();
-                    long hi = range.getHi();
-                    int lengthPos = pos;
-                    pos = writeFDEHeader((int) lo, (int) hi, buffer, pos);
-                    pos = writeFDEs(primaryEntry.getFrameSize(), primaryEntry.getFrameSizeInfos(), buffer, pos);
-                    pos = writePaddingNops(buffer, pos);
-                    patchLength(lengthPos, buffer, pos);
-                }
-            }
-        }
-        /* now write frames for deopt targets */
-        for (ClassEntry classEntry : getPrimaryClasses()) {
-            for (PrimaryEntry primaryEntry : classEntry.getPrimaryEntries()) {
-                Range range = primaryEntry.getPrimary();
-                if (range.isDeoptTarget()) {
-                    long lo = range.getLo();
-                    long hi = range.getHi();
-                    int lengthPos = pos;
-                    pos = writeFDEHeader((int) lo, (int) hi, buffer, pos);
-                    pos = writeFDEs(primaryEntry.getFrameSize(), primaryEntry.getFrameSizeInfos(), buffer, pos);
-                    pos = writePaddingNops(buffer, pos);
-                    patchLength(lengthPos, buffer, pos);
-                }
-            }
-        }
-        return pos;
+        Cursor cursor = new Cursor(p);
+        compiledMethodsStream().forEach(compiledMethod -> {
+            cursor.set(writeMethodFrame(compiledMethod, buffer, cursor.get()));
+        });
+        return cursor.get();
     }
 
     protected abstract int writeFDEs(int frameSize, List<DebugInfoProvider.DebugFrameSizeChange> frameSizeInfos, byte[] buffer, int pos);
@@ -217,61 +184,36 @@ public abstract class DwarfFrameSectionImpl extends DwarfSectionImpl {
          */
 
         int pos = p;
-        if (buffer == null) {
-            /* Dummy length. */
-            pos += putInt(0, scratch, 0);
-            /* CIE_offset */
-            pos += putInt(0, scratch, 0);
-            /* Initial address. */
-            pos += putLong(lo, scratch, 0);
-            /* Address range. */
-            return pos + putLong(hi - lo, scratch, 0);
-        } else {
-            /* Dummy length. */
-            pos = putInt(0, buffer, pos);
-            /* CIE_offset */
-            pos = putInt(0, buffer, pos);
-            /* Initial address. */
-            pos = putRelocatableCodeOffset(lo, buffer, pos);
-            /* Address range. */
-            return putLong(hi - lo, buffer, pos);
-        }
+        /* Dummy length. */
+        pos = writeInt(0, buffer, pos);
+        /* CIE_offset */
+        pos = writeInt(0, buffer, pos);
+        /* Initial address. */
+        pos = writeRelocatableCodeOffset(lo, buffer, pos);
+        /* Address range. */
+        return writeLong(hi - lo, buffer, pos);
     }
 
     private int writePaddingNops(byte[] buffer, int p) {
         int pos = p;
         while ((pos & (PADDING_NOPS_ALIGNMENT - 1)) != 0) {
-            if (buffer == null) {
-                pos++;
-            } else {
-                pos = putByte(DwarfDebugInfo.DW_CFA_nop, buffer, pos);
-            }
+            pos = writeByte(DwarfFrameValue.DW_CFA_nop.value(), buffer, pos);
         }
         return pos;
     }
 
     protected int writeDefCFA(int register, int offset, byte[] buffer, int p) {
         int pos = p;
-        if (buffer == null) {
-            pos += putByte(DwarfDebugInfo.DW_CFA_def_cfa, scratch, 0);
-            pos += putSLEB(register, scratch, 0);
-            return pos + putULEB(offset, scratch, 0);
-        } else {
-            pos = putByte(DwarfDebugInfo.DW_CFA_def_cfa, buffer, pos);
-            pos = putULEB(register, buffer, pos);
-            return putULEB(offset, buffer, pos);
-        }
+        pos = writeByte(DwarfFrameValue.DW_CFA_def_cfa.value(), buffer, pos);
+        pos = writeULEB(register, buffer, pos);
+        return writeULEB(offset, buffer, pos);
     }
 
     protected int writeDefCFAOffset(int offset, byte[] buffer, int p) {
         int pos = p;
-        if (buffer == null) {
-            pos += putByte(DwarfDebugInfo.DW_CFA_def_cfa_offset, scratch, 0);
-            return pos + putULEB(offset, scratch, 0);
-        } else {
-            pos = putByte(DwarfDebugInfo.DW_CFA_def_cfa_offset, buffer, pos);
-            return putULEB(offset, buffer, pos);
-        }
+        byte op = DwarfFrameValue.DW_CFA_def_cfa_offset.value();
+        pos = writeByte(op, buffer, pos);
+        return writeULEB(offset, buffer, pos);
     }
 
     protected int writeAdvanceLoc(int offset, byte[] buffer, int pos) {
@@ -288,83 +230,50 @@ public abstract class DwarfFrameSectionImpl extends DwarfSectionImpl {
 
     protected int writeAdvanceLoc0(byte offset, byte[] buffer, int pos) {
         byte op = advanceLoc0Op(offset);
-        if (buffer == null) {
-            return pos + putByte(op, scratch, 0);
-        } else {
-            return putByte(op, buffer, pos);
-        }
+        return writeByte(op, buffer, pos);
     }
 
     protected int writeAdvanceLoc1(byte offset, byte[] buffer, int p) {
         int pos = p;
-        byte op = DwarfDebugInfo.DW_CFA_advance_loc1;
-        if (buffer == null) {
-            pos += putByte(op, scratch, 0);
-            return pos + putByte(offset, scratch, 0);
-        } else {
-            pos = putByte(op, buffer, pos);
-            return putByte(offset, buffer, pos);
-        }
+        byte op = DwarfFrameValue.DW_CFA_advance_loc1.value();
+        pos = writeByte(op, buffer, pos);
+        return writeByte(offset, buffer, pos);
     }
 
     protected int writeAdvanceLoc2(short offset, byte[] buffer, int p) {
-        byte op = DwarfDebugInfo.DW_CFA_advance_loc2;
+        byte op = DwarfFrameValue.DW_CFA_advance_loc2.value();
         int pos = p;
-        if (buffer == null) {
-            pos += putByte(op, scratch, 0);
-            return pos + putShort(offset, scratch, 0);
-        } else {
-            pos = putByte(op, buffer, pos);
-            return putShort(offset, buffer, pos);
-        }
+        pos = writeByte(op, buffer, pos);
+        return writeShort(offset, buffer, pos);
     }
 
     protected int writeAdvanceLoc4(int offset, byte[] buffer, int p) {
-        byte op = DwarfDebugInfo.DW_CFA_advance_loc4;
+        byte op = DwarfFrameValue.DW_CFA_advance_loc4.value();
         int pos = p;
-        if (buffer == null) {
-            pos += putByte(op, scratch, 0);
-            return pos + putInt(offset, scratch, 0);
-        } else {
-            pos = putByte(op, buffer, pos);
-            return putInt(offset, buffer, pos);
-        }
+        pos = writeByte(op, buffer, pos);
+        return writeInt(offset, buffer, pos);
     }
 
     protected int writeOffset(int register, int offset, byte[] buffer, int p) {
         byte op = offsetOp(register);
         int pos = p;
-        if (buffer == null) {
-            pos += putByte(op, scratch, 0);
-            return pos + putULEB(offset, scratch, 0);
-        } else {
-            pos = putByte(op, buffer, pos);
-            return putULEB(offset, buffer, pos);
-        }
+        pos = writeByte(op, buffer, pos);
+        return writeULEB(offset, buffer, pos);
     }
 
     protected int writeRestore(int register, byte[] buffer, int p) {
         byte op = restoreOp(register);
         int pos = p;
-        if (buffer == null) {
-            return pos + putByte(op, scratch, 0);
-        } else {
-            return putByte(op, buffer, pos);
-        }
+        return writeByte(op, buffer, pos);
     }
 
     @SuppressWarnings("unused")
     protected int writeRegister(int savedReg, int savedToReg, byte[] buffer, int p) {
         int pos = p;
-        if (buffer == null) {
-            pos += putByte(DwarfDebugInfo.DW_CFA_register, scratch, 0);
-            pos += putULEB(savedReg, scratch, 0);
-            return pos + putULEB(savedToReg, scratch, 0);
-        } else {
-            pos = putByte(DwarfDebugInfo.DW_CFA_register, buffer, pos);
-            pos = putULEB(savedReg, buffer, pos);
-            return putULEB(savedToReg, buffer, pos);
-        }
+        byte op = DwarfFrameValue.DW_CFA_register.value();
+        pos = writeByte(op, buffer, pos);
+        pos = writeULEB(savedReg, buffer, pos);
+        return writeULEB(savedToReg, buffer, pos);
     }
 
     protected abstract int getReturnPCIdx();
@@ -374,38 +283,23 @@ public abstract class DwarfFrameSectionImpl extends DwarfSectionImpl {
 
     protected abstract int writeInitialInstructions(byte[] buffer, int pos);
 
-    /**
-     * The debug_frame section depends on debug_line section.
-     */
-    private static final String TARGET_SECTION_NAME = DwarfDebugInfo.DW_LINE_SECTION_NAME;
-
-    @Override
-    public String targetSectionName() {
-        return TARGET_SECTION_NAME;
-    }
-
-    private final LayoutDecision.Kind[] targetSectionKinds = {
-                    LayoutDecision.Kind.CONTENT,
-                    LayoutDecision.Kind.SIZE
-    };
-
-    @Override
-    public LayoutDecision.Kind[] targetSectionKinds() {
-        return targetSectionKinds;
-    }
-
     private static byte offsetOp(int register) {
-        assert (register >> 6) == 0;
-        return (byte) ((DwarfDebugInfo.DW_CFA_offset << 6) | register);
+        byte op = DwarfFrameValue.DW_CFA_offset.value();
+        return encodeOp(op, register);
     }
 
     private static byte restoreOp(int register) {
-        assert (register >> 6) == 0;
-        return (byte) ((DwarfDebugInfo.DW_CFA_restore << 6) | register);
+        byte op = DwarfFrameValue.DW_CFA_restore.value();
+        return encodeOp(op, register);
     }
 
     private static byte advanceLoc0Op(int offset) {
-        assert (offset >= 0 && offset <= 0x3f);
-        return (byte) ((DwarfDebugInfo.DW_CFA_advance_loc << 6) | offset);
+        byte op = DwarfFrameValue.DW_CFA_advance_loc.value();
+        return encodeOp(op, offset);
+    }
+
+    private static byte encodeOp(byte op, int value) {
+        assert (value >> 6) == 0;
+        return (byte) ((op << 6) | value);
     }
 }

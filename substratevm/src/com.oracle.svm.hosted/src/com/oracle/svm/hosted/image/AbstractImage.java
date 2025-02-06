@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2007, 2018, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2007, 2022, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -27,8 +27,6 @@ package com.oracle.svm.hosted.image;
 import java.nio.file.Path;
 import java.util.List;
 
-import org.graalvm.compiler.debug.DebugContext;
-
 import com.oracle.objectfile.ObjectFile;
 import com.oracle.svm.core.LinkerInvocation;
 import com.oracle.svm.hosted.FeatureImpl.BeforeImageWriteAccessImpl;
@@ -36,6 +34,8 @@ import com.oracle.svm.hosted.c.NativeLibraries;
 import com.oracle.svm.hosted.meta.HostedMetaAccess;
 import com.oracle.svm.hosted.meta.HostedMethod;
 import com.oracle.svm.hosted.meta.HostedUniverse;
+
+import jdk.graal.compiler.debug.DebugContext;
 
 public abstract class AbstractImage {
 
@@ -46,50 +46,51 @@ public abstract class AbstractImage {
     protected final ClassLoader imageClassLoader;
     protected final NativeImageCodeCache codeCache;
     protected final List<HostedMethod> entryPoints;
-    protected int resultingImageSize; // for statistical output
+    protected int imageFileSize = -1; // for build output reporting
+    protected int debugInfoSize = -1; // for build output reporting
 
     public enum NativeImageKind {
+        /* IMAGE_LAYER mimics a SHARED_LIBRARY. */
+        IMAGE_LAYER(false, true) {
+            @Override
+            protected String getFilenameSuffix() {
+                return ".so";
+            }
+        },
         SHARED_LIBRARY(false) {
             @Override
-            public String getFilenameSuffix() {
-                switch (ObjectFile.getNativeFormat()) {
-                    case ELF:
-                        return ".so";
-                    case MACH_O:
-                        return ".dylib";
-                    case PECOFF:
-                        return ".dll";
-                    default:
-                        throw new AssertionError("unreachable");
-                }
-            }
-
-            @Override
-            public String getFilenamePrefix() {
-                return ObjectFile.getNativeFormat() == ObjectFile.Format.PECOFF ? "" : "lib";
+            protected String getFilenameSuffix() {
+                return switch (ObjectFile.getNativeFormat()) {
+                    case ELF -> ".so";
+                    case MACH_O -> ".dylib";
+                    case PECOFF -> ".dll";
+                    default -> throw new AssertionError("Unreachable");
+                };
             }
         },
         EXECUTABLE(true),
         STATIC_EXECUTABLE(true);
 
         public final boolean isExecutable;
+        public final boolean isImageLayer;
         public final String mainEntryPointName;
 
         NativeImageKind(boolean executable) {
+            this(executable, false);
+        }
+
+        NativeImageKind(boolean executable, boolean imageLayer) {
             isExecutable = executable;
+            isImageLayer = imageLayer;
             mainEntryPointName = executable ? "main" : "run_main";
         }
 
-        public String getFilenameSuffix() {
+        public final String getOutputFilename(String imageName) {
+            return imageName + getFilenameSuffix();
+        }
+
+        protected String getFilenameSuffix() {
             return ObjectFile.getNativeFormat() == ObjectFile.Format.PECOFF ? ".exe" : "";
-        }
-
-        public String getFilenamePrefix() {
-            return "";
-        }
-
-        public String getFilename(String basename) {
-            return getFilenamePrefix() + basename + getFilenameSuffix();
         }
     }
 
@@ -111,8 +112,14 @@ public abstract class AbstractImage {
         return imageKind;
     }
 
-    public int getImageSize() {
-        return resultingImageSize;
+    public int getImageFileSize() {
+        assert imageFileSize > 0 : "imageFileSize read before being set; cannot be zero";
+        return imageFileSize;
+    }
+
+    public int getDebugInfoSize() {
+        assert debugInfoSize >= 0 : "debugInfoSize read before being set";
+        return debugInfoSize;
     }
 
     public NativeLibraries getNativeLibs() {
@@ -126,27 +133,21 @@ public abstract class AbstractImage {
     public abstract void build(String imageName, DebugContext debug);
 
     /**
-     * Write the image to the named file. This also writes debug information -- either to the same
-     * or a different file, as decided by the implementation of {@link #getOrCreateDebugObjectFile}.
-     * If {@link #getOrCreateDebugObjectFile} is not called, no debug information is written.
+     * Write the image to the named file.
      */
     public abstract LinkerInvocation write(DebugContext debug, Path outputDirectory, Path tempDirectory, String imageName, BeforeImageWriteAccessImpl config);
-
-    /**
-     * Returns the ObjectFile.Section within the image, if any, whose vaddr defines the image's base
-     * vaddr.
-     */
-    public abstract ObjectFile.Section getTextSection();
 
     // factory method
     public static AbstractImage create(NativeImageKind k, HostedUniverse universe, HostedMetaAccess metaAccess, NativeLibraries nativeLibs, NativeImageHeap heap,
                     NativeImageCodeCache codeCache, List<HostedMethod> entryPoints, ClassLoader classLoader) {
-        switch (k) {
-            case SHARED_LIBRARY:
-                return new SharedLibraryImageViaCC(universe, metaAccess, nativeLibs, heap, codeCache, entryPoints, classLoader);
-            default:
-                return new ExecutableImageViaCC(k, universe, metaAccess, nativeLibs, heap, codeCache, entryPoints, classLoader);
-        }
+        return switch (k) {
+            case SHARED_LIBRARY ->
+                new SharedLibraryImageViaCC(universe, metaAccess, nativeLibs, heap, codeCache, entryPoints, classLoader);
+            case IMAGE_LAYER ->
+                new ImageLayerViaCC(universe, metaAccess, nativeLibs, heap, codeCache, entryPoints, classLoader);
+            case EXECUTABLE, STATIC_EXECUTABLE ->
+                new ExecutableImageViaCC(k, universe, metaAccess, nativeLibs, heap, codeCache, entryPoints, classLoader);
+        };
     }
 
     public abstract String[] makeLaunchCommand(AbstractImage.NativeImageKind k, String imageName, Path binPath, Path workPath, java.lang.reflect.Method method);
@@ -159,9 +160,7 @@ public abstract class AbstractImage {
         return heap;
     }
 
-    public abstract ObjectFile getOrCreateDebugObjectFile();
+    public abstract long getImageHeapSize();
 
-    public boolean requiresCustomDebugRelocation() {
-        return false;
-    }
+    public abstract ObjectFile getObjectFile();
 }

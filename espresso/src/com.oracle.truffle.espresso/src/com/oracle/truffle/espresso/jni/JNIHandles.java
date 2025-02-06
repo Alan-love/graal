@@ -29,7 +29,9 @@ import java.util.Arrays;
 import java.util.function.Supplier;
 
 import com.oracle.truffle.api.CompilerDirectives;
-import com.oracle.truffle.espresso.runtime.StaticObject;
+import com.oracle.truffle.espresso.impl.Field;
+import com.oracle.truffle.espresso.impl.Method;
+import com.oracle.truffle.espresso.runtime.staticobject.StaticObject;
 
 /**
  * JNI handles are divided in two categories: local and global.
@@ -49,6 +51,8 @@ public final class JNIHandles {
      */
     static final int NATIVE_CALL_MIN_LOCAL_HANDLE_CAPACITY = 16;
 
+    private final WeakHandles<Field> fieldIds = new WeakHandles<>();
+    private final WeakHandles<Method> methodIds = new WeakHandles<>();
     private final ThreadLocal<LocalHandles> locals;
     private final GlobalHandles globals;
 
@@ -187,6 +191,14 @@ public final class JNIHandles {
     public int pushFrame() {
         return pushFrame(NATIVE_CALL_MIN_LOCAL_HANDLE_CAPACITY);
     }
+
+    public WeakHandles<Field> fieldIds() {
+        return fieldIds;
+    }
+
+    public WeakHandles<Method> methodIds() {
+        return methodIds;
+    }
 }
 
 /**
@@ -259,12 +271,18 @@ final class GlobalHandles {
     }
 
     public int getObjectRefType(int handle) {
+        if (handle == 0) {
+            return JniEnv.JNIInvalidRefType;
+        }
         assert validHandle(handle);
         Object obj = objects[handle];
-        if (obj instanceof WeakReference) {
+        if (obj == null) {
+            // destroyed
+            return JniEnv.JNIInvalidRefType;
+        } else if (obj instanceof WeakReference) {
             return JniEnv.JNIWeakGlobalRefType;
         } else {
-            assert obj instanceof StaticObject;
+            assert obj instanceof StaticObject : obj;
             return JniEnv.JNIGlobalRefType;
         }
     }
@@ -323,7 +341,7 @@ final class LocalHandles {
             targetCapacity = Math.multiplyExact(targetCapacity, 2);
         }
         if (targetCapacity > objects.length) {
-            Object[] oldArray = objects;
+            StaticObject[] oldArray = objects;
             assert targetCapacity >= top + capacity;
             objects = new StaticObject[targetCapacity];
             System.arraycopy(oldArray, 0, objects, 0, oldArray.length);

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012, 2017, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2012, 2023, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,106 +24,145 @@
  */
 package com.oracle.graal.pointsto.meta;
 
-import java.lang.annotation.Annotation;
-import java.lang.reflect.Field;
 import java.lang.reflect.Modifier;
-import java.util.Set;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
-import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
 
-import org.graalvm.compiler.debug.GraalError;
-import org.graalvm.util.GuardedAnnotationAccess;
-
-import com.oracle.graal.pointsto.api.DefaultUnsafePartition;
-import com.oracle.graal.pointsto.api.HostVM;
 import com.oracle.graal.pointsto.api.PointstoOptions;
-import com.oracle.graal.pointsto.flow.FieldSinkTypeFlow;
+import com.oracle.graal.pointsto.flow.ContextInsensitiveFieldTypeFlow;
 import com.oracle.graal.pointsto.flow.FieldTypeFlow;
-import com.oracle.graal.pointsto.flow.MethodTypeFlow;
+import com.oracle.graal.pointsto.infrastructure.OriginalClassProvider;
 import com.oracle.graal.pointsto.infrastructure.OriginalFieldProvider;
-import com.oracle.graal.pointsto.typestate.TypeState;
-import com.oracle.svm.util.UnsafePartitionKind;
+import com.oracle.graal.pointsto.infrastructure.WrappedJavaField;
+import com.oracle.graal.pointsto.util.AnalysisError;
+import com.oracle.graal.pointsto.util.AnalysisFuture;
+import com.oracle.graal.pointsto.util.AtomicUtils;
+import com.oracle.svm.common.meta.GuaranteeFolded;
 
+import jdk.graal.compiler.debug.GraalError;
+import jdk.vm.ci.code.BytecodePosition;
+import jdk.vm.ci.meta.JavaConstant;
 import jdk.vm.ci.meta.JavaKind;
 import jdk.vm.ci.meta.ResolvedJavaField;
 import jdk.vm.ci.meta.ResolvedJavaType;
 
-public class AnalysisField implements ResolvedJavaField, OriginalFieldProvider {
+public abstract class AnalysisField extends AnalysisElement implements WrappedJavaField, OriginalFieldProvider {
 
+    private static final AtomicReferenceFieldUpdater<AnalysisField, Object> isAccessedUpdater = AtomicReferenceFieldUpdater
+                    .newUpdater(AnalysisField.class, Object.class, "isAccessed");
+
+    private static final AtomicReferenceFieldUpdater<AnalysisField, Object> isReadUpdater = AtomicReferenceFieldUpdater
+                    .newUpdater(AnalysisField.class, Object.class, "isRead");
+
+    private static final AtomicReferenceFieldUpdater<AnalysisField, Object> isWrittenUpdater = AtomicReferenceFieldUpdater
+                    .newUpdater(AnalysisField.class, Object.class, "isWritten");
+
+    private static final AtomicReferenceFieldUpdater<AnalysisField, Object> isFoldedUpdater = AtomicReferenceFieldUpdater
+                    .newUpdater(AnalysisField.class, Object.class, "isFolded");
+
+    private static final AtomicReferenceFieldUpdater<AnalysisField, Object> isUnsafeAccessedUpdater = AtomicReferenceFieldUpdater
+                    .newUpdater(AnalysisField.class, Object.class, "isUnsafeAccessed");
     private final int id;
+    /** Marks a field loaded from a base layer. */
+    private final boolean isInBaseLayer;
 
     public final ResolvedJavaField wrapped;
 
-    /** Field type flow for the static fields. */
-    private FieldTypeFlow staticFieldFlow;
-
-    /** Initial field type flow, i.e., as specified by the analysis client. */
-    private FieldTypeFlow initialInstanceFieldFlow;
-
+    /**
+     * Initial field type flow, i.e., as specified by the analysis client. It can be used to inject
+     * specific types into a field that the analysis would not see on its own, and to inject the
+     * null value into a field.
+     */
+    protected FieldTypeFlow initialFlow;
     /**
      * Field type flow that reflects all the types flowing in this field on its declaring type and
-     * all the sub-types.
+     * all the sub-types. It does not track any context-sensitive information.
      */
-    private FieldSinkTypeFlow instanceFieldFlow;
+    protected FieldTypeFlow sinkFlow;
 
-    private boolean isAccessed;
-    private boolean isRead;
-    private boolean isWritten;
-    private boolean isUsedInComparison;
-    private AtomicBoolean isUnsafeAccessed;
-    private AtomicBoolean unsafeFrozenTypeState;
+    /** The reason flags contain a {@link BytecodePosition} or a reason object. */
+    @SuppressWarnings("unused") private volatile Object isRead;
+    @SuppressWarnings("unused") private volatile Object isAccessed;
+    @SuppressWarnings("unused") private volatile Object isWritten;
+    @SuppressWarnings("unused") private volatile Object isFolded;
+    @SuppressWarnings("unused") private volatile Object isUnsafeAccessed;
 
-    /**
-     * By default all instance fields are null before are initialized. It can be specified by
-     * {@link HostVM} that certain fields will not be null.
-     */
-    private boolean canBeNull;
-
-    private ConcurrentMap<MethodTypeFlow, Boolean> readBy;
-    private ConcurrentMap<MethodTypeFlow, Boolean> writtenBy;
-
-    protected TypeState instanceFieldTypeState;
+    private ConcurrentMap<Object, Boolean> readBy;
+    private ConcurrentMap<Object, Boolean> writtenBy;
 
     /** Field's position in the list of declaring type's fields, including inherited fields. */
-    private int position;
+    protected int position;
 
-    private final AnalysisType declaringClass;
-    private final AnalysisType fieldType;
+    protected final AnalysisType declaringClass;
+    protected final AnalysisType fieldType;
 
+    /**
+     * Marks a field whose value is computed during image building, in general derived from other
+     * values. The actual meaning of the field value is out of scope of the static analysis, but the
+     * value is stored here to allow fast access.
+     */
+    protected Object fieldValueInterceptor;
+
+    @SuppressWarnings("this-escape")
     public AnalysisField(AnalysisUniverse universe, ResolvedJavaField wrappedField) {
-        assert !wrappedField.isInternal();
+        super(universe.hostVM.enableTrackAcrossLayers());
+        assert !wrappedField.isInternal() : wrappedField;
 
         this.position = -1;
-        this.isUnsafeAccessed = new AtomicBoolean();
-        this.unsafeFrozenTypeState = new AtomicBoolean();
 
         this.wrapped = wrappedField;
-        this.id = universe.nextFieldId.getAndIncrement();
 
-        readBy = PointstoOptions.TrackAccessChain.getValue(universe.hostVM().options()) ? new ConcurrentHashMap<>() : null;
-        writtenBy = new ConcurrentHashMap<>();
+        boolean trackAccessChain = PointstoOptions.TrackAccessChain.getValue(universe.hostVM().options());
+        readBy = trackAccessChain ? new ConcurrentHashMap<>() : null;
+        writtenBy = trackAccessChain ? new ConcurrentHashMap<>() : null;
 
         declaringClass = universe.lookup(wrappedField.getDeclaringClass());
         fieldType = getDeclaredType(universe, wrappedField);
 
-        isUsedInComparison = false;
-
+        initialFlow = new FieldTypeFlow(this, getType());
         if (this.isStatic()) {
-            this.canBeNull = false;
-            this.staticFieldFlow = new FieldTypeFlow(this, getType());
-            this.initialInstanceFieldFlow = null;
+            /* There is never any context-sensitivity for static fields. */
+            sinkFlow = initialFlow;
         } else {
-            this.canBeNull = true;
-            this.instanceFieldFlow = new FieldSinkTypeFlow(this, getType());
-            this.initialInstanceFieldFlow = new FieldTypeFlow(this, getType());
+            /*
+             * Regardless of the context-sensitivity policy, there is always this single type flow
+             * that accumulates all types.
+             */
+            sinkFlow = new ContextInsensitiveFieldTypeFlow(this, getType());
         }
+
+        if (universe.hostVM().useBaseLayer() && declaringClass.isInBaseLayer()) {
+            int fid = universe.getImageLayerLoader().lookupHostedFieldInBaseLayer(this);
+            if (fid != -1) {
+                /*
+                 * This id is the actual link between the corresponding field from the base layer
+                 * and this new field.
+                 */
+                id = fid;
+                isInBaseLayer = true;
+            } else {
+                id = universe.computeNextFieldId();
+                isInBaseLayer = false;
+            }
+        } else {
+            id = universe.computeNextFieldId();
+            isInBaseLayer = false;
+        }
+    }
+
+    @Override
+    protected AnalysisUniverse getUniverse() {
+        /* Access the universe via the declaring class to avoid storing it here. */
+        return declaringClass.getUniverse();
     }
 
     private static AnalysisType getDeclaredType(AnalysisUniverse universe, ResolvedJavaField wrappedField) {
         ResolvedJavaType resolvedType;
         try {
-            resolvedType = wrappedField.getType().resolve(universe.substitutions.resolve(wrappedField.getDeclaringClass()));
+            resolvedType = wrappedField.getType().resolve(OriginalClassProvider.getOriginalType(wrappedField.getDeclaringClass()));
         } catch (LinkageError e) {
             /*
              * Type resolution fails if the declared type is missing. Just erase the type by
@@ -135,16 +174,17 @@ public class AnalysisField implements ResolvedJavaField, OriginalFieldProvider {
         return universe.lookup(resolvedType);
     }
 
-    public void copyAccessInfos(AnalysisField other) {
-        this.isAccessed = other.isAccessed;
-        this.isUnsafeAccessed = other.isUnsafeAccessed;
-        this.canBeNull = other.canBeNull;
-        this.isWritten = other.isWritten;
-        this.isRead = other.isRead;
+    @Override
+    public ResolvedJavaField getWrapped() {
+        return wrapped;
     }
 
     public int getId() {
         return id;
+    }
+
+    public boolean isInBaseLayer() {
+        return isInBaseLayer;
     }
 
     @Override
@@ -157,111 +197,99 @@ public class AnalysisField implements ResolvedJavaField, OriginalFieldProvider {
 
     }
 
-    /**
-     * Returns all possible types that this field can have. The result is not context sensitive,
-     * i.e., it is a union of all types found in all contexts.
-     */
-    public TypeState getTypeState() {
-        if (getType().getStorageKind() != JavaKind.Object) {
-            return null;
-        } else if (isStatic()) {
-            return staticFieldFlow.getState();
-        } else {
-            return getInstanceFieldTypeState();
-        }
+    public FieldTypeFlow getInitialFlow() {
+        return initialFlow;
     }
 
-    public TypeState getInstanceFieldTypeState() {
-        return instanceFieldFlow.getState();
-    }
-
-    // @formatter:off
-//    public TypeState getInstanceFieldTypeState() {
-//        if (instanceFieldTypeState == null) {
-//
-//            /* Collect the types of all instance field flows. */
-//            HashSet<AnalysisType> fieldTypes = new HashSet<>();
-//            boolean fieldCanBeNull = false;
-//
-//            fieldCanBeNull = collectInstanceFieldTypes(getDeclaringClass(), fieldTypes);
-//            instanceFieldTypeState = TypeState.forExactTypes(null, new ArrayList<>(fieldTypes), fieldCanBeNull);
-//
-//        }
-//        return instanceFieldTypeState;
-//    }
-
-//    private boolean collectInstanceFieldTypes(AnalysisType type, HashSet<AnalysisType> fieldTypes) {
-//        boolean fieldCanBeNull = false;
-//
-//        TypeFlow<?> fieldFlow = type.getAbstractObject().getInstanceFieldFlow(null, this, false);
-//        if (fieldFlow != null) {
-//            TypeState mergedState = fieldFlow.getState();
-//            mergedState.typesIterator().forEachRemaining(fieldTypes::add);
-//            fieldCanBeNull |= mergedState.canBeNull();
-//        }
-//
-//        for (AnalysisType subClass : type.subTypes) {
-//            fieldCanBeNull |= collectInstanceFieldTypes(subClass, fieldTypes);
-//        }
-//        return fieldCanBeNull;
-//    }
-    //@formatter:on
-
-    public FieldTypeFlow getInitialInstanceFieldFlow() {
-        return initialInstanceFieldFlow;
+    public FieldTypeFlow getSinkFlow() {
+        return sinkFlow;
     }
 
     public FieldTypeFlow getStaticFieldFlow() {
-        assert Modifier.isStatic(this.getModifiers());
-
-        return staticFieldFlow;
-    }
-
-    public FieldSinkTypeFlow getInstanceFieldFlow() {
-        assert !Modifier.isStatic(this.getModifiers());
-
-        return instanceFieldFlow;
+        assert Modifier.isStatic(this.getModifiers()) : this;
+        return sinkFlow;
     }
 
     public void cleanupAfterAnalysis() {
-        staticFieldFlow = null;
-        instanceFieldFlow = null;
-        initialInstanceFieldFlow = null;
+        initialFlow = null;
+        sinkFlow = null;
         readBy = null;
         writtenBy = null;
-        instanceFieldTypeState = null;
     }
 
-    public void registerAsAccessed() {
-        isAccessed = true;
+    public boolean registerAsAccessed(Object reason) {
+        checkGuaranteeFolded();
+        getDeclaringClass().registerAsReachable(this);
+
+        assert isValidReason(reason) : "Registering a field as accessed needs to provide a valid reason.";
+        return AtomicUtils.atomicSetAndRun(this, reason, isAccessedUpdater, () -> {
+            onReachable(reason);
+            getUniverse().onFieldAccessed(this);
+            getUniverse().getHeapScanner().onFieldRead(this);
+        });
     }
 
-    public void registerAsRead(MethodTypeFlow method) {
-        isRead = true;
-        if (readBy != null && method != null) {
-            readBy.put(method, Boolean.TRUE);
+    /**
+     * @param reason the reason why this field is read, non-null
+     */
+    public boolean registerAsRead(Object reason) {
+        checkGuaranteeFolded();
+        getDeclaringClass().registerAsReachable(this);
+
+        assert isValidReason(reason) : "Registering a field as read needs to provide a valid reason.";
+        if (readBy != null) {
+            readBy.put(reason, Boolean.TRUE);
         }
+        return AtomicUtils.atomicSetAndRun(this, reason, isReadUpdater, () -> {
+            onReachable(reason);
+            getUniverse().onFieldAccessed(this);
+            getUniverse().getHeapScanner().onFieldRead(this);
+        });
     }
 
     /**
      * Registers that the field is written.
      *
-     * @param method The method where the field is written or null if the method is not known, e.g.
-     *            for an unsafe accessed field.
+     * @param reason the reason why this field is written, non-null
      */
-    public void registerAsWritten(MethodTypeFlow method) {
-        isWritten = true;
-        if (writtenBy != null && method != null) {
-            writtenBy.put(method, Boolean.TRUE);
+    public boolean registerAsWritten(Object reason) {
+        checkGuaranteeFolded();
+        getDeclaringClass().registerAsReachable(this);
+
+        assert isValidReason(reason) : "Registering a field as written needs to provide a valid reason.";
+        if (writtenBy != null) {
+            writtenBy.put(reason, Boolean.TRUE);
         }
+        return AtomicUtils.atomicSetAndRun(this, reason, isWrittenUpdater, () -> {
+            onReachable(reason);
+            if (Modifier.isVolatile(getModifiers()) || getStorageKind() == JavaKind.Object) {
+                getUniverse().onFieldAccessed(this);
+            }
+        });
     }
 
-    public void registerAsUnsafeAccessed(AnalysisUniverse universe) {
-        registerAsUnsafeAccessed(universe, DefaultUnsafePartition.get());
+    public boolean isGuaranteeFolded() {
+        return getAnnotation(GuaranteeFolded.class) != null;
     }
 
-    public void registerAsUnsafeAccessed(AnalysisUniverse universe, UnsafePartitionKind partitionKind) {
+    public void checkGuaranteeFolded() {
+        AnalysisError.guarantee(!isGuaranteeFolded(), "A field that is guaranteed to always be folded is seen as accessed: %s. ", this);
+    }
 
+    public void registerAsFolded(Object reason) {
+        getDeclaringClass().registerAsReachable(this);
+
+        assert isValidReason(reason) : "Registering a field as folded needs to provide a valid reason.";
+        AtomicUtils.atomicSetAndRun(this, reason, isFoldedUpdater, () -> {
+            assert getDeclaringClass().isReachable() : this;
+            onReachable(reason);
+        });
+    }
+
+    public boolean registerAsUnsafeAccessed(Object reason) {
+        checkGuaranteeFolded();
+        assert isValidReason(reason) : "Registering a field as unsafe accessed needs to provide a valid reason.";
+        registerAsAccessed(reason);
         /*
          * A field can potentially be registered as unsafe accessed multiple times. This is
          * especially true for the Graal nodes because FieldsOffsetsFeature.registerFields iterates
@@ -271,58 +299,45 @@ public class AnalysisField implements ResolvedJavaField, OriginalFieldProvider {
          * only register fields as unsafe accessed with their declaring type once.
          */
 
-        if (!isUnsafeAccessed.getAndSet(true)) {
+        return AtomicUtils.atomicSetAndRun(this, reason, isUnsafeAccessedUpdater, () -> {
             /*
-             * The atomic boolean ensures that the field is registered as unsafe accessed with its
+             * The atomic updater ensures that the field is registered as unsafe accessed with its
              * declaring class only once. However, at the end of this call the registration might
              * still be in progress. The first thread that calls this methods enters the if and
              * starts the registration, the next threads return right away, while the registration
              * might still be in progress.
              */
 
-            registerAsWritten(null);
+            registerAsWritten(reason);
 
             if (isStatic()) {
                 /* Register the static field as unsafe accessed with the analysis universe. */
-                universe.registerUnsafeAccessedStaticField(this);
+                getUniverse().registerUnsafeAccessedStaticField(this);
             } else {
                 /* Register the instance field as unsafe accessed on the declaring type. */
                 AnalysisType declaringType = getDeclaringClass();
-                declaringType.registerUnsafeAccessedField(this, partitionKind);
+                declaringType.registerUnsafeAccessedField(this);
             }
-        }
-
+        });
     }
 
     public boolean isUnsafeAccessed() {
-        return isUnsafeAccessed.get();
+        return AtomicUtils.isSet(this, isUnsafeAccessedUpdater);
     }
 
-    public void setUnsafeFrozenTypeState(boolean value) {
-        unsafeFrozenTypeState.getAndSet(value);
+    public Object getReadBy() {
+        return isReadUpdater.get(this);
     }
 
-    public boolean hasUnsafeFrozenTypeState() {
-        return unsafeFrozenTypeState.get();
-    }
-
-    public Set<MethodTypeFlow> getReadBy() {
-        return readBy.keySet();
-    }
-
-    /**
-     * Returns all methods where the field is written. It does not include the methods where the
-     * field is written with unsafe access.
-     */
-    public Set<MethodTypeFlow> getWrittenBy() {
-        return writtenBy.keySet();
+    public Object getAccessedReason() {
+        return isAccessed;
     }
 
     /**
      * Returns true if the field is reachable. Fields that are read or manually registered as
      * reachable are always reachable. For fields that are write-only, more cases need to be
      * considered:
-     * 
+     *
      * If a primitive field is never read, writes to it are useless as well and we can eliminate the
      * field. Unless the field is volatile, because the write is a memory barrier and therefore has
      * side effects.
@@ -334,34 +349,57 @@ public class AnalysisField implements ResolvedJavaField, OriginalFieldProvider {
      * DirectByteBuffer remains reachable.
      */
     public boolean isAccessed() {
-        return isAccessed || isRead || (isWritten && (Modifier.isVolatile(getModifiers()) || getStorageKind() == JavaKind.Object));
+        return AtomicUtils.isSet(this, isAccessedUpdater) || AtomicUtils.isSet(this, isReadUpdater) ||
+                        (AtomicUtils.isSet(this, isWrittenUpdater) && (Modifier.isVolatile(getModifiers()) || getStorageKind() == JavaKind.Object));
     }
 
-    /**
-     * Returns true if the field needs to be preserved in the image heap. If this method returns
-     * false but {@link #isAccessed} is true, then memory for the field is still reserved. The value
-     * written into the image heap is then the default value for the field's type.
-     *
-     * This method is necessary for the handling of write-only fields: Not all write-only fields can
-     * be eliminated completely (see the comment in {@link #isAccessed}. But in the image heap, such
-     * field values do not need to be preserved because the write happens at image build time (so
-     * memory barriers are no issue) and the image heap is not garbage collected (so object
-     * reachability is no issue).
-     */
-    public boolean isInImageHeap() {
-        return isAccessed || isRead;
+    public boolean isRead() {
+        return AtomicUtils.isSet(this, isAccessedUpdater) || AtomicUtils.isSet(this, isReadUpdater);
+    }
+
+    public Object getReadReason() {
+        return isRead;
     }
 
     public boolean isWritten() {
-        return isAccessed || isWritten;
+        return AtomicUtils.isSet(this, isAccessedUpdater) || AtomicUtils.isSet(this, isWrittenUpdater);
     }
 
-    public void setCanBeNull(boolean canBeNull) {
-        this.canBeNull = canBeNull;
+    public Object getWrittenReason() {
+        return isWritten;
     }
 
-    public boolean canBeNull() {
-        return canBeNull;
+    public boolean isFolded() {
+        return AtomicUtils.isSet(this, isFoldedUpdater);
+    }
+
+    public Object getFoldedReason() {
+        return isFolded;
+    }
+
+    @Override
+    public boolean isReachable() {
+        return AtomicUtils.isSet(this, isAccessedUpdater) || AtomicUtils.isSet(this, isReadUpdater) ||
+                        AtomicUtils.isSet(this, isWrittenUpdater) || AtomicUtils.isSet(this, isFoldedUpdater);
+    }
+
+    @Override
+    public void onReachable(Object reason) {
+        registerAsTrackedAcrossLayers(reason);
+        notifyReachabilityCallbacks(declaringClass.getUniverse(), new ArrayList<>());
+    }
+
+    @Override
+    protected void onTrackedAcrossLayers(Object reason) {
+        AnalysisError.guarantee(!getUniverse().sealed(), "Field %s was marked as tracked after the universe was sealed", this);
+    }
+
+    public Object getFieldValueInterceptor() {
+        return fieldValueInterceptor;
+    }
+
+    public void setFieldValueInterceptor(Object fieldValueInterceptor) {
+        this.fieldValueInterceptor = fieldValueInterceptor;
     }
 
     @Override
@@ -370,12 +408,11 @@ public class AnalysisField implements ResolvedJavaField, OriginalFieldProvider {
     }
 
     public void setPosition(int newPosition) {
-        assert position == -1 || position == newPosition;
         this.position = newPosition;
     }
 
     public int getPosition() {
-        assert position != -1 : this;
+        AnalysisError.guarantee(position != -1, "Unknown position for field %s", this);
         return position;
     }
 
@@ -396,7 +433,7 @@ public class AnalysisField implements ResolvedJavaField, OriginalFieldProvider {
          * the hosting HotSpot VM, but it is safer to disallow the operation entirely. The offset
          * from the hosting VM can be accessed by explicitly calling `wrapped.getOffset()`.
          */
-        throw GraalError.shouldNotReachHere();
+        throw GraalError.unimplementedOverride(); // ExcludeFromJacocoGeneratedReport
     }
 
     @Override
@@ -420,35 +457,42 @@ public class AnalysisField implements ResolvedJavaField, OriginalFieldProvider {
     }
 
     @Override
-    public Annotation[] getAnnotations() {
-        return GuardedAnnotationAccess.getAnnotations(wrapped);
-    }
-
-    @Override
-    public Annotation[] getDeclaredAnnotations() {
-        return GuardedAnnotationAccess.getDeclaredAnnotations(wrapped);
-    }
-
-    @Override
-    public <T extends Annotation> T getAnnotation(Class<T> annotationClass) {
-        return GuardedAnnotationAccess.getAnnotation(wrapped, annotationClass);
-    }
-
-    @Override
     public String toString() {
-        return "AnalysisField<" + format("%h.%n") + " accessed: " + isAccessed + " reads: " + isRead + " written: " + isWritten + ">";
-    }
-
-    public void markAsUsedInComparison() {
-        isUsedInComparison = true;
-    }
-
-    public boolean isUsedInComparison() {
-        return isUsedInComparison;
+        return "AnalysisField<" + format("%h.%n") + " -> " + wrapped.toString() + ", accessed: " + (isAccessed != null) +
+                        ", read: " + (isRead != null) + ", written: " + (isWritten != null) + ", folded: " + isFolded() + ">";
     }
 
     @Override
-    public Field getJavaField() {
-        return OriginalFieldProvider.getJavaField(getDeclaringClass().universe.getOriginalSnippetReflection(), wrapped);
+    public ResolvedJavaField unwrapTowardsOriginalField() {
+        return wrapped;
+    }
+
+    @Override
+    public JavaConstant getConstantValue() {
+        return getUniverse().lookup(getWrapped().getConstantValue());
+    }
+
+    /**
+     * Ensure that all reachability handler that were present at the time the declaring type was
+     * marked as reachable are executed before accessing field values. This allows field value
+     * transformer to be installed reliably in reachability handler.
+     */
+    public void beforeFieldValueAccess() {
+        declaringClass.registerAsReachable(this);
+
+        declaringClass.forAllSuperTypes(type -> {
+            type.ensureOnTypeReachableTaskDone();
+
+            List<AnalysisFuture<Void>> notifications = type.scheduledTypeReachableNotifications;
+            if (notifications != null) {
+                for (var notification : notifications) {
+                    notification.ensureDone();
+                }
+                /*
+                 * Now we know all the handlers have been executed, no checks are necessary anymore.
+                 */
+                type.scheduledTypeReachableNotifications = null;
+            }
+        });
     }
 }

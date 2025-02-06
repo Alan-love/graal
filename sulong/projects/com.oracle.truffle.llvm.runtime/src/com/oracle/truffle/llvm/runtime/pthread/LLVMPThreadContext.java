@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, 2021, Oracle and/or its affiliates.
+ * Copyright (c) 2019, 2023, Oracle and/or its affiliates.
  *
  * All rights reserved.
  *
@@ -37,9 +37,11 @@ import java.util.concurrent.ConcurrentMap;
 import com.oracle.truffle.api.CallTarget;
 import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
 import com.oracle.truffle.api.TruffleLanguage;
+import com.oracle.truffle.llvm.runtime.LLVMContext;
 import com.oracle.truffle.llvm.runtime.LLVMLanguage;
 import com.oracle.truffle.llvm.runtime.datalayout.DataLayout;
-import com.oracle.truffle.llvm.runtime.nodes.intrinsics.multithreading.LLVMPThreadStart;
+import com.oracle.truffle.llvm.runtime.except.LLVMPolyglotException;
+import com.oracle.truffle.llvm.runtime.nodes.intrinsics.multithreading.LLVMThreadStart;
 import com.oracle.truffle.llvm.runtime.pointer.LLVMPointer;
 
 public final class LLVMPThreadContext {
@@ -51,8 +53,7 @@ public final class LLVMPThreadContext {
     private final Object threadLock;
 
     /**
-     * TODO GR-30833: At pthread_join, return values need to be cleared from the map of thread
-     * return values.
+     * At pthread_join, return values shall be cleared from this map of return values.
      */
     private final ConcurrentMap<Long, Object> threadReturnValueStorage;
 
@@ -89,21 +90,23 @@ public final class LLVMPThreadContext {
         this.pThreadKeyStorage = new ConcurrentHashMap<>();
         this.pThreadDestructorStorage = new ConcurrentHashMap<>();
 
-        this.pthreadCallTarget = language.createCachedCallTarget(LLVMPThreadStart.LLVMPThreadFunctionRootNode.class,
-                        l -> LLVMPThreadStart.LLVMPThreadFunctionRootNode.create(l, l.getActiveConfiguration().createNodeFactory(l, dataLayout)));
+        this.pthreadCallTarget = language.createCachedCallTarget(LLVMThreadStart.LLVMPThreadFunctionRootNode.class,
+                        l -> LLVMThreadStart.LLVMPThreadFunctionRootNode.create(l, l.getActiveConfiguration().createNodeFactory(l, dataLayout)));
         this.isCreateThreadAllowed = true;
     }
 
     @TruffleBoundary
     public void joinAllThreads() {
-        final Collection<WeakReference<Thread>> threadsToJoin;
+        final Collection<WeakReference<Thread>> threads;
+
         synchronized (threadLock) {
             this.isCreateThreadAllowed = false;
-            threadsToJoin = threadStorage.values();
+            threads = threadStorage.values();
         }
-        for (WeakReference<Thread> createdThread : threadsToJoin) {
+
+        for (WeakReference<Thread> thread : threads) {
             try {
-                Thread t = createdThread.get();
+                Thread t = thread.get();
                 if (t != null) {
                     t.join();
                 }
@@ -148,6 +151,7 @@ public final class LLVMPThreadContext {
     }
 
     @TruffleBoundary
+    @SuppressWarnings("deprecation") // GR-41711: we still need Thread.getId() for JDK17 support
     public LLVMPointer getSpecific(int keyId) {
         final ConcurrentMap<Long, LLVMPointer> value = pThreadKeyStorage.get(keyId);
         if (value != null) {
@@ -158,6 +162,7 @@ public final class LLVMPThreadContext {
     }
 
     @TruffleBoundary
+    @SuppressWarnings("deprecation") // GR-41711: we still need Thread.getId() for JDK17 support
     public boolean setSpecific(int keyId, LLVMPointer value) {
         final ConcurrentMap<Long, LLVMPointer> specificStore = pThreadKeyStorage.get(keyId);
         if (specificStore != null) {
@@ -168,10 +173,15 @@ public final class LLVMPThreadContext {
     }
 
     @TruffleBoundary
+    @SuppressWarnings("deprecation") // GR-41711: we still need Thread.getId() for JDK17 support
     public LLVMPointer getAndRemoveSpecificUnlessNull(int keyId) {
+        return getAndRemoveSpecificUnlessNull(keyId, Thread.currentThread().getId());
+    }
+
+    @TruffleBoundary
+    public LLVMPointer getAndRemoveSpecificUnlessNull(int keyId, long threadId) {
         final ConcurrentMap<Long, LLVMPointer> value = pThreadKeyStorage.get(keyId);
         if (value != null) {
-            final long threadId = Thread.currentThread().getId();
             final LLVMPointer keyMapping = value.get(threadId);
             if (keyMapping != null && !keyMapping.isNull()) {
                 value.remove(threadId);
@@ -187,10 +197,11 @@ public final class LLVMPThreadContext {
     }
 
     @TruffleBoundary
+    @SuppressWarnings("deprecation") // GR-41711: we still need Thread.getId() for JDK17 support
     public Thread createThread(Runnable runnable) {
         synchronized (threadLock) {
             if (isCreateThreadAllowed) {
-                final Thread thread = env.createThread(runnable);
+                final Thread thread = env.newTruffleThreadBuilder(runnable).build();
                 threadStorage.put(thread.getId(), new WeakReference<>(thread));
                 return thread;
             } else {
@@ -201,25 +212,56 @@ public final class LLVMPThreadContext {
 
     @TruffleBoundary
     public Thread getThread(long threadID) {
-        return threadStorage.get(threadID).get();
+        WeakReference<Thread> thread = threadStorage.get(threadID);
+        if (thread == null) {
+            return null;
+        }
+        return thread.get();
     }
 
     @TruffleBoundary
-    public void clearThreadId() {
-        threadStorage.remove(Thread.currentThread().getId());
+    public void clearThreadID(long threadID) {
+        threadStorage.remove(threadID);
     }
 
     @TruffleBoundary
-    public void setThreadReturnValue(long threadId, Object value) {
-        threadReturnValueStorage.put(threadId, value);
+    public void setThreadReturnValue(long threadID, Object value) {
+        threadReturnValueStorage.put(threadID, value);
     }
 
     @TruffleBoundary
-    public Object getThreadReturnValue(long threadId) {
-        return threadReturnValueStorage.get(threadId);
+    public Object getThreadReturnValue(long threadID) {
+        return threadReturnValueStorage.get(threadID);
+    }
+
+    @TruffleBoundary
+    public void clearThreadReturnValue(long threadID) {
+        threadReturnValueStorage.remove(threadID);
     }
 
     public CallTarget getPthreadCallTarget() {
         return pthreadCallTarget;
+    }
+
+    @SuppressWarnings("deprecation") // GR-41711: we still need Thread.getId() for JDK17 support
+    public void callDestructors(LLVMContext context) {
+        callDestructors(context, Thread.currentThread().getId());
+    }
+
+    public void callDestructors(LLVMContext context, long threadId) {
+        for (int key = 1; key <= getNumberOfPthreadKeys(); key++) {
+            final LLVMPointer destructor = getDestructor(key);
+            if (destructor != null && !destructor.isNull()) {
+                final LLVMPointer keyMapping = getAndRemoveSpecificUnlessNull(key, threadId);
+                if (keyMapping != null) {
+                    if (context.isFinalized()) {
+                        throw new LLVMPolyglotException(null,
+                                        "Tried to call a pthread destructor, but the LLVMContext has already been finalized. Ensure that the context is still alive and that the thread was created using the Truffle API.");
+                    }
+                    assert !keyMapping.isNull();
+                    getPthreadCallTarget().call(destructor, keyMapping);
+                }
+            }
+        }
     }
 }

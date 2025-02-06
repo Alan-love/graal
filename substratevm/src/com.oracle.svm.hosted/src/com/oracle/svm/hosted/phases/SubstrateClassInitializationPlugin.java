@@ -26,16 +26,16 @@ package com.oracle.svm.hosted.phases;
 
 import java.util.function.Supplier;
 
-import org.graalvm.compiler.nodes.ConstantNode;
-import org.graalvm.compiler.nodes.FrameState;
-import org.graalvm.compiler.nodes.ValueNode;
-import org.graalvm.compiler.nodes.graphbuilderconf.ClassInitializationPlugin;
-import org.graalvm.compiler.nodes.graphbuilderconf.GraphBuilderContext;
-
 import com.oracle.svm.core.classinitialization.EnsureClassInitializedNode;
-import com.oracle.svm.core.meta.SubstrateObjectConstant;
 import com.oracle.svm.hosted.SVMHost;
+import com.oracle.svm.hosted.classinitialization.ClassInitializationSupport;
 
+import jdk.graal.compiler.api.replacements.SnippetReflectionProvider;
+import jdk.graal.compiler.nodes.ConstantNode;
+import jdk.graal.compiler.nodes.FrameState;
+import jdk.graal.compiler.nodes.ValueNode;
+import jdk.graal.compiler.nodes.graphbuilderconf.ClassInitializationPlugin;
+import jdk.graal.compiler.nodes.graphbuilderconf.GraphBuilderContext;
 import jdk.vm.ci.meta.ConstantPool;
 import jdk.vm.ci.meta.JavaConstant;
 import jdk.vm.ci.meta.ResolvedJavaType;
@@ -59,31 +59,21 @@ public class SubstrateClassInitializationPlugin implements ClassInitializationPl
     }
 
     @Override
-    public boolean apply(GraphBuilderContext builder, ResolvedJavaType type, Supplier<FrameState> frameState, ValueNode[] classInit) {
-        if (needsRuntimeInitialization(builder.getMethod().getDeclaringClass(), type)) {
-            emitEnsureClassInitialized(builder, SubstrateObjectConstant.forObject(host.dynamicHub(type)));
-            /*
-             * The classInit value is only registered with Invoke nodes. Since we do not need that,
-             * we ensure it is null.
-             */
-            if (classInit != null) {
-                classInit[0] = null;
-            }
+    public boolean apply(GraphBuilderContext builder, ResolvedJavaType type, Supplier<FrameState> frameState) {
+        var requiredForTypeReached = ClassInitializationSupport.singleton().requiresInitializationNodeForTypeReached(type);
+        if (requiredForTypeReached ||
+                        EnsureClassInitializedNode.needsRuntimeInitialization(builder.getMethod().getDeclaringClass(), type)) {
+            assert !type.isArray() : "Array types must not have initialization nodes: " + type.getName();
+            SnippetReflectionProvider snippetReflection = builder.getSnippetReflection();
+            emitEnsureClassInitialized(builder, snippetReflection.forObject(host.dynamicHub(type)), frameState.get());
             return true;
         }
         return false;
     }
 
-    public static void emitEnsureClassInitialized(GraphBuilderContext builder, JavaConstant hubConstant) {
+    private static void emitEnsureClassInitialized(GraphBuilderContext builder, JavaConstant hubConstant, FrameState frameState) {
         ValueNode hub = ConstantNode.forConstant(hubConstant, builder.getMetaAccess(), builder.getGraph());
-        builder.add(new EnsureClassInitializedNode(hub));
-    }
-
-    /**
-     * Return true if the type needs to be initialized at run time, i.e., it has not been already
-     * initialized during image generation.
-     */
-    static boolean needsRuntimeInitialization(ResolvedJavaType declaringClass, ResolvedJavaType type) {
-        return !declaringClass.equals(type) && !type.isInitialized() && !type.isArray();
+        EnsureClassInitializedNode node = new EnsureClassInitializedNode(hub, frameState);
+        builder.canonicalizeAndAdd(node);
     }
 }

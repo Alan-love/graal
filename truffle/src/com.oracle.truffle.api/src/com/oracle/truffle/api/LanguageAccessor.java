@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2014, 2023, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -44,33 +44,34 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.URI;
 import java.nio.charset.Charset;
-import java.nio.file.FileSystemNotFoundException;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Iterator;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.BooleanSupplier;
 import java.util.logging.Level;
 
 import org.graalvm.options.OptionDescriptor;
 import org.graalvm.options.OptionDescriptors;
 import org.graalvm.options.OptionValues;
+import org.graalvm.polyglot.SandboxPolicy;
 import org.graalvm.polyglot.io.FileSystem;
 
 import com.oracle.truffle.api.TruffleLanguage.ContextLocalFactory;
 import com.oracle.truffle.api.TruffleLanguage.ContextThreadLocalFactory;
 import com.oracle.truffle.api.TruffleLanguage.Env;
+import com.oracle.truffle.api.TruffleLogger.LoggerCache;
 import com.oracle.truffle.api.frame.Frame;
 import com.oracle.truffle.api.frame.MaterializedFrame;
 import com.oracle.truffle.api.impl.Accessor;
 import com.oracle.truffle.api.nodes.ExecutableNode;
 import com.oracle.truffle.api.nodes.LanguageInfo;
 import com.oracle.truffle.api.nodes.Node;
-import com.oracle.truffle.api.nodes.RootNode;
 import com.oracle.truffle.api.source.Source;
-import com.oracle.truffle.api.source.SourceSection;
 
 final class LanguageAccessor extends Accessor {
 
@@ -79,9 +80,11 @@ final class LanguageAccessor extends Accessor {
     static final NodeSupport NODES = ACCESSOR.nodeSupport();
     static final SourceSupport SOURCE = ACCESSOR.sourceSupport();
     static final InstrumentSupport INSTRUMENT = ACCESSOR.instrumentSupport();
-    static final JDKSupport JDK = ACCESSOR.jdkSupport();
     static final EngineSupport ENGINE = ACCESSOR.engineSupport();
     static final InteropSupport INTEROP = ACCESSOR.interopSupport();
+    static final RuntimeSupport RUNTIME = ACCESSOR.runtimeSupport();
+    static final ExceptionSupport EXCEPTIONS = ACCESSOR.exceptionSupport();
+    static final HostSupport HOST = ACCESSOR.hostSupport();
 
     private LanguageAccessor() {
     }
@@ -102,16 +105,12 @@ final class LanguageAccessor extends Accessor {
         return ACCESSOR.interopSupport();
     }
 
-    static ExceptionSupport exceptionAccess() {
-        return ACCESSOR.exceptionSupport();
-    }
-
     static IOSupport ioAccess() {
         return ACCESSOR.ioSupport();
     }
 
-    static JDKSupport jdkServicesAccessor() {
-        return ACCESSOR.jdkSupport();
+    static HostSupport hostAccess() {
+        return ACCESSOR.hostSupport();
     }
 
     static final class LanguageImpl extends LanguageSupport {
@@ -132,8 +131,8 @@ final class LanguageAccessor extends Accessor {
         }
 
         @Override
-        public void materializeHostFrames(Throwable original) {
-            TruffleStackTrace.materializeHostFrames(original);
+        public Throwable getOrCreateLazyStackTrace(Throwable t) {
+            return TruffleStackTrace.getOrCreateLazyStackTrace(t);
         }
 
         @Override
@@ -146,30 +145,31 @@ final class LanguageAccessor extends Accessor {
             return info.getPolyglotInstrument();
         }
 
+        @SuppressWarnings("unchecked")
         @Override
         public void initializeLanguage(TruffleLanguage<?> impl, LanguageInfo language, Object polyglotLanguage, Object polyglotLanguageInstance) {
             impl.languageInfo = language;
-            impl.reference = engineAccess().getCurrentContextReference(polyglotLanguage);
             impl.polyglotLanguageInstance = polyglotLanguageInstance;
-            if (impl.contextLocals == null) {
-                impl.contextLocals = Collections.emptyList();
-            } else {
-                ENGINE.initializeLanguageContextLocal(impl.contextLocals, polyglotLanguageInstance);
-                impl.contextLocals = Collections.unmodifiableList(impl.contextLocals);
-            }
-            if (impl.contextThreadLocals == null) {
-                impl.contextThreadLocals = Collections.emptyList();
-            } else {
-                ENGINE.initializeLanguageContextThreadLocal(impl.contextThreadLocals, polyglotLanguageInstance);
-                impl.contextThreadLocals = Collections.unmodifiableList(impl.contextThreadLocals);
+            if (polyglotLanguageInstance != null) {
+                if (impl.locals.contextLocals == null) {
+                    impl.locals.contextLocals = Collections.emptyList();
+                } else {
+                    ENGINE.initializeLanguageContextLocal(impl.locals.contextLocals, polyglotLanguageInstance);
+                    impl.locals.contextLocals = Collections.unmodifiableList(impl.locals.contextLocals);
+                }
+                if (impl.locals.contextThreadLocals == null) {
+                    impl.locals.contextThreadLocals = Collections.emptyList();
+                } else {
+                    ENGINE.initializeLanguageContextThreadLocal(impl.locals.contextThreadLocals, polyglotLanguageInstance);
+                    impl.locals.contextThreadLocals = Collections.unmodifiableList(impl.locals.contextThreadLocals);
+                }
             }
         }
 
         @SuppressWarnings("deprecation")
         @Override
-        public boolean initializeMultiContext(TruffleLanguage<?> language) {
+        public void initializeMultiContext(TruffleLanguage<?> language) {
             language.initializeMultipleContexts();
-            return language.initializeMultiContext();
         }
 
         @Override
@@ -196,27 +196,15 @@ final class LanguageAccessor extends Accessor {
         public Object getLanguageView(Env env, Object value) {
             Object c = env.getLanguageContext();
             if (c == TruffleLanguage.Env.UNSET_CONTEXT) {
-                CompilerDirectives.transferToInterpreter();
+                CompilerDirectives.transferToInterpreterAndInvalidate();
                 return null;
             } else {
                 Object result = env.getSpi().getLanguageView(c, value);
                 if (result == null) {
-                    return LanguageAccessor.engineAccess().getDefaultLanguageView(env.spi, c, value);
+                    return LanguageAccessor.engineAccess().getDefaultLanguageView(env.spi, value);
                 } else {
                     return result;
                 }
-            }
-        }
-
-        @Override
-        @SuppressWarnings("deprecation")
-        public Object getLegacyScopedView(Env env, Node location, Frame frame, Object value) {
-            Object c = env.getLanguageContext();
-            if (c == TruffleLanguage.Env.UNSET_CONTEXT) {
-                CompilerDirectives.transferToInterpreter();
-                return value;
-            } else {
-                return env.getSpi().getScopedView(c, location, frame, value);
             }
         }
 
@@ -228,7 +216,7 @@ final class LanguageAccessor extends Accessor {
                 return null;
             } else {
                 Object result = env.getSpi().getScope(c);
-                assert ACCESSOR.interopSupport().isScopeObject(result) : String.format("%s is not a scope", result);
+                assert result == null || ACCESSOR.interopSupport().isScopeObject(result) : String.format("%s is not a scope", result);
                 return result;
             }
         }
@@ -268,8 +256,7 @@ final class LanguageAccessor extends Accessor {
                         OptionValues options, String[] applicationArguments) {
             TruffleLanguage.Env env = new TruffleLanguage.Env(polyglotLanguageContext, language, stdOut, stdErr, stdIn, config, options, applicationArguments);
             LinkedHashSet<Object> collectedServices = new LinkedHashSet<>();
-            LanguageInfo info = language.languageInfo;
-            instrumentAccess().collectEnvServices(collectedServices, ACCESSOR.nodeSupport().getPolyglotLanguage(info), language);
+            instrumentAccess().collectEnvServices(collectedServices, polyglotLanguageContext, language);
             env.services = new ArrayList<>(collectedServices);
             return env;
         }
@@ -291,8 +278,8 @@ final class LanguageAccessor extends Accessor {
         }
 
         @Override
-        public TruffleContext createTruffleContext(Object impl, boolean creator) {
-            return new TruffleContext(impl, creator);
+        public TruffleContext createTruffleContext(Object impl, TruffleContext parentContext) {
+            return new TruffleContext(impl, parentContext);
         }
 
         @Override
@@ -307,13 +294,13 @@ final class LanguageAccessor extends Accessor {
 
         @Override
         @SuppressWarnings("unused")
-        public CallTarget parse(TruffleLanguage.Env env, Source code, Node context, String... argumentNames) {
-            return env.getSpi().parse(code, argumentNames);
+        public CallTarget parse(TruffleLanguage.Env env, Source code, OptionValues optionValues, Node context, String... argumentNames) {
+            return env.getSpi().parse(code, optionValues, argumentNames);
         }
 
         @Override
-        public ExecutableNode parseInline(TruffleLanguage.Env env, Source code, Node context, MaterializedFrame frame) {
-            return env.getSpi().parseInline(code, context, frame);
+        public ExecutableNode parseInline(TruffleLanguage.Env env, Source code, OptionValues optionValues, Node context, MaterializedFrame frame) {
+            return env.getSpi().parseInline(code, optionValues, context, frame);
         }
 
         @Override
@@ -322,7 +309,7 @@ final class LanguageAccessor extends Accessor {
         }
 
         @Override
-        public void onThrowable(Node callNode, RootCallTarget root, Throwable e, Frame frame) {
+        public void addStackFrameInfo(Node callNode, RootCallTarget root, Throwable e, Frame frame) {
             TruffleStackTrace.addStackFrameInfo(callNode, root, e, frame);
         }
 
@@ -347,31 +334,18 @@ final class LanguageAccessor extends Accessor {
         }
 
         @Override
+        public void exitContext(Env env, TruffleLanguage.ExitMode exitMode, int exitCode) {
+            env.getSpi().exitContext(env.context, exitMode, exitCode);
+        }
+
+        @Override
+        public void finalizeThread(TruffleLanguage.Env env, Thread current) {
+            env.getSpi().finalizeThread(env.context, current);
+        }
+
+        @Override
         public void disposeThread(TruffleLanguage.Env env, Thread current) {
             env.getSpi().disposeThread(env.context, current);
-        }
-
-        @Override
-        public Object evalInContext(Source source, Node node, final MaterializedFrame mFrame) {
-            CallTarget target = ACCESSOR.nodeSupport().getLanguage(node.getRootNode()).parse(source);
-            try {
-                if (target instanceof RootCallTarget) {
-                    RootNode exec = ((RootCallTarget) target).getRootNode();
-                    return exec.execute(mFrame);
-                } else {
-                    throw new IllegalStateException("" + target);
-                }
-            } catch (Exception ex) {
-                if (ex instanceof RuntimeException) {
-                    throw (RuntimeException) ex;
-                }
-                throw new RuntimeException(ex);
-            }
-        }
-
-        @Override
-        public Object findExportedSymbol(TruffleLanguage.Env env, String globalName, boolean onlyExplicit) {
-            return env.findExportedSymbol(globalName, onlyExplicit);
         }
 
         @Override
@@ -398,58 +372,18 @@ final class LanguageAccessor extends Accessor {
         }
 
         @Override
-        public String legacyToString(TruffleLanguage.Env env, Object value) {
-            return env.toStringIfVisible(value, false);
-        }
-
-        @Override
-        public Object legacyFindMetaObject(TruffleLanguage.Env env, Object obj) {
-            return env.findMetaObjectImpl(obj);
-        }
-
-        @Override
-        public SourceSection legacyFindSourceLocation(TruffleLanguage.Env env, Object obj) {
-            return env.findSourceLocation(obj);
-        }
-
-        @Override
-        public boolean isObjectOfLanguage(TruffleLanguage.Env env, Object value) {
-            return env.isObjectOfLanguage(value);
-        }
-
-        @SuppressWarnings("deprecation")
-        @Override
-        public <C> Object legacyFindMetaObject(TruffleLanguage<C> language, C context, Object value) {
-            return language.findMetaObject(context, value);
-        }
-
-        @SuppressWarnings("deprecation")
-        @Override
-        public <C> SourceSection legacyFindSourceLocation(TruffleLanguage<C> language, C context, Object value) {
-            return language.findSourceLocation(context, value);
-        }
-
-        @SuppressWarnings("deprecation")
-        @Override
-        public <C> String legacyToString(TruffleLanguage<C> language, C context, Object obj) {
-            return language.toString(context, obj);
-        }
-
-        @Override
-        @SuppressWarnings("deprecation")
-        public Iterable<Scope> findLegacyLocalScopes(TruffleLanguage.Env env, Node node, Frame frame) {
-            return env.findLocalScopes(node, frame);
-        }
-
-        @Override
-        @SuppressWarnings("deprecation")
-        public Iterable<Scope> findTopScopes(TruffleLanguage.Env env) {
-            return env.findTopScopes();
-        }
-
-        @Override
         public OptionDescriptors describeOptions(TruffleLanguage<?> language, String requiredGroup) {
             OptionDescriptors descriptors = language.getOptionDescriptors();
+            if (descriptors == null) {
+                return OptionDescriptors.EMPTY;
+            }
+            assert verifyDescriptors(language, requiredGroup, descriptors);
+            return descriptors;
+        }
+
+        @Override
+        public OptionDescriptors describeSourceOptions(TruffleLanguage<?> language, String requiredGroup) {
+            OptionDescriptors descriptors = language.getSourceOptionDescriptors();
             if (descriptors == null) {
                 return OptionDescriptors.EMPTY;
             }
@@ -518,12 +452,13 @@ final class LanguageAccessor extends Accessor {
         }
 
         @Override
-        public void configureLoggers(Object polyglotContext, Map<String, Level> logLevels, Object... loggers) {
-            for (Object loggerCache : loggers) {
+        public void configureLoggers(Object vmObject, Map<String, Level> logLevels, Object... loggers) {
+            for (Object logger : loggers) {
+                TruffleLogger.LoggerCache loggerCache = (TruffleLogger.LoggerCache) logger;
                 if (logLevels == null) {
-                    ((TruffleLogger.LoggerCache) loggerCache).removeLogLevelsForContext(polyglotContext);
-                } else {
-                    ((TruffleLogger.LoggerCache) loggerCache).addLogLevelsForContext(polyglotContext, logLevels);
+                    loggerCache.removeLogLevelsForVMObject(vmObject);
+                } else if (!logLevels.isEmpty() || !ENGINE.isContextBoundLogger(loggerCache.getSPI())) {
+                    loggerCache.addLogLevelsForVMObject(vmObject, logLevels);
                 }
             }
         }
@@ -545,24 +480,21 @@ final class LanguageAccessor extends Accessor {
         }
 
         @Override
-        public TruffleFile getTruffleFile(Object fileSystemContext, URI uri) {
+        public TruffleFile getTruffleFile(Path path, Object fileSystemContext) {
             TruffleFile.FileSystemContext ctx = (TruffleFile.FileSystemContext) fileSystemContext;
-            try {
-                return new TruffleFile(ctx, ctx.fileSystem.parsePath(uri));
-            } catch (UnsupportedOperationException e) {
-                throw new FileSystemNotFoundException("FileSystem for: " + uri.getScheme() + " scheme is not supported.");
-            }
+            return new TruffleFile(ctx, path);
         }
 
         @Override
-        public boolean hasAllAccess(Object fileSystemContext) {
+        public TruffleFile getTruffleFile(URI uri, Object fileSystemContext) {
             TruffleFile.FileSystemContext ctx = (TruffleFile.FileSystemContext) fileSystemContext;
-            return engineAccess().hasAllAccess(ctx.fileSystem);
+            return new TruffleFile(ctx, ctx.fileSystem.parsePath(uri));
         }
 
         @Override
-        public TruffleFile getTruffleFile(Object context, String path) {
-            return getTruffleFile(path, context);
+        public boolean isSocketIOAllowed(Object fileSystemContext) {
+            TruffleFile.FileSystemContext ctx = (TruffleFile.FileSystemContext) fileSystemContext;
+            return engineAccess().isSocketIOAllowed(ctx.engineObject);
         }
 
         @Override
@@ -571,8 +503,8 @@ final class LanguageAccessor extends Accessor {
         }
 
         @Override
-        public Object createEngineLoggers(Object spi, Map<String, Level> logLevels) {
-            return TruffleLogger.createLoggerCache(spi, logLevels);
+        public Object createEngineLoggers(Object spi) {
+            return new LoggerCache(spi);
         }
 
         @Override
@@ -588,6 +520,11 @@ final class LanguageAccessor extends Accessor {
         @Override
         public TruffleLogger getLogger(String id, String loggerName, Object loggers) {
             return TruffleLogger.getLogger(id, loggerName, (TruffleLogger.LoggerCache) loggers);
+        }
+
+        @Override
+        public Object getLoggerCache(TruffleLogger logger) {
+            return logger.getLoggerCache();
         }
 
         @Override
@@ -611,9 +548,83 @@ final class LanguageAccessor extends Accessor {
         }
 
         @Override
+        public boolean isRecurringTLAction(ThreadLocalAction action) {
+            return action.isRecurring();
+        }
+
+        @Override
         public void performTLAction(ThreadLocalAction action, ThreadLocalAction.Access access) {
             action.perform(access);
         }
 
+        @Override
+        public void notifyTLActionBlocked(ThreadLocalAction action, ThreadLocalAction.Access access, boolean blocked) {
+            if (blocked) {
+                action.notifyBlocked(access);
+            } else {
+                action.notifyUnblocked(access);
+            }
+        }
+
+        @Override
+        public OptionDescriptors createOptionDescriptorsUnion(OptionDescriptors... descriptors) {
+            return switch (descriptors.length) {
+                case 0 -> OptionDescriptors.EMPTY;
+                case 1 -> descriptors[0];
+                default -> {
+                    OptionDescriptors singleNonEmpty = null;
+                    for (OptionDescriptors d : descriptors) {
+                        if (d != OptionDescriptors.EMPTY) {
+                            if (singleNonEmpty == null) {
+                                singleNonEmpty = d;
+                            } else {
+                                yield new UnionTruffleOptionDescriptors(descriptors);
+                            }
+                        }
+                    }
+                    yield singleNonEmpty != null ? singleNonEmpty : OptionDescriptors.EMPTY;
+                }
+            };
+        }
+
+        @Override
+        public InternalResource.Env createInternalResourceEnv(InternalResource resource, BooleanSupplier contextPreinitializationCheck) {
+            return new InternalResource.Env(resource, contextPreinitializationCheck);
+        }
+    }
+
+    private static final class UnionTruffleOptionDescriptors implements TruffleOptionDescriptors {
+
+        private final OptionDescriptors delegate;
+        private final OptionDescriptors[] descriptorsList;
+
+        UnionTruffleOptionDescriptors(OptionDescriptors[] descriptorsList) {
+            this.delegate = OptionDescriptors.createUnion(descriptorsList);
+            this.descriptorsList = descriptorsList;
+        }
+
+        @Override
+        public Iterator<OptionDescriptor> iterator() {
+            return delegate.iterator();
+        }
+
+        @Override
+        public OptionDescriptor get(String optionName) {
+            return delegate.get(optionName);
+        }
+
+        @Override
+        public SandboxPolicy getSandboxPolicy(String key) {
+            for (OptionDescriptors descriptors : descriptorsList) {
+                if (descriptors.get(key) != null) {
+                    if (descriptors instanceof TruffleOptionDescriptors) {
+                        return ((TruffleOptionDescriptors) descriptors).getSandboxPolicy(key);
+                    } else {
+                        return SandboxPolicy.TRUSTED;
+                    }
+                }
+            }
+            return null;
+        }
     }
 }

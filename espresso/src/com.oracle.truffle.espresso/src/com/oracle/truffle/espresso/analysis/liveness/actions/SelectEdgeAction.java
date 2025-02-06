@@ -24,11 +24,13 @@
 package com.oracle.truffle.espresso.analysis.liveness.actions;
 
 import com.oracle.truffle.api.CompilerDirectives.CompilationFinal;
+import com.oracle.truffle.api.frame.VirtualFrame;
 import com.oracle.truffle.api.nodes.ExplodeLoop;
+import com.oracle.truffle.espresso.analysis.frame.EspressoFrameDescriptor.Builder;
 import com.oracle.truffle.espresso.analysis.liveness.EdgeAction;
 import com.oracle.truffle.espresso.analysis.liveness.LocalVariableAction;
 
-public class SelectEdgeAction implements EdgeAction {
+public final class SelectEdgeAction implements EdgeAction {
     @CompilationFinal(dimensions = 1) //
     private final int[] from;
     @CompilationFinal(dimensions = 1) //
@@ -39,11 +41,21 @@ public class SelectEdgeAction implements EdgeAction {
         this.actions = actions;
     }
 
+    @Override
     @ExplodeLoop
-    public void onEdge(long[] primitives, Object[] refs, int fromBCI) {
+    public void onEdge(VirtualFrame frame, int fromBCI) {
         for (int i = 0; i < from.length; i++) {
             if (from[i] == fromBCI) {
-                actions[i].execute(primitives, refs);
+                actions[i].execute(frame);
+            }
+        }
+    }
+
+    @Override
+    public void onEdge(Builder frame, int fromBCI) {
+        for (int i = 0; i < from.length; i++) {
+            if (from[i] == fromBCI) {
+                actions[i].execute(frame);
             }
         }
     }

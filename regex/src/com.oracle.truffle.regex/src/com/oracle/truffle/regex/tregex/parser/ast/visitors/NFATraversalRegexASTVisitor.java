@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -40,18 +40,17 @@
  */
 package com.oracle.truffle.regex.tregex.parser.ast.visitors;
 
+import static com.oracle.truffle.regex.tregex.util.MathUtil.saturatingInc;
+
 import java.util.Arrays;
 import java.util.Set;
 
-import org.graalvm.collections.EconomicMap;
+import org.graalvm.collections.EconomicSet;
 
 import com.oracle.truffle.api.CompilerDirectives;
-import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
-import com.oracle.truffle.regex.UnsupportedRegexException;
-import com.oracle.truffle.regex.tregex.automaton.StateSet;
 import com.oracle.truffle.regex.tregex.buffer.LongArrayBuffer;
-import com.oracle.truffle.regex.tregex.buffer.ObjectArrayBuffer;
-import com.oracle.truffle.regex.tregex.nfa.QuantifierGuard;
+import com.oracle.truffle.regex.tregex.nfa.ASTStepVisitor;
+import com.oracle.truffle.regex.tregex.nfa.TransitionGuard;
 import com.oracle.truffle.regex.tregex.parser.Token.Quantifier;
 import com.oracle.truffle.regex.tregex.parser.ast.CharacterClass;
 import com.oracle.truffle.regex.tregex.parser.ast.Group;
@@ -65,7 +64,7 @@ import com.oracle.truffle.regex.tregex.parser.ast.RegexAST;
 import com.oracle.truffle.regex.tregex.parser.ast.RegexASTNode;
 import com.oracle.truffle.regex.tregex.parser.ast.Sequence;
 import com.oracle.truffle.regex.tregex.parser.ast.Term;
-import com.oracle.truffle.regex.tregex.parser.flavors.RubyFlavor;
+import com.oracle.truffle.regex.tregex.parser.flavors.RegexFlavor;
 import com.oracle.truffle.regex.util.TBitSet;
 
 /**
@@ -86,14 +85,14 @@ import com.oracle.truffle.regex.util.TBitSet;
  * 3.: "c"
  * }
  * </pre>
- *
+ * <p>
  * For every successor, the visitor will find the full path of AST nodes that have been traversed
  * from the initial node to the successor node, where {@link Group} nodes are treated specially: The
  * path will contain separate entries for <em>entering</em> and <em>leaving</em> a {@link Group},
- * and a special <em>pass-through</em> node for empty sequences of {@link Group}s marked with
- * {@link Group#isExpandedQuantifier()}. Furthermore, the visitor will not descend into lookaround
- * assertions, it will jump over them and just add their corresponding {@link LookAheadAssertion} or
- * {@link LookBehindAssertion} node to the path.
+ * and a special <em>pass-through</em> node for empty sequences marked with
+ * {@link Sequence#isQuantifierPassThroughSequence()}. Furthermore, the visitor will not descend
+ * into lookaround assertions, it will jump over them and just add their corresponding
+ * {@link LookAheadAssertion} or {@link LookBehindAssertion} node to the path.
  *
  * <pre>
  * {@code
@@ -111,12 +110,6 @@ import com.oracle.truffle.regex.util.TBitSet;
  */
 public abstract class NFATraversalRegexASTVisitor {
 
-    /**
-     * Bailout threshold for the number of successors eliminated by de-duplication so far. This is
-     * necessary for expressions with an exponential number of possible paths, like
-     * {@code /(a?|b?|c?|d?|e?|f?|g?)(a?|b?|c?|d?|e?|f?|g?)(a?|b?|c?|d?|e?|f?|g?)/}.
-     */
-    private static final int SUCCESSOR_DEDUPLICATION_BAILOUT_THRESHOLD = 100_000;
     protected final RegexAST ast;
     private Term root;
     /**
@@ -127,67 +120,101 @@ public abstract class NFATraversalRegexASTVisitor {
      */
     private final LongArrayBuffer curPath = new LongArrayBuffer(8);
     /**
-     * insideLoops is the multiset of looping groups that we are currently inside of. We need to
-     * maintain this in order to detect infinite loops in the NFA traversal. If we enter a looping
-     * group, traverse it without encountering a CharacterClass node or a MatchFound node and arrive
-     * back at the same group, then we are bound to loop like this forever. Using insideLoops, we
-     * can detect this situation and proceed with the search using another alternative. For example,
-     * in the RegexAST {@code ((|[a])*|)*}, which corresponds to the regex {@code /(a*?)* /}, we can
-     * traverse the inner loop, {@code (|[a])*}, without hitting any CharacterClass node by choosing
-     * the first alternative and we will then arrive back at the outer loop. There, we detect an
-     * infinite loop, which causes us to backtrack and choose the second alternative in the inner
-     * loop, leading us to the CharacterClass node {@code [a]}. <br>
-     * This is a multiset, because in some cases, we want to admit one empty traversal through a
-     * loop, but still disallow any further iterations to prevent infinite loops. The value stored
-     * in this map tells us how many times we have entered the current search. <br>
-     * NB: For every looping group, this map tells us how many {@code enter} nodes there are on the
-     * current path.
-     */
-    private final EconomicMap<RegexASTNode, Integer> insideLoops;
-    /**
      * This set is needed to make sure that a quantified term cannot match the empty string, as is
      * specified in step 2a of RepeatMatcher from ECMAScript draft 2018, chapter 21.2.2.5.1.
      */
-    private final StateSet<RegexAST, Group> insideEmptyGuardGroup;
+    private final TBitSet insideEmptyGuardGroup;
     private RegexASTNode cur;
     private Set<LookBehindAssertion> traversableLookBehindAssertions;
     private boolean canTraverseCaret = false;
+    private boolean ignoreMatchBoundaryAssertions = false;
+    private TBitSet matchedConditionGroups;
     private boolean forward = true;
     private boolean done = false;
+    /**
+     * This is set to true whenever a nested call discovers that the current path is dead. One of
+     * the top-levels methods should check for this flag regularly and back-track if needed.
+     */
+    private boolean shouldRetreat = false;
+    private boolean recalcTransitionGuards = false;
 
     /**
      * The exhaustive path traversal may result in some duplicate successors, e.g. on a regex like
-     * {@code /(a?|b?)(a?|b?)/}. We consider two successors as identical if they go through the same
-     * {@link PositionAssertion dollar-assertions} and {@link LookAroundAssertion}s, and their final
-     * {@link CharacterClass} / {@link MatchFound} node is the same.
+     * {@code /(a?|b?)(a?|b?)/}. In order to avoid a combinatorial explosion of duplicate
+     * successors, we prune the search for successors whenever we enter into a state that is
+     * equivalent to one visited before. In order for two traversal states to be considered
+     * equivalent, they must be equal in the following parameters:
+     * <ul>
+     * <li>the {@link #cur current node}</li>
+     * <li>the set of traversed {@link PositionAssertion position assertions}</li>
+     * <li>the set of traversed {@link LookAroundAssertion}s</li>
+     * <li>the {@link TransitionGuard}s incurred by the traversal</li>
+     * <li>the resulting {@link GroupBoundaries} (updates, clears, last group)</li>
+     * </ul>
+     * Deduplication is performed when {@link #cur the current node} is updated. However, in order
+     * to reduce this costly operation, we only deduplicate when update {@link #cur the current
+     * node} to a {@link Sequence}. This is sufficient for our purposes since runaway traversals
+     * will need to regularly enter new {@link Sequence} nodes. NB: It also simplifies the
+     * equivalence test for {@link DeduplicationKey}, because if we considered {@link Group}s, we
+     * would need to distinguish the current alternative index stored in the last element of
+     * {@link #curPath}.
      */
-    private final EconomicMap<StateSet<RegexAST, RegexASTNode>, StateSet<RegexAST, RegexASTNode>> targetDeduplicationMap = EconomicMap.create();
-    private final StateSet<RegexAST, RegexASTNode> lookAroundsOnPath;
-    private final StateSet<RegexAST, RegexASTNode> dollarsOnPath;
-    private final StateSet<RegexAST, RegexASTNode> targetsVisited;
-    private final int[] nodeVisitCount;
-    private int deduplicatedTargets = 0;
+    private final EconomicSet<DeduplicationKey> pathDeduplicationSet = EconomicSet.create();
+    private final LongArrayBuffer dedupKey = new LongArrayBuffer(8);
 
+    private final TBitSet lookAroundsOnPath;
+    private int dollarsOnPath = 0;
+    private int caretsOnPath = 0;
+    private int matchBeginAssertionsOnPath = 0;
+    private int matchEndAssertionsOnPath = 0;
+    private final int[] lookAroundVisitedCount;
     private final TBitSet captureGroupUpdates;
     private final TBitSet captureGroupClears;
+    private final TBitSet referencedGroupBoundaries;
+    private int firstGroup = -1;
+    private int lastGroup = -1;
+    /**
+     * Per-quantifier position of last quantified group exit or escape in the transition guards
+     * array.
+     */
+    private final int[] bqLastCounterReset;
+    /**
+     * Per-quantifier position of last quantified group zero-width-enter guard in the transition
+     * guards array.
+     */
+    private final int[] bqLastZeroWidthEnter;
+    /**
+     * Tracks whether a given quantifier has been exited "normally" on the current path.
+     */
+    private final TBitSet bqExited;
+    /**
+     * Tracks whether a given quantifier has been bypassed using either a group passthrough or a
+     * group escape on the current path.
+     */
+    private final TBitSet bqBypassed;
+    private final TBitSet referencedCaptureGroupsTmp;
 
-    private final ObjectArrayBuffer<QuantifierGuard> quantifierGuards = new ObjectArrayBuffer<>();
-    private QuantifierGuard[] quantifierGuardsResult = null;
-    private final TBitSet quantifierGuardsLoop;
-    private final TBitSet quantifierGuardsExited;
+    private final LongArrayBuffer transitionGuards = new LongArrayBuffer(8);
+    private final LongArrayBuffer transitionGuardsCanonicalized = new LongArrayBuffer(8);
+    private long[] transitionGuardsResult = null;
 
     protected NFATraversalRegexASTVisitor(RegexAST ast) {
         this.ast = ast;
-        this.insideLoops = EconomicMap.create();
-        this.insideEmptyGuardGroup = StateSet.create(ast);
-        this.targetsVisited = StateSet.create(ast);
-        this.lookAroundsOnPath = StateSet.create(ast);
-        this.dollarsOnPath = StateSet.create(ast);
-        this.nodeVisitCount = new int[ast.getNumberOfStates()];
+        this.insideEmptyGuardGroup = new TBitSet(ast.getGroupsWithGuards().size());
+        this.lookAroundsOnPath = new TBitSet(ast.getSubtrees().size());
+        this.lookAroundVisitedCount = new int[ast.getSubtrees().size()];
         this.captureGroupUpdates = new TBitSet(ast.getNumberOfCaptureGroups() * 2);
         this.captureGroupClears = new TBitSet(ast.getNumberOfCaptureGroups() * 2);
-        this.quantifierGuardsLoop = new TBitSet(ast.getQuantifierCount().getCount());
-        this.quantifierGuardsExited = new TBitSet(ast.getQuantifierCount().getCount());
+        this.referencedGroupBoundaries = new TBitSet(ast.getNumberOfCaptureGroups() * 2);
+        this.bqLastCounterReset = new int[ast.getQuantifierCount()];
+        this.bqLastZeroWidthEnter = new int[ast.getGroupsWithGuards().size()];
+        this.bqExited = new TBitSet(ast.getGroupsWithGuards().size());
+        this.bqBypassed = new TBitSet(ast.getGroupsWithGuards().size());
+        for (int i : ast.getReferencedGroups()) {
+            referencedGroupBoundaries.set(Group.groupNumberToBoundaryIndexStart(i));
+            referencedGroupBoundaries.set(Group.groupNumberToBoundaryIndexEnd(i));
+        }
+        this.referencedCaptureGroupsTmp = new TBitSet(ast.getNumberOfCaptureGroups());
     }
 
     public Set<LookBehindAssertion> getTraversableLookBehindAssertions() {
@@ -206,55 +233,132 @@ public abstract class NFATraversalRegexASTVisitor {
         this.canTraverseCaret = canTraverseCaret;
     }
 
-    public void setReverse() {
-        this.forward = false;
+    public void setIgnoreMatchBoundaryAssertions(boolean ignoreMatchBoundaryAssertions) {
+        this.ignoreMatchBoundaryAssertions = ignoreMatchBoundaryAssertions;
     }
 
-    protected abstract boolean canTraverseLookArounds();
+    public void setMatchedConditionGroups(TBitSet matchedConditionGroups) {
+        this.matchedConditionGroups = matchedConditionGroups;
+    }
+
+    public TBitSet getMatchedConditionGroups() {
+        assert isBuildingDFA();
+        return matchedConditionGroups;
+    }
+
+    protected TBitSet getCurrentMatchedConditionGroups() {
+        assert isBuildingDFA();
+        if (!ast.getProperties().hasConditionalBackReferences()) {
+            return matchedConditionGroups;
+        }
+        TBitSet currentMatchedConditionGroups = matchedConditionGroups.copy();
+        for (int conditionGroup : ast.getConditionGroups()) {
+            if (getCaptureGroupClears().get(Group.groupNumberToBoundaryIndexEnd(conditionGroup))) {
+                currentMatchedConditionGroups.clear(conditionGroup);
+            }
+            if (getCaptureGroupUpdates().get(Group.groupNumberToBoundaryIndexEnd(conditionGroup))) {
+                currentMatchedConditionGroups.set(conditionGroup);
+            }
+        }
+        return currentMatchedConditionGroups;
+    }
+
+    protected boolean isReverse() {
+        return !forward;
+    }
+
+    public void setReverse(boolean reverse) {
+        this.forward = !reverse;
+    }
+
+    private void setShouldRetreat() {
+        shouldRetreat = true;
+    }
+
+    protected RegexFlavor getFlavor() {
+        return ast.getOptions().getFlavor();
+    }
+
+    protected abstract boolean isBuildingDFA();
+
+    protected abstract boolean canPruneAfterUnconditionalFinalState();
+
+    private boolean canTraverseLookArounds() {
+        return isBuildingDFA();
+    }
 
     protected void run(Term runRoot) {
-        assert insideLoops.isEmpty();
+        clearCaptureGroupData();
+        recalcTransitionGuards = false;
         assert insideEmptyGuardGroup.isEmpty();
         assert curPath.isEmpty();
-        assert dollarsOnPath.isEmpty();
+        assert dollarsOnPath == 0;
+        assert caretsOnPath == 0;
+        assert matchBeginAssertionsOnPath == 0;
+        assert matchEndAssertionsOnPath == 0;
         assert lookAroundsOnPath.isEmpty();
-        assert nodeVisitsEmpty() : Arrays.toString(nodeVisitCount);
-        targetsVisited.clear();
-        targetDeduplicationMap.clear();
-        deduplicatedTargets = 0;
+        assert isEmpty(lookAroundVisitedCount) : Arrays.toString(lookAroundVisitedCount);
+        assert !shouldRetreat;
+        assert transitionGuards.isEmpty();
+        assert captureGroupUpdates.isEmpty();
+        assert captureGroupClears.isEmpty();
+        assert firstGroup == -1;
+        assert lastGroup == -1;
         root = runRoot;
+        pathDeduplicationSet.clear();
         if (runRoot.isGroup() && runRoot.getParent().isSubtreeRoot()) {
             cur = runRoot;
         } else {
+            // Before we call advanceTerm, we always push a group exit or pass-through to the path.
+            // advanceTerm will when push any further group exits as it walks up the AST.
+            if (runRoot.isGroup()) {
+                pushGroupExit(runRoot.asGroup());
+            }
             advanceTerm(runRoot);
         }
+        boolean foundNextTarget = false;
         while (!done) {
-            while (doAdvance()) {
+            while (!done && !foundNextTarget) {
                 // advance until we reach the next node to visit
+                foundNextTarget = doAdvance();
+                if (foundNextTarget) {
+                    foundNextTarget = deduplicatePath(false);
+                }
             }
             if (done) {
                 break;
             }
-            RegexASTNode target = pathGetNode(curPath.peek());
-            visit(target);
-            if (target.isMatchFound() && !dollarsOnPath() && lookAroundsOnPath.isEmpty() && !hasQuantifierGuards() && !caretsOnPath()) {
+            assert cur == pathGetNode(curPath.peek());
+            visit(cur);
+            if (canPruneAfterUnconditionalFinalState() && cur.isMatchFound() && !dollarsOnPath() && !caretsOnPath() && lookAroundsOnPath.isEmpty() && !hasTransitionGuards()) {
                 /*
                  * Transitions after an unconditional final state transition will never be taken, so
                  * it is safe to prune them.
                  */
-                insideLoops.clear();
                 insideEmptyGuardGroup.clear();
                 curPath.clear();
-                quantifierGuardsResult = null;
+                clearCaptureGroupData();
+                clearTransitionGuards();
+                transitionGuardsResult = null;
+                matchBeginAssertionsOnPath = 0;
+                matchEndAssertionsOnPath = 0;
                 /*
                  * no need to clear nodeVisitedCount here, because !dollarsOnPath() &&
                  * lookAroundsOnPath.isEmpty() implies nodeVisitsEmpty()
                  */
                 break;
             }
-            quantifierGuardsResult = null;
+            transitionGuardsResult = null;
             retreat();
+            foundNextTarget = false;
+            // If we have back-tracked into an empty-match transition, then we must continue by
+            // advancing past the empty-match group using advanceTerm instead of entering the group
+            // again using doAdvance.
+            if (cur.isGroup() && cur.hasEmptyGuard() && !done) {
+                foundNextTarget = advanceTerm(cur.asGroup());
+            }
         }
+        clearTransitionGuards();
         done = false;
     }
 
@@ -268,250 +372,169 @@ public abstract class NFATraversalRegexASTVisitor {
     protected abstract void leaveLookAhead(LookAheadAssertion assertion);
 
     protected boolean caretsOnPath() {
-        for (int i = 0; i < curPath.length(); i++) {
-            RegexASTNode node = pathGetNode(curPath.get(i));
-            if (node.isCaret()) {
-                return true;
-            }
-        }
-        return false;
+        return caretsOnPath > 0;
     }
 
     protected boolean dollarsOnPath() {
-        return !dollarsOnPath.isEmpty();
+        return dollarsOnPath > 0;
     }
 
-    protected boolean hasQuantifierGuards() {
-        calcQuantifierGuards();
-        return quantifierGuardsResult.length > 0;
+    protected boolean matchBeginAssertionsOnPath() {
+        return matchBeginAssertionsOnPath > 0;
     }
 
-    protected QuantifierGuard[] getQuantifierGuardsOnPath() {
-        calcQuantifierGuards();
-        return quantifierGuardsResult;
+    protected boolean matchEndAssertionsOnPath() {
+        return matchEndAssertionsOnPath > 0;
     }
 
-    protected void calcQuantifierGuards() {
-        if (quantifierGuardsResult == null) {
-            quantifierGuards.clear();
-            quantifierGuardsLoop.clear();
-            quantifierGuardsExited.clear();
-            RegexASTNode target = pathGetNode(curPath.peek());
-            Group emptyMatch = null;
-            if (target.isGroup()) {
-                emptyMatch = target.getParent().getParent().asGroup();
-                quantifierGuards.add(QuantifierGuard.createEnterEmptyMatch(emptyMatch.getQuantifier()));
-            }
-            for (int i = 0; i < curPath.length(); i++) {
-                long element = curPath.get(i);
-                if (pathIsGroup(element)) {
-                    Group group = (Group) pathGetNode(element);
-                    if (group.hasQuantifier() && group != emptyMatch) {
-                        Quantifier quantifier = group.getQuantifier();
-                        if (quantifier.hasIndex()) {
-                            if (pathIsGroupEnter(element)) {
-                                if (quantifierGuardsLoop.get(quantifier.getIndex()) && !quantifierGuardsExited.get(quantifier.getIndex())) {
-                                    quantifierGuards.add(quantifier.isInfiniteLoop() ? QuantifierGuard.createLoopInc(quantifier) : QuantifierGuard.createLoop(quantifier));
-                                } else {
-                                    quantifierGuards.add(QuantifierGuard.createEnter(quantifier));
-                                }
-                            } else if (pathIsGroupPassThrough(element)) {
-                                if (quantifier.getMin() > 0) {
-                                    quantifierGuardsExited.set(quantifier.getIndex());
-                                    quantifierGuards.add(QuantifierGuard.createExit(quantifier));
-                                } else {
-                                    quantifierGuards.add(QuantifierGuard.createClear(quantifier));
-                                }
-                            } else if (pathIsGroupExit(element)) {
-                                quantifierGuardsLoop.set(quantifier.getIndex());
-                            } else {
-                                assert pathIsGroupRubyEscape(element);
-                                quantifierGuardsExited.set(quantifier.getIndex());
-                            }
-                        }
-                        if (quantifier.hasZeroWidthIndex() && (group.getFirstAlternative().isExpandedQuantifier() || group.getLastAlternative().isExpandedQuantifier())) {
-                            if (pathIsGroupEnter(element)) {
-                                quantifierGuards.add(QuantifierGuard.createEnterZeroWidth(quantifier));
-                            } else if (pathIsGroupExit(element) && ((ast.getOptions().getFlavor() == RubyFlavor.INSTANCE) || !root.isCharacterClass())) {
-                                quantifierGuards.add(QuantifierGuard.createExitZeroWidth(quantifier));
-                            } else if (pathIsGroupRubyEscape(element)) {
-                                quantifierGuards.add(QuantifierGuard.createEscapeZeroWidth(quantifier));
-                            }
-                        }
-                    }
-                    if (ast.getOptions().getFlavor() == RubyFlavor.INSTANCE && group.isCapturing()) {
-                        if (pathIsGroupEnter(element)) {
-                            quantifierGuards.add(QuantifierGuard.createUpdateCG(group.getBoundaryIndexStart()));
-                        } else if (pathIsGroupPassThrough(element)) {
-                            quantifierGuards.add(QuantifierGuard.createUpdateCG(group.getBoundaryIndexStart()));
-                            quantifierGuards.add(QuantifierGuard.createUpdateCG(group.getBoundaryIndexEnd()));
-                        } else {
-                            assert pathIsGroupExit(element) || pathIsGroupRubyEscape(element);
-                            quantifierGuards.add(QuantifierGuard.createUpdateCG(group.getBoundaryIndexEnd()));
-                        }
-                    }
-                }
-            }
-            if (root.isGroup() && !root.getParent().isSubtreeRoot()) {
-                emptyMatch = root.getParent().getParent().asGroup();
-                quantifierGuards.add(QuantifierGuard.createExitEmptyMatch(emptyMatch.getQuantifier()));
-            }
-            quantifierGuardsResult = quantifierGuards.toArray(QuantifierGuard.NO_GUARDS);
+    protected boolean hasTransitionGuards() {
+        calcTransitionGuardsResult();
+        return transitionGuardsResult.length > 0;
+    }
+
+    protected long[] getTransitionGuardsOnPath() {
+        calcTransitionGuardsResult();
+        return transitionGuardsResult;
+    }
+
+    protected void calcTransitionGuardsResult() {
+        if (transitionGuardsResult == null) {
+            transitionGuardsResult = getTransitionGuards().isEmpty() ? TransitionGuard.NO_GUARDS : getTransitionGuards().toArray();
         }
-    }
-
-    @TruffleBoundary
-    protected PositionAssertion getLastDollarOnPath() {
-        assert dollarsOnPath();
-        for (int i = curPath.length() - 1; i >= 0; i--) {
-            long element = curPath.get(i);
-            if (pathGetNode(element).isDollar()) {
-                return (PositionAssertion) pathGetNode(element);
-            }
-        }
-        throw CompilerDirectives.shouldNotReachHere();
     }
 
     protected GroupBoundaries getGroupBoundaries() {
-        captureGroupUpdates.clear();
-        captureGroupClears.clear();
-        for (int i = 0; i < curPath.length(); i++) {
-            long element = curPath.get(i);
-            if (pathIsGroupPassThrough(element)) {
-                continue;
-            }
-            if (pathIsGroup(element)) {
-                Group group = (Group) pathGetNode(element);
-                if (group.isCapturing()) {
-                    int b = pathIsGroupEnter(element) ? group.getBoundaryIndexStart() : group.getBoundaryIndexEnd();
-                    captureGroupUpdates.set(b);
-                    captureGroupClears.clear(b);
-                }
-                if (ast.getOptions().getFlavor() != RubyFlavor.INSTANCE) {
-                    if (pathIsGroupEnter(element) && group.hasQuantifier() && group.hasEnclosedCaptureGroups()) {
-                        int lo = Group.groupNumberToBoundaryIndexStart(group.getEnclosedCaptureGroupsLow());
-                        int hi = Group.groupNumberToBoundaryIndexEnd(group.getEnclosedCaptureGroupsHigh() - 1);
-                        captureGroupUpdates.clearRange(lo, hi);
-                        captureGroupClears.setRange(lo, hi);
-                    }
-                }
-            }
-        }
-        return ast.createGroupBoundaries(captureGroupUpdates, captureGroupClears);
+        return ast.createGroupBoundaries(getCaptureGroupUpdates(), getCaptureGroupClears(), getFirstGroup(), getLastGroup());
     }
 
+    /**
+     * Advances the traversal by diving into {@link #cur current node} in pursuit of the next
+     * successor.
+     *
+     * @return {@code true} if a successor was reached in this step
+     */
     private boolean doAdvance() {
-        // emptyLoopIterations tells us how many extra empty iterations of a loop do we admit.
-        // In Ruby, we admit 1, while in other dialects, we admit 0. This extra iteration
-        // will not match any characters, but it might store an empty string in a capture group.
-        int extraEmptyLoopIterations = ast.getOptions().getFlavor() == RubyFlavor.INSTANCE ? 1 : 0;
-        if (cur.isDead() || insideLoops.get(cur, 0) > extraEmptyLoopIterations) {
+        if (cur.isDead()) {
             return retreat();
         }
         if (cur.isSequence()) {
             final Sequence sequence = (Sequence) cur;
             if (sequence.isEmpty()) {
                 Group parent = sequence.getParent();
-                if (sequence.isExpandedQuantifier()) {
+                if (sequence.isQuantifierPassThroughSequence()) {
                     // this empty sequence was inserted during quantifier expansion, so it is
                     // allowed to pass through the parent quantified group.
-                    long lastElement = curPath.pop();
-                    assert pathGetNode(lastElement) == parent && pathIsGroupEnter(lastElement);
-                    if (parent.hasNotUnrolledQuantifier() && parent.getQuantifier().getMin() > 0) {
-                        if (!isGroupExitOnPath(parent)) {
-                            // non-unrolled quantifiers with min > 0 may be exited from within their
-                            // respective group only.
-                            curPath.add(lastElement);
-                            return retreat();
-                        }
-                    }
-                    curPath.add(pathSwitchEnterAndPassThrough(lastElement));
-                    unregisterInsideLoop(parent);
+                    assert pathGetNode(curPath.peek()) == parent && PathElement.isGroupEnter(curPath.peek());
+                    switchEnterToPassThrough(parent);
                 } else {
                     pushGroupExit(parent);
+                }
+                if (shouldRetreat) {
+                    return retreat();
                 }
                 return advanceTerm(parent);
             } else {
                 cur = forward ? sequence.getFirstTerm() : sequence.getLastTerm();
-                return true;
+                return false;
             }
         } else if (cur.isGroup()) {
             final Group group = (Group) cur;
-            curPath.add(createGroupEnterPathElement(group));
-            if (group.hasEmptyGuard()) {
-                insideEmptyGuardGroup.add(group);
+            pushGroupEnter(group, 1);
+            if (shouldRetreat) {
+                return retreat();
             }
-            if (group.isLoop()) {
-                registerInsideLoop(group);
+            if (group.hasEmptyGuard()) {
+                insideEmptyGuardGroup.set(group.getGroupsWithGuardsIndex());
             }
             // This path will only be hit when visiting a group for the first time. All groups
             // must have at least one child sequence, so no check is needed here.
             // createGroupEnterPathElement initializes the group alternation index with 1, so we
             // don't have to increment it here, either.
             cur = group.getFirstAlternative();
-            return true;
+            return deduplicatePath(true);
         } else {
-            curPath.add(createPathElement(cur));
+            curPath.add(PathElement.create(cur));
             if (cur.isPositionAssertion()) {
-                final PositionAssertion assertion = (PositionAssertion) cur;
-                switch (assertion.type) {
-                    case CARET:
-                        if (canTraverseCaret) {
-                            return advanceTerm(assertion);
-                        } else {
-                            return retreat();
-                        }
-                    case DOLLAR:
-                        addToVisitedSet(dollarsOnPath);
-                        return advanceTerm((Term) cur);
-                    default:
-                        throw CompilerDirectives.shouldNotReachHere();
-                }
-            } else if (canTraverseLookArounds() && cur.isLookAheadAssertion()) {
-                enterLookAhead((LookAheadAssertion) cur);
-                addToVisitedSet(lookAroundsOnPath);
-                return advanceTerm((Term) cur);
-            } else if (canTraverseLookArounds() && cur.isLookBehindAssertion()) {
-                addToVisitedSet(lookAroundsOnPath);
-                if (traversableLookBehindAssertions == null || traversableLookBehindAssertions.contains(cur)) {
-                    return advanceTerm((LookBehindAssertion) cur);
-                } else {
-                    return retreat();
-                }
+                return advancePositionAssertion(cur.asPositionAssertion());
+            } else if (cur.isLookAroundAssertion()) {
+                return advanceLookAround(cur.asLookAroundAssertion());
             } else {
-                assert cur.isCharacterClass() || cur.isBackReference() || cur.isMatchFound() || (!canTraverseLookArounds() && cur.isLookAroundAssertion());
-                if (forward && dollarsOnPath() && cur.isCharacterClass()) {
-                    // don't visit CharacterClass nodes if we traversed dollar - PositionAssertions
-                    // already
+                assert cur.isCharacterClass() || cur.isBackReference() || cur.isMatchFound() || cur.isAtomicGroup();
+                if ((forward && dollarsOnPath() || !forward && caretsOnPath()) && !canMatchEmptyString(cur)) {
                     return retreat();
                 }
-                return deduplicateTarget();
+                if (!ignoreMatchBoundaryAssertions) {
+                    if ((forward && matchBeginAssertionsOnPath() || !forward && matchEndAssertionsOnPath()) && !isRootEnterOnPath() && !canMatchEmptyString(cur)) {
+                        return retreat();
+                    }
+                    if (matchEndAssertionsOnPath() && (cur.isCharacterClass() || cur.isBackReference())) {
+                        return retreat();
+                    }
+                }
+                return true;
             }
         }
     }
 
-    private boolean isGroupExitOnPath(Group group) {
-        return !curPath.isEmpty() && pathIsGroupExit(curPath.peek()) && pathGetNode(curPath.peek()) == group;
+    private boolean advanceLookAround(LookAroundAssertion lookAround) {
+        if (canTraverseLookArounds()) {
+            if (lookAround.isLookAheadAssertion()) {
+                enterLookAhead(lookAround.asLookAheadAssertion());
+                addLookAroundToVisitedSet();
+                return advanceTerm(lookAround);
+            } else {
+                assert lookAround.isLookBehindAssertion();
+                addLookAroundToVisitedSet();
+                if (traversableLookBehindAssertions == null || traversableLookBehindAssertions.contains(lookAround.asLookBehindAssertion())) {
+                    return advanceTerm(lookAround);
+                } else {
+                    return retreat();
+                }
+            }
+        }
+        return true;
     }
 
-    private void registerInsideLoop(Group group) {
-        insideLoops.put(group, insideLoops.get(group, 0) + 1);
-    }
-
-    private void unregisterInsideLoop(Group group) {
-        int depth = insideLoops.get(group, 0);
-        if (depth == 1) {
-            insideLoops.removeKey(group);
-        } else if (depth > 1) {
-            insideLoops.put(group, depth - 1);
+    private boolean advancePositionAssertion(PositionAssertion assertion) {
+        switch (assertion.type) {
+            case CARET:
+                caretsOnPath++;
+                if (canTraverseCaret) {
+                    return advanceTerm(assertion);
+                } else {
+                    return retreat();
+                }
+            case DOLLAR:
+                dollarsOnPath++;
+                return advanceTerm(assertion);
+            case MATCH_BEGIN:
+                if (!ignoreMatchBoundaryAssertions) {
+                    matchBeginAssertionsOnPath++;
+                    if (forward && isBuildingDFA() && !isRootEnterOnPath()) {
+                        return retreat();
+                    }
+                }
+                return advanceTerm(assertion);
+            case MATCH_END:
+                if (!ignoreMatchBoundaryAssertions) {
+                    matchEndAssertionsOnPath++;
+                    if (!forward && isBuildingDFA() && !isRootEnterOnPath()) {
+                        return retreat();
+                    }
+                }
+                return advanceTerm(assertion);
+            default:
+                throw CompilerDirectives.shouldNotReachHere();
         }
     }
 
-    private void addToVisitedSet(StateSet<RegexAST, RegexASTNode> visitedSet) {
-        nodeVisitCount[cur.getId()]++;
-        visitedSet.add(cur);
-    }
-
+    /**
+     * Advances past the given {@link Term} and updates {@link #cur the current node}.
+     *
+     * @return {@code true} if a successor was reached in this step (possible if we want to generate
+     *         a transition to the special EMPTY_STATE, which by itself doesn't match anything, but
+     *         acts as a helper for simulating the backtracking behavior of the ECMAScript flavor)
+     */
     private boolean advanceTerm(Term term) {
         if (ast.isNFAInitialState(term) || (term.getParent().isSubtreeRoot() && (term.isPositionAssertion() || term.isMatchFound()))) {
             assert term.isPositionAssertion() || term.isMatchFound();
@@ -520,110 +543,143 @@ public abstract class NFATraversalRegexASTVisitor {
             } else {
                 cur = term.asMatchFound().getNext();
             }
-            return true;
+            return false;
         }
         Term curTerm = term;
         while (!curTerm.getParent().isSubtreeRoot()) {
-            // We are leaving curTerm. If curTerm is a quantified group and we have already entered
-            // curTerm during this step, then we stop and retreat. Otherwise, we would end up
-            // letting curTerm match the empty string, which is forbidden.
-            if (insideEmptyGuardGroup.contains(curTerm)) {
-                return advanceEmptyGuard(curTerm);
+            /*
+             * We are leaving curTerm, which is a quantified group that we have already entered
+             * during this step.
+             *
+             * We avoid infinite loops on these groups by statically resolving TransitionGuards and
+             * de-duplicating equivalent transitions, but we have to apply special treatment for
+             * ECMAScript and Python's behavior on empty loop iterations here.
+             *
+             * ECMAScript and Python don't stop quantifier loops on empty matches as long as their
+             * minimum count has not been reached. Unfortunately, we have to simulate this behavior
+             * in cases where it is observable via capture groups, back-references or position
+             * assertions.
+             */
+            if (curTerm.isGroupWithGuards() && insideEmptyGuardGroup.get(curTerm.asGroup().getGroupsWithGuardsIndex()) &&
+                            !getFlavor().emptyChecksMonitorCaptureGroups()) {
+                Group curGroup = curTerm.asGroup();
+                Quantifier quantifier = curGroup.getQuantifier();
+                // If we are:
+                // - in ECMAScript or Python flavor
+                // - in the mandatory split part of a quantifier
+                // - that has not been unrolled
+                // - and capture groups are visible to the caller, or the expression contains
+                // back-references, or we crossed a caret
+                if (!getFlavor().emptyChecksOnMandatoryLoopIterations() &&
+                                curGroup.isMandatoryQuantifier() &&
+                                !curGroup.isExpandedQuantifier() &&
+                                (!ast.getOptions().isBooleanMatch() || ast.getProperties().hasBackReferences() || caretsOnPath() || isReverse() && dollarsOnPath())) {
+                    // the existence of a mandatory copy of the quantifier loop implies a minimum
+                    // greater than zero
+                    assert !curGroup.isMandatoryQuantifier() || quantifier.getMin() > 0;
+                    popGroupExit();
+                    cur = curTerm;
+                    // Set the current group node as the path's target to indicate we want to
+                    // generate an EMPTY_STATE for it. The empty state allows the backtracking
+                    // engine to loop without consuming characters.
+                    curPath.add(PathElement.create(cur));
+                    return true;
+                }
+                // otherwise, retreat.
+                return retreat();
             }
             Sequence parentSeq = (Sequence) curTerm.getParent();
             if (curTerm == (forward ? parentSeq.getLastTerm() : parentSeq.getFirstTerm())) {
                 final Group parentGroup = parentSeq.getParent();
                 pushGroupExit(parentGroup);
+                if (shouldRetreat) {
+                    return retreat();
+                }
                 if (parentGroup.isLoop()) {
                     cur = parentGroup;
-                    return true;
+                    return false;
                 }
                 curTerm = parentGroup;
             } else {
                 cur = parentSeq.getTerms().get(curTerm.getSeqIndex() + (forward ? 1 : -1));
-                return true;
+                return false;
             }
         }
         assert curTerm.isGroup();
         assert curTerm.getParent().isSubtreeRoot();
-        if (insideEmptyGuardGroup.contains(curTerm)) {
-            return advanceEmptyGuard(curTerm);
-        }
         cur = curTerm.getSubTreeParent().getMatchFound();
-        return true;
+        return false;
     }
 
-    private boolean advanceEmptyGuard(Term curTerm) {
-        Group parent = curTerm.getParent().getParent().asGroup();
-        if (parent.hasNotUnrolledQuantifier() && parent.getQuantifier().getMin() > 0) {
-            assert curTerm.isGroup();
-            // We found a zero-width match group with a bounded quantifier.
-            // By returning the quantified group itself, we map the transition target to the special
-            // empty-match state.
-            cur = curTerm;
-            return false;
-        }
-        return retreat();
-    }
-
-    private void pushGroupExit(Group group) {
-        curPath.add(createPathElement(group) | PATH_GROUP_ACTION_EXIT);
-    }
-
+    /**
+     * Backtrack through the traversal and find an unexplored alternative.
+     *
+     * @return {@code true} if a successor was found in this step
+     */
     private boolean retreat() {
+        shouldRetreat = false;
         while (!curPath.isEmpty()) {
-            long lastVisited = curPath.pop();
-            RegexASTNode node = pathGetNode(lastVisited);
-            if (pathIsGroup(lastVisited)) {
+            long lastElement = curPath.peek();
+            RegexASTNode node = pathGetNode(lastElement);
+            if (PathElement.isGroup(lastElement)) {
                 Group group = (Group) node;
-                if (pathIsGroupEnter(lastVisited) || pathIsGroupPassThrough(lastVisited)) {
-                    if (pathGroupHasNext(lastVisited)) {
-                        cur = pathGroupGetNext(lastVisited);
-                        curPath.add(pathToGroupEnter(pathIncGroupAltIndex(lastVisited)));
-                        if (pathIsGroupPassThrough(lastVisited)) {
-                            // a passthrough node was changed to an enter node,
-                            // so we register the loop in insideLoops
-                            registerInsideLoop(group);
+                if (PathElement.isGroupEnter(lastElement) || PathElement.isGroupPassThrough(lastElement)) {
+                    if (pathGroupHasNext(lastElement)) {
+                        switchNextGroupAlternative(group);
+                        if (shouldRetreat) {
+                            return retreat();
                         }
-                        return true;
+                        cur = pathGroupGetNext(lastElement);
+                        return deduplicatePath(true);
                     } else {
-                        assert noEmptyGuardGroupEnterOnPath(group);
-                        if (pathIsGroupEnter(lastVisited)) {
-                            // we only deregister the node from insideLoops if this was an enter
-                            // node, if it was a passthrough node, it was already deregistered when
-                            // it was transformed from an enter node in doAdvance
-                            unregisterInsideLoop(group);
+                        if (PathElement.isGroupEnter(lastElement)) {
+                            popGroupEnter();
+                        } else {
+                            assert PathElement.isGroupPassThrough(lastElement);
+                            popGroupPassThrough();
                         }
-                        insideEmptyGuardGroup.remove(group);
+                        if (group.hasEmptyGuard()) {
+                            insideEmptyGuardGroup.clear(group.getGroupsWithGuardsIndex());
+                        }
                     }
-                } else if (ast.getOptions().getFlavor() == RubyFlavor.INSTANCE && pathIsGroupExit(lastVisited) && group.hasQuantifier() && group.getQuantifier().hasZeroWidthIndex() &&
-                                (group.getFirstAlternative().isExpandedQuantifier() || group.getLastAlternative().isExpandedQuantifier())) {
-                    // In Ruby, when we finish an iteration of a loop, there is an empty check.
-                    // If we pass the empty check, we return to the beginning of the loop where we
-                    // get to make a non-deterministic choice as to whether we want to start another
-                    // iteration of the loop (so far the same as ECMAScript). However, if we fail
-                    // the empty check, we continue to the expression that follows the loop. We
+                } else if (PathElement.isGroupExit(lastElement) && needsZeroWidthEscape(group)) {
+                    // In Ruby and OracleDB, when we finish an iteration of a loop, there is
+                    // an empty check. If we pass the empty check, we return to the beginning of the
+                    // loop where we get to make a non-deterministic choice whether we want to start
+                    // another iteration of the loop (so far the same as ECMAScript). However, if we
+                    // fail the empty check, we continue to the expression that follows the loop. We
                     // implement this by introducing two transitions, one leading to the start of
                     // the loop (empty check passes) and one escaping past the loop (empty check
                     // fails). The two transitions are then annotated with complementary guards
                     // (exitZeroWidth and escapeZeroWidth, respectively), so that at runtime, only
                     // one of the two transitions will be admissible. The clause below lets us
                     // generate the second transition by replacing the loop exit with a loop escape.
-                    curPath.add(pathToGroupRubyEscape(lastVisited));
-                    if (advanceTerm(group)) {
-                        return true;
+                    // In ECMAScript, we use the same mechanism to fast-forward mandatory quantifier
+                    // parts when we find a zero-width match for the quantified expression.
+                    switchExitToEscape(group);
+                    if (shouldRetreat) {
+                        return retreat();
+                    }
+                    // When we expand quantifiers, we wrap them in a group. This lets us escape past
+                    // the expansion of the quantifier even in cases when we are in the mandatory
+                    // prefix (e.g. empty-check fails in the first A in (AA((A)((A)|)|))).
+                    Group parentGroup = group.getParent().getParent().asGroup();
+                    pushGroupExit(parentGroup);
+                    return advanceTerm(parentGroup);
+                } else {
+                    if (PathElement.isGroupExit(lastElement)) {
+                        popGroupExit();
                     } else {
-                        retreat();
+                        assert PathElement.isGroupEscape(lastElement);
+                        popGroupEscape(group);
                     }
                 }
             } else {
+                curPath.pop();
                 if (canTraverseLookArounds() && node.isLookAroundAssertion()) {
-                    if (node.isLookAheadAssertion()) {
-                        leaveLookAhead(node.asLookAheadAssertion());
-                    }
-                    removeFromVisitedSet(lastVisited, lookAroundsOnPath);
-                } else if (node.isDollar()) {
-                    removeFromVisitedSet(lastVisited, dollarsOnPath);
+                    popLookAround(node, lastElement);
+                } else if (node.isPositionAssertion()) {
+                    popPositionAssertion(node);
                 }
             }
         }
@@ -631,158 +687,137 @@ public abstract class NFATraversalRegexASTVisitor {
         return false;
     }
 
-    private void removeFromVisitedSet(long pathElement, StateSet<RegexAST, RegexASTNode> visitedSet) {
-        if (--nodeVisitCount[pathGetNodeId(pathElement)] == 0) {
-            visitedSet.remove(pathGetNode(pathElement));
+    private void popLookAround(RegexASTNode node, long pathElement) {
+        if (node.isLookAheadAssertion()) {
+            leaveLookAhead(node.asLookAheadAssertion());
+        }
+        removeLookAroundFromVisitedSet(pathElement);
+    }
+
+    private void popPositionAssertion(RegexASTNode node) {
+        switch (node.asPositionAssertion().type) {
+            case CARET -> {
+                caretsOnPath--;
+            }
+            case DOLLAR -> {
+                dollarsOnPath--;
+            }
+            case MATCH_BEGIN -> {
+                if (!ignoreMatchBoundaryAssertions) {
+                    matchBeginAssertionsOnPath--;
+                }
+            }
+            case MATCH_END -> {
+                if (!ignoreMatchBoundaryAssertions) {
+                    matchEndAssertionsOnPath--;
+                }
+            }
         }
     }
 
-    private boolean deduplicateTarget() {
-        if (!canTraverseLookArounds()) {
-            quantifierGuardsResult = null;
-            calcQuantifierGuards();
-            if (quantifierGuardsResult.length != 0) {
-                // TODO: properly deduplicate transitions with guards
-                return false;
-            }
-        }
-        boolean isDuplicate = false;
-        if (dollarsOnPath.isEmpty() && lookAroundsOnPath.isEmpty()) {
-            isDuplicate = !targetsVisited.add(cur);
-        } else if (canTraverseLookArounds()) {
-            StateSet<RegexAST, RegexASTNode> key = lookAroundsOnPath.copy();
-            key.addAll(dollarsOnPath);
-            key.add(cur);
-            isDuplicate = targetDeduplicationMap.put(key, key) != null;
-        } else {
-            StateSet<RegexAST, RegexASTNode> key = dollarsOnPath.copy();
-            key.add(cur);
-            isDuplicate = targetDeduplicationMap.put(key, key) != null;
-        }
-        if (isDuplicate) {
-            if (++deduplicatedTargets > SUCCESSOR_DEDUPLICATION_BAILOUT_THRESHOLD) {
-                throw new UnsupportedRegexException("NFATraversal explosion");
-            }
+    /**
+     * This should be called whenever {@link #cur} is set to some {@link Sequence}.
+     *
+     * @return {@code true} if a successor was found in this step
+     */
+    private boolean deduplicatePath(boolean internal) {
+        calcTransitionGuards();
+        if (shouldRetreat) {
             return retreat();
         }
-        return false;
+        if (internal && getFlavor().emptyChecksMonitorCaptureGroups()) {
+            // in Ruby, we don't deduplicate on intermediate Sequence nodes, because due to the
+            // "empty checks monitor capture groups" property, we may have to generate transitions
+            // that represent multiple loop iterations in a quantified expression.
+            return false;
+        }
+        // internal == true means that this is being called during traversal, before reaching a
+        // successor node (these calls are made in regular intervals, whenever a new Sequence is
+        // entered).
+        // This method is also called for every successor we have found (internal == false). In
+        // these cases, we can use a broader notion of state equivalence to prune more aggressively.
+        assert internal == cur.isSequence();
+        // In regex flavors where backreferences to unmatched capture groups always pass (i.e. they
+        // behave as if the capture group matched the empty string), we don't have to distinguish
+        // two states of the traversal that differ only in capture groups, since the state that was
+        // encountered first will dominate the one found later and any empty capture groups that
+        // would have been matched along the way cannot affect future matching.
+        boolean captureGroupsMatter = !cur.isMatchFound() &&
+                        ((getFlavor().backreferencesToUnmatchedGroupsFail() && ast.getProperties().hasBackReferences()) ||
+                                        (isBuildingDFA() && ast.getProperties().hasConditionalBackReferences()));
+
+        long id = cur.getId();
+        if (caretsOnPath()) {
+            id |= 1L << 32;
+        }
+        if (dollarsOnPath()) {
+            id |= 1L << 33;
+        }
+        if (matchBeginAssertionsOnPath()) {
+            id |= 1L << 34;
+        }
+        if (matchEndAssertionsOnPath()) {
+            id |= 1L << 35;
+        }
+        dedupKey.clear();
+        dedupKey.add(id);
+        dedupKey.addAll(lookAroundsOnPath.getInternalArray());
+        if (internal) {
+            dedupKey.addAll(insideEmptyGuardGroup.getInternalArray());
+        }
+        if (captureGroupsMatter) {
+            dedupKeyAddGroupBoundaries(getCaptureGroupUpdates());
+            dedupKeyAddGroupBoundaries(getCaptureGroupClears());
+        }
+        for (long guard : getTransitionGuards()) {
+            if (!TransitionGuard.is(guard, TransitionGuard.Kind.updateCG)) {
+                dedupKey.add(guard);
+            }
+        }
+        DeduplicationKey key = new DeduplicationKey(dedupKey.toArray());
+        boolean isDuplicate = !pathDeduplicationSet.add(key);
+        if (isDuplicate) {
+            return retreat();
+        } else {
+            // When called in the middle of traversal (internal == true), we can return false, since
+            // the current target node is a Sequence and these can never be successors.
+            // When called at the end of traversal (internal == false), we can return true, since
+            // the current target node is a valid successor.
+            return !internal;
+        }
     }
 
-    /**
-     * First field: (short) group alternation index. This value is used to iterate the alternations
-     * of groups referenced in a group-enter path element. <br>
-     * Since the same group can appear multiple times on the path, we cannot reuse {@link Group}'s
-     * implementation of {@link RegexASTVisitorIterable}. Therefore, every occurrence of a group on
-     * the path has its own index for iterating and back-tracking over its alternatives. <br>
-     * This field's offset <em>must</em> be zero for {@link #pathIncGroupAltIndex(long)} to work!
-     */
-    private static final int PATH_GROUP_ALT_INDEX_OFFSET = 0;
-    /**
-     * Second field: (int) id of the path element's {@link RegexASTNode}.
-     */
-    private static final int PATH_NODE_OFFSET = Short.SIZE;
-    /**
-     * Third field: group action. Every path element referencing a group must have one of three
-     * possible group actions:
-     * <ul>
-     * <li>group enter</li>
-     * <li>group exit</li>
-     * <li>group pass through</li>
-     * </ul>
-     */
-    private static final int PATH_GROUP_ACTION_OFFSET = Short.SIZE + Integer.SIZE;
-    private static final long PATH_GROUP_ACTION_CLEAR_MASK = 0x0000ffffffffffffL;
-    private static final long PATH_GROUP_ACTION_ENTER = 1L << PATH_GROUP_ACTION_OFFSET;
-    private static final long PATH_GROUP_ACTION_EXIT = 1L << PATH_GROUP_ACTION_OFFSET + 1;
-    private static final long PATH_GROUP_ACTION_PASS_THROUGH = 1L << PATH_GROUP_ACTION_OFFSET + 2;
-    private static final long PATH_GROUP_ACTION_RUBY_ESCAPE = 1L << PATH_GROUP_ACTION_OFFSET + 3;
-    private static final long PATH_GROUP_ACTION_ENTER_OR_PASS_THROUGH = PATH_GROUP_ACTION_ENTER | PATH_GROUP_ACTION_PASS_THROUGH;
-    private static final long PATH_GROUP_ACTION_ANY = PATH_GROUP_ACTION_ENTER | PATH_GROUP_ACTION_EXIT | PATH_GROUP_ACTION_PASS_THROUGH | PATH_GROUP_ACTION_RUBY_ESCAPE;
-
-    /**
-     * Create a new path element containing the given node.
-     */
-    private static long createPathElement(RegexASTNode node) {
-        return (long) node.getId() << PATH_NODE_OFFSET;
+    private void dedupKeyAddGroupBoundaries(TBitSet boundaries) {
+        // We only care about groups referenced by back-references when de-duplicating transitions.
+        // Without back-references, the first possible transition to the same target always
+        // dominates the others.
+        long[] bitset = boundaries.getInternalArray();
+        long[] referenced = referencedGroupBoundaries.getInternalArray();
+        assert bitset.length == referenced.length;
+        for (int i = 0; i < bitset.length; i++) {
+            dedupKey.add(bitset[i] & referenced[i]);
+        }
     }
 
-    /**
-     * Create a group-enter path element for the given Group. The group alternation index is
-     * initialized with 1!
-     */
-    private static long createGroupEnterPathElement(Group node) {
-        return ((long) node.getId() << PATH_NODE_OFFSET) | (1 << PATH_GROUP_ALT_INDEX_OFFSET) | PATH_GROUP_ACTION_ENTER;
-    }
-
-    private static int pathGetNodeId(long pathElement) {
-        return (int) (pathElement >>> PATH_NODE_OFFSET);
+    private static boolean canMatchEmptyString(RegexASTNode node) {
+        if (node.isBackReference()) {
+            return node.asBackReference().mayMatchEmptyString();
+        }
+        return !node.isCharacterClass();
     }
 
     /**
      * Get the {@link RegexASTNode} contained in the given path element.
      */
     private RegexASTNode pathGetNode(long pathElement) {
-        return ast.getState(pathGetNodeId(pathElement));
-    }
-
-    /**
-     * Get the group alternation index of the given path element.
-     */
-    private static int pathGetGroupAltIndex(long pathElement) {
-        return (short) (pathElement >>> PATH_GROUP_ALT_INDEX_OFFSET);
-    }
-
-    /**
-     * Convert the given path element to a group-enter.
-     */
-    private static long pathToGroupEnter(long pathElement) {
-        return (pathElement & PATH_GROUP_ACTION_CLEAR_MASK) | PATH_GROUP_ACTION_ENTER;
-    }
-
-    /**
-     * Convert the given path element to a group-Ruby-escape.
-     */
-    private static long pathToGroupRubyEscape(long pathElement) {
-        return (pathElement & PATH_GROUP_ACTION_CLEAR_MASK) | PATH_GROUP_ACTION_RUBY_ESCAPE;
-    }
-
-    /**
-     * Returns {@code true} if the given path element has any group action set. Every path element
-     * containing a group must have one group action.
-     */
-    private static boolean pathIsGroup(long pathElement) {
-        return (pathElement & PATH_GROUP_ACTION_ANY) != 0;
-    }
-
-    private static boolean pathIsGroupEnter(long pathElement) {
-        return (pathElement & PATH_GROUP_ACTION_ENTER) != 0;
-    }
-
-    private static boolean pathIsGroupExit(long pathElement) {
-        return (pathElement & PATH_GROUP_ACTION_EXIT) != 0;
-    }
-
-    private static boolean pathIsGroupPassThrough(long pathElement) {
-        return (pathElement & PATH_GROUP_ACTION_PASS_THROUGH) != 0;
-    }
-
-    private static boolean pathIsGroupRubyEscape(long pathElement) {
-        return (pathElement & PATH_GROUP_ACTION_RUBY_ESCAPE) != 0;
-    }
-
-    /**
-     * Convert a group enter path element to a group pass-through, and vice versa.
-     */
-    private static long pathSwitchEnterAndPassThrough(long pathElement) {
-        assert (pathIsGroupEnter(pathElement) != pathIsGroupPassThrough(pathElement));
-        return pathElement ^ PATH_GROUP_ACTION_ENTER_OR_PASS_THROUGH;
+        return ast.getState(PathElement.getNodeId(pathElement));
     }
 
     /**
      * Returns {@code true} if the path element's group alternation index is still in bounds.
      */
     private boolean pathGroupHasNext(long pathElement) {
-        return pathGetGroupAltIndex(pathElement) < ((Group) pathGetNode(pathElement)).size();
+        return PathElement.getGroupAltIndex(pathElement) < ((Group) pathGetNode(pathElement)).size();
     }
 
     /**
@@ -790,31 +825,562 @@ public abstract class NFATraversalRegexASTVisitor {
      * the group alternation index!
      */
     private Sequence pathGroupGetNext(long pathElement) {
-        return ((Group) pathGetNode(pathElement)).getAlternatives().get(pathGetGroupAltIndex(pathElement));
+        return ((Group) pathGetNode(pathElement)).getAlternatives().get(PathElement.getGroupAltIndex(pathElement));
     }
 
-    /**
-     * Increment the group alternation index. This requires {@link #PATH_GROUP_ALT_INDEX_OFFSET} to
-     * be 0!
-     */
-    private static long pathIncGroupAltIndex(long pathElement) {
-        return pathElement + 1;
+    protected boolean isRootEnterOnPath() {
+        return isGroupEnterOnPath(ast.getRoot());
     }
 
-    private boolean noEmptyGuardGroupEnterOnPath(Group group) {
-        if (!group.hasEmptyGuard()) {
-            return true;
-        }
-        for (int i = 0; i < curPath.length(); i++) {
-            if (pathGetNode(curPath.get(i)) == group && pathIsGroupEnter(curPath.get(i))) {
-                return false;
+    private boolean isGroupEnterOnPath(Group group) {
+        int groupNodeId = group.getId();
+        for (long element : curPath) {
+            if (PathElement.getNodeId(element) == groupNodeId && PathElement.isGroupEnter(element)) {
+                return true;
             }
         }
-        return true;
+        return false;
     }
 
-    private boolean nodeVisitsEmpty() {
-        for (int i : nodeVisitCount) {
+    /// Pushing and popping group elements to and from the path
+    private void pushGroupEnter(Group group, int groupAltIndex) {
+        curPath.add(PathElement.createGroupEnter(group, groupAltIndex));
+        recalcTransitionGuards = true;
+    }
+
+    private int popGroupEnter() {
+        long pathEntry = curPath.pop();
+        assert PathElement.isGroupEnter(pathEntry);
+        recalcTransitionGuards = true;
+        return PathElement.getGroupAltIndex(pathEntry);
+    }
+
+    private void switchNextGroupAlternative(Group group) {
+        int groupAltIndex;
+        if (PathElement.isGroupEnter(curPath.peek())) {
+            groupAltIndex = popGroupEnter();
+        } else {
+            assert PathElement.isGroupPassThrough(curPath.peek());
+            groupAltIndex = popGroupPassThrough();
+        }
+        pushGroupEnter(group, groupAltIndex + 1);
+    }
+
+    private void pushGroupExit(Group group) {
+        curPath.add(PathElement.createGroupExit(group));
+        recalcTransitionGuards = true;
+    }
+
+    private void popGroupExit() {
+        long pathEntry = curPath.pop();
+        assert PathElement.isGroupExit(pathEntry);
+        recalcTransitionGuards = true;
+    }
+
+    private void pushGroupPassThrough(Group group, int groupAltIndex) {
+        curPath.add(PathElement.createGroupPassThrough(group, groupAltIndex));
+        recalcTransitionGuards = true;
+    }
+
+    private int popGroupPassThrough() {
+        long pathEntry = curPath.pop();
+        int groupAltIndex = PathElement.getGroupAltIndex(pathEntry);
+        assert PathElement.isGroupPassThrough(pathEntry);
+        recalcTransitionGuards = true;
+        return groupAltIndex;
+    }
+
+    private void switchEnterToPassThrough(Group group) {
+        int groupAltIndex = popGroupEnter();
+        pushGroupPassThrough(group, groupAltIndex);
+    }
+
+    private void switchExitToEscape(Group group) {
+        popGroupExit();
+        pushGroupEscape(group);
+    }
+
+    private void pushGroupEscape(Group group) {
+        long groupEscape = PathElement.createGroupEscape(group);
+        curPath.add(groupEscape);
+        recalcTransitionGuards = true;
+    }
+
+    private void popGroupEscape(Group group) {
+        long pathEntry = curPath.pop();
+        assert PathElement.isGroupEscape(pathEntry);
+        assert group == pathGetNode(pathEntry);
+        recalcTransitionGuards = true;
+    }
+
+    /// Capture group data handling
+    private void clearCaptureGroupData() {
+        captureGroupUpdates.clear();
+        captureGroupClears.clear();
+        firstGroup = -1;
+        lastGroup = -1;
+    }
+
+    private TBitSet getCaptureGroupUpdates() {
+        calcTransitionGuards();
+        return captureGroupUpdates;
+    }
+
+    private TBitSet getCaptureGroupClears() {
+        calcTransitionGuards();
+        return captureGroupClears;
+    }
+
+    private int getFirstGroup() {
+        calcTransitionGuards();
+        return firstGroup;
+    }
+
+    private int getLastGroup() {
+        calcTransitionGuards();
+        return lastGroup;
+    }
+
+    private LongArrayBuffer getTransitionGuards() {
+        calcTransitionGuards();
+        return transitionGuardsCanonicalized;
+    }
+
+    private void calcTransitionGuards() {
+        if (recalcTransitionGuards) {
+            calculateTransitionGuards();
+            recalcTransitionGuards = false;
+        }
+    }
+
+    private int getBoundaryIndexStart(Group group) {
+        return forward ? group.getBoundaryIndexStart() : group.getBoundaryIndexEnd();
+    }
+
+    private int getBoundaryIndexEnd(Group group) {
+        return forward ? group.getBoundaryIndexEnd() : group.getBoundaryIndexStart();
+    }
+
+    private void calcGroupBoundariesEnter(Group group) {
+        if (group.isCapturing()) {
+            captureGroupUpdate(getBoundaryIndexStart(group));
+            if (updatesLastGroupField(group) && firstGroup == -1) {
+                firstGroup = group.getGroupNumber();
+            }
+        }
+        if (clearsEnclosedGroups(group)) {
+            int lo = Group.groupNumberToBoundaryIndexStart(group.getEnclosedCaptureGroupsLo());
+            int hi = Group.groupNumberToBoundaryIndexEnd(group.getEnclosedCaptureGroupsHi() - 1);
+            captureGroupClears.setRange(lo, hi);
+            captureGroupUpdates.clearRange(lo, hi);
+        }
+    }
+
+    private void calcGroupBoundariesExit(Group group) {
+        if (group.isCapturing()) {
+            captureGroupUpdate(getBoundaryIndexEnd(group));
+            if (updatesLastGroupField(group)) {
+                lastGroup = group.getGroupNumber();
+            }
+        }
+    }
+
+    private void captureGroupUpdate(int boundary) {
+        captureGroupUpdates.set(boundary);
+        captureGroupClears.clear(boundary);
+    }
+
+    private void calculateTransitionGuards() {
+        clearCaptureGroupData();
+        bqExited.clear();
+        bqBypassed.clear();
+        Arrays.fill(bqLastZeroWidthEnter, -1);
+        Arrays.fill(bqLastCounterReset, -1);
+        transitionGuards.clear();
+        transitionGuardsCanonicalized.clear();
+        for (int i = 0; i < curPath.length(); i++) {
+            long element = curPath.get(i);
+            if (PathElement.isGroup(element)) {
+                Group group = (Group) pathGetNode(element);
+                int groupAltIndex = PathElement.getGroupAltIndex(element);
+                if (PathElement.isGroupEnter(element)) {
+                    if (group.hasQuantifier()) {
+                        Quantifier quantifier = group.getQuantifier();
+                        if (quantifier.hasIndex()) {
+                            if (bqExited.get(group.getGroupsWithGuardsIndex()) && !bqBypassed.get(group.getGroupsWithGuardsIndex())) {
+                                if (group.isMandatoryQuantifier()) {
+                                    pushTransitionGuard(TransitionGuard.createCountLtMin(quantifier));
+                                } else if (!quantifier.isInfiniteLoop()) {
+                                    pushTransitionGuard(TransitionGuard.createCountLtMax(quantifier));
+                                }
+                                pushTransitionGuard(TransitionGuard.createCountInc(quantifier));
+                            } else {
+                                if (group.isOptionalQuantifier()) {
+                                    pushTransitionGuard(TransitionGuard.createCountSetMin(quantifier));
+                                } else {
+                                    pushTransitionGuard(TransitionGuard.createCountSet1(quantifier));
+                                }
+                            }
+                        }
+                        if (group.getEnclosedZeroWidthGroupsHi() - group.getEnclosedZeroWidthGroupsLo() > 0) {
+                            bqBypassed.clearRange(group.getEnclosedZeroWidthGroupsLo(), group.getEnclosedZeroWidthGroupsHi() - 1);
+                            bqExited.clearRange(group.getEnclosedZeroWidthGroupsLo(), group.getEnclosedZeroWidthGroupsHi() - 1);
+                        }
+                        if (needsEmptyCheck(group)) {
+                            pushTransitionGuard(TransitionGuard.createEnterZeroWidth(quantifier));
+                        }
+                    }
+                    if (needsUpdateCGStepByStep(group) && (getFlavor().usesLastGroupResultField() || !captureGroupUpdates.get(getBoundaryIndexStart(group)))) {
+                        pushTransitionGuard(TransitionGuard.createUpdateCG(getBoundaryIndexStart(group)));
+                    }
+                    calcGroupBoundariesEnter(group);
+                    if (group.isConditionalBackReferenceGroup()) {
+                        pushTransitionGuard(getConditionalBackReferenceGroupTransitionGuard(group, groupAltIndex));
+                    }
+                } else if (PathElement.isGroupExitOrEscape(element)) {
+                    if (PathElement.isGroupExit(element)) {
+                        if (group.hasQuantifier()) {
+                            Quantifier quantifier = group.getQuantifier();
+                            if (quantifier.hasIndex()) {
+                                if (!root.isGroup()) {
+                                    bqLastCounterReset[quantifier.getIndex()] = transitionGuards.length();
+                                }
+                                bqExited.set(group.getGroupsWithGuardsIndex());
+                            }
+                            if (needsEmptyCheck(group)) {
+                                pushTransitionGuard(TransitionGuard.createExitZeroWidth(quantifier));
+                            }
+                        }
+                    } else if (PathElement.isGroupEscape(element)) {
+                        if (group.hasQuantifier()) {
+                            Quantifier quantifier = group.getQuantifier();
+                            if (quantifier.hasIndex()) {
+                                bqLastCounterReset[quantifier.getIndex()] = transitionGuards.length();
+                                if (bqBypassed.get(group.getGroupsWithGuardsIndex())) {
+                                    setShouldRetreat();
+                                }
+                                bqBypassed.set(group.getGroupsWithGuardsIndex());
+                            }
+                            if (quantifier.hasZeroWidthIndex()) {
+                                pushTransitionGuard(TransitionGuard.createEscapeZeroWidth(quantifier));
+                            }
+                        }
+                    }
+                    pushRecursiveBackrefUpdates(group);
+                    if (needsUpdateCGStepByStep(group) && (getFlavor().usesLastGroupResultField() || !captureGroupUpdates.get(getBoundaryIndexEnd(group)))) {
+                        pushTransitionGuard(TransitionGuard.createUpdateCG(getBoundaryIndexEnd(group)));
+                    }
+                    calcGroupBoundariesExit(group);
+                } else if (PathElement.isGroupPassThrough(element)) {
+                    Group quantifierGroup = getQuantifiedGroupFromPassthrough(group, groupAltIndex);
+                    Quantifier quantifier = quantifierGroup.getQuantifier();
+                    if (!quantifierGroup.isExpandedQuantifier()) {
+                        if (quantifierGroup.isDead()) {
+                            if (quantifier.getMin() > 0 && !quantifierGroup.isOptionalQuantifier()) {
+                                setShouldRetreat();
+                            }
+                        } else if (quantifier.hasIndex()) {
+                            if (bqBypassed.get(quantifierGroup.getGroupsWithGuardsIndex())) {
+                                setShouldRetreat();
+                            }
+                            bqBypassed.set(quantifierGroup.getGroupsWithGuardsIndex());
+                            if (quantifierGroup.isMandatoryQuantifier() || quantifier.getMin() > 0 && !quantifierGroup.isOptionalQuantifier()) {
+                                if (!bqExited.get(quantifierGroup.getGroupsWithGuardsIndex())) {
+                                    setShouldRetreat();
+                                }
+                                if (quantifier.getMin() > 0) {
+                                    pushTransitionGuard(TransitionGuard.createCountGeMin(quantifier));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for (int i = 0; i < transitionGuards.length(); i++) {
+            long guard = transitionGuards.get(i);
+            if (shouldKeepGuard(guard, i)) {
+                transitionGuardsCanonicalized.add(guard);
+            }
+        }
+    }
+
+    private boolean shouldKeepGuard(long guard, int guardPosition) {
+        switch (TransitionGuard.getKind(guard)) {
+            case countSet1, countInc, countSetMin -> {
+                return getFlavor().emptyChecksMonitorCaptureGroups() || guardPosition >= bqLastCounterReset[TransitionGuard.getQuantifierIndex(guard)];
+            }
+            case enterZeroWidth -> {
+                int zeroWidthQuantifierIndex = TransitionGuard.getZeroWidthQuantifierIndex(guard);
+                Group quantifiedTerm = (Group) ast.getZeroWidthQuantifiables().get(zeroWidthQuantifierIndex);
+                // we need to keep enterZeroWidth guards if the quantified expression can contain
+                // NFA states that don't consume any characters, or the expression contains capture
+                // groups referred to by back-references. In the case of referenced groups, the
+                // guard is needed just to differentiate transitions in nested quantifiers,
+                // because these may require additional backtracking, e.g. matching
+                // /a(b*)*c\\1d/ against "abbbbcbbd"
+                return bqLastZeroWidthEnter[zeroWidthQuantifierIndex] == guardPosition && (quantifiedTerm.hasCaret() ||
+                                quantifiedTerm.hasLookArounds() ||
+                                quantifiedTerm.hasBackReferences() ||
+                                quantifiedTerm.hasAtomicGroups() ||
+                                hasReferencedCaptureGroups(quantifiedTerm) ||
+                                (cur.isGroup() && cur.asGroup().getQuantifier().getZeroWidthIndex() != zeroWidthQuantifierIndex));
+            }
+            case updateRecursiveBackrefPointer -> {
+                for (int i = transitionGuards.length() - 1; i > guardPosition; i--) {
+                    if (transitionGuards.get(i) == guard) {
+                        return false;
+                    }
+                }
+                return true;
+            }
+            default -> {
+                return true;
+            }
+        }
+    }
+
+    private boolean hasReferencedCaptureGroups(Group quantifiedTerm) {
+        if (!ast.getProperties().hasBackReferences() || !quantifiedTerm.hasCaptureGroups()) {
+            return false;
+        }
+        referencedCaptureGroupsTmp.clear();
+        referencedCaptureGroupsTmp.setRange(quantifiedTerm.getCaptureGroupsLo(), quantifiedTerm.getCaptureGroupsHi() - 1);
+        return !ast.getReferencedGroups().isDisjoint(referencedCaptureGroupsTmp);
+    }
+
+    private static Group getQuantifiedGroupFromPassthrough(Group group, int groupAltIndex) {
+        assert group.size() == 2 && groupAltIndex - 1 >= 0 && groupAltIndex - 1 <= 1;
+        int otherAltIndex = (groupAltIndex - 1) ^ 1;
+        Sequence otherAlternative = group.getAlternatives().get(otherAltIndex);
+        Term quantifiedTerm = group.isInLookBehindAssertion() ? otherAlternative.getLastTerm() : otherAlternative.getFirstTerm();
+        assert !otherAlternative.isEmpty() && quantifiedTerm.isGroup();
+        Group quantifierGroup = quantifiedTerm.asGroup();
+        assert quantifierGroup.hasQuantifier();
+        return quantifierGroup;
+    }
+
+    private boolean needsUpdateCGStepByStep(Group group) {
+        return getFlavor().matchesTransitionsStepByStep() && group.isCapturing();
+    }
+
+    private boolean needsEmptyCheck(Group group) {
+        assert group.hasQuantifier();
+        return group.getQuantifier().hasZeroWidthIndex() && (getFlavor().emptyChecksOnMandatoryLoopIterations() || !group.isMandatoryUnrolledQuantifier());
+    }
+
+    private boolean needsZeroWidthEscape(Group group) {
+        if (getFlavor().failingEmptyChecksDontBacktrack()) {
+            return group.hasQuantifier() && group.getQuantifier().hasZeroWidthIndex();
+        } else {
+            return group.hasNotUnrolledQuantifier() && group.getQuantifier().hasZeroWidthIndex() && group.getQuantifier().getMin() > 0 && group.isMandatoryQuantifier();
+        }
+    }
+
+    private boolean clearsEnclosedGroups(Group group) {
+        return !getFlavor().nestedCaptureGroupsKeptOnLoopReentry() && group.hasQuantifier() && group.hasEnclosedCaptureGroups();
+    }
+
+    private boolean updatesLastGroupField(Group group) {
+        return getFlavor().usesLastGroupResultField() && group.isCapturing() && group.getGroupNumber() != 0;
+    }
+
+    private static long getConditionalBackReferenceGroupTransitionGuard(Group group, int groupAltIndex) {
+        assert group.isConditionalBackReferenceGroup();
+        int referencedGroupNumber = group.asConditionalBackReferenceGroup().getReferencedGroupNumber();
+        if (groupAltIndex == 1) {
+            return TransitionGuard.createCheckGroupMatched(referencedGroupNumber);
+        } else {
+            assert groupAltIndex == 2;
+            return TransitionGuard.createCheckGroupNotMatched(referencedGroupNumber);
+        }
+    }
+
+    private void pushRecursiveBackrefUpdates(Group group) {
+        if (getFlavor().supportsRecursiveBackreferences() && ast.getProperties().hasRecursiveBackReferences()) {
+            if (group.isCapturing() && ast.isGroupRecursivelyReferenced(group.getGroupNumber())) {
+                pushTransitionGuard(TransitionGuard.createUpdateRecursiveBackref(group.getGroupNumber()));
+            }
+        }
+    }
+
+    private void clearTransitionGuards() {
+        transitionGuards.clear();
+        transitionGuardsCanonicalized.clear();
+    }
+
+    private void pushTransitionGuard(long guard) {
+        // First, we check whether the guard can be resolved statically. If it is trivially true,
+        // we ignore it (normalization). If it is impossible to satisfy, we backtrack.
+        switch (TransitionGuard.getKind(guard)) {
+            case countSet1, countSetMin -> {
+                bqLastCounterReset[TransitionGuard.getQuantifierIndex(guard)] = transitionGuards.length();
+            }
+            case countLtMin, countGeMin, countLtMax -> {
+                if (canOmitCounterCheck(guard)) {
+                    return;
+                }
+            }
+            case exitZeroWidth, escapeZeroWidth -> {
+                boolean keptAliveByConsumedInput = false;
+                boolean keptAliveByCaptureGroups = false;
+                if (!transitionGuards.isEmpty() && transitionGuards.peek() == guard) {
+                    return;
+                }
+                // Search for the last enterZeroWidth guard of the same group.
+                long enter = TransitionGuard.createEnterZeroWidthFromExit(guard);
+                boolean enterFound = false;
+                for (int i = transitionGuards.length() - 1; i >= 0; i--) {
+                    long tg = transitionGuards.get(i);
+                    if (tg == enter) {
+                        enterFound = true;
+                        break;
+                    }
+                    if (getFlavor().emptyChecksMonitorCaptureGroups() && TransitionGuard.is(tg, TransitionGuard.Kind.updateCG)) {
+                        keptAliveByCaptureGroups = true;
+                    }
+                }
+                if (!enterFound) {
+                    // We did not find any corresponding enterZeroWidth, so exitZeroWidth will
+                    // pass because of input being consumed.
+                    keptAliveByConsumedInput = isBuildingDFA() || !canMatchEmptyString(root);
+                }
+                boolean keptAlive = keptAliveByConsumedInput || keptAliveByCaptureGroups;
+                boolean isExit = TransitionGuard.is(guard, TransitionGuard.Kind.exitZeroWidth);
+                boolean isEscape = TransitionGuard.is(guard, TransitionGuard.Kind.escapeZeroWidth);
+                int zeroWidthQuantifierIndex = TransitionGuard.getZeroWidthQuantifierIndex(guard);
+                if (isEscape) {
+                    bqLastZeroWidthEnter[zeroWidthQuantifierIndex] = -1;
+                }
+                if ((isExit && !keptAlive) || (isEscape && keptAlive)) {
+                    if (isBuildingDFA() || (isExit && enterFound) || !canMatchEmptyString(root) || root.isMatchFound()) {
+                        setShouldRetreat();
+                    }
+                }
+                if (isBuildingDFA() || !canMatchEmptyString(root) || root.isMatchFound() ||
+                                (root.isGroup() && root.asGroup().getQuantifier().getZeroWidthIndex() == zeroWidthQuantifierIndex) ||
+                                (isEscape && enterFound && !keptAliveByCaptureGroups)) {
+                    return;
+                }
+            }
+            case enterZeroWidth -> {
+                int zeroWidthQuantifierIndex = TransitionGuard.getZeroWidthQuantifierIndex(guard);
+                if (bqLastZeroWidthEnter[zeroWidthQuantifierIndex] < 0) {
+                    bqLastZeroWidthEnter[zeroWidthQuantifierIndex] = transitionGuards.length();
+                } else if (getFlavor().emptyChecksMonitorCaptureGroups()) {
+                    // If there is another enterZeroWidth for the same group in the quantifier
+                    // guards and there are no CG updates in between, then this new enterZeroWidth
+                    // is redundant.
+                    for (int i = transitionGuards.length() - 1; i >= bqLastZeroWidthEnter[zeroWidthQuantifierIndex]; i--) {
+                        if (TransitionGuard.is(transitionGuards.get(i), TransitionGuard.Kind.updateCG)) {
+                            bqLastZeroWidthEnter[zeroWidthQuantifierIndex] = transitionGuards.length();
+                            break;
+                        }
+                    }
+                }
+            }
+            case checkGroupMatched, checkGroupNotMatched -> {
+                assert (isBuildingDFA() && getMatchedConditionGroups() != null) == this instanceof ASTStepVisitor;
+                if (isBuildingDFA() && getMatchedConditionGroups() != null) {
+                    int referencedGroupNumber = TransitionGuard.getGroupNumber(guard);
+                    int groupEndIndex = Group.groupNumberToBoundaryIndexEnd(referencedGroupNumber);
+                    boolean groupMatched = (getMatchedConditionGroups().get(referencedGroupNumber) && !captureGroupClears.get(groupEndIndex)) || captureGroupUpdates.get(groupEndIndex);
+                    if ((TransitionGuard.is(guard, TransitionGuard.Kind.checkGroupMatched)) != groupMatched) {
+                        setShouldRetreat();
+                    }
+                    return;
+                }
+            }
+        }
+        transitionGuards.add(guard);
+    }
+
+    private boolean canOmitCounterCheck(long guard) {
+        assert TransitionGuard.is(guard, TransitionGuard.Kind.countLtMin) || TransitionGuard.is(guard, TransitionGuard.Kind.countGeMin) || TransitionGuard.is(guard, TransitionGuard.Kind.countLtMax);
+        int quantifierIndex = TransitionGuard.getQuantifierIndex(guard);
+        int min = ast.getQuantifier(quantifierIndex).getMin();
+        int max = ast.getQuantifier(quantifierIndex).getMax();
+        int minPlus1 = saturatingInc(min);
+
+        long countLtMin = TransitionGuard.createCountLtMin(quantifierIndex);
+        long countGeMin = TransitionGuard.createCountGeMin(quantifierIndex);
+        long countLtMax = TransitionGuard.createCountLtMax(quantifierIndex);
+        long countInc = TransitionGuard.createCountInc(quantifierIndex);
+        long countSetMin = TransitionGuard.createCountSetMin(quantifierIndex);
+        long countSet1 = TransitionGuard.createCountSet1(quantifierIndex);
+
+        int counterLow = 0;
+        int counterHigh = Integer.MAX_VALUE;
+        for (long existingGuard : transitionGuards) {
+            if (existingGuard == countLtMin) {
+                counterHigh = Math.min(counterHigh, min - 1);
+            } else if (existingGuard == countGeMin) {
+                counterLow = Math.max(counterLow, min);
+            } else if (existingGuard == countLtMax) {
+                counterHigh = Math.min(counterHigh, max - 1);
+            } else if (existingGuard == countSetMin) {
+                counterLow = minPlus1;
+                counterHigh = minPlus1;
+            } else if (existingGuard == countSet1) {
+                counterLow = 1;
+                counterHigh = 1;
+            } else if (existingGuard == countInc) {
+                counterLow = saturatingInc(counterLow);
+                counterHigh = saturatingInc(counterHigh);
+            }
+        }
+
+        switch (TransitionGuard.getKind(guard)) {
+            case countLtMin -> {
+                if (counterHigh < min) {
+                    return true;
+                } else if (counterLow >= min) {
+                    setShouldRetreat();
+                    return true;
+                } else {
+                    return false;
+                }
+            }
+            case countLtMax -> {
+                if (counterHigh < max) {
+                    return true;
+                } else if (counterLow >= max) {
+                    setShouldRetreat();
+                    return true;
+                } else {
+                    return false;
+                }
+            }
+            case countGeMin -> {
+                if (counterLow >= min) {
+                    return true;
+                } else if (counterHigh < min) {
+                    setShouldRetreat();
+                    return true;
+                } else {
+                    return false;
+                }
+            }
+            default -> throw CompilerDirectives.shouldNotReachHere();
+        }
+    }
+
+    /// Visited set management
+    private void addLookAroundToVisitedSet() {
+        LookAroundAssertion la = (LookAroundAssertion) cur;
+        lookAroundVisitedCount[la.getGlobalSubTreeId()]++;
+        lookAroundsOnPath.set(la.getGlobalSubTreeId());
+    }
+
+    private void removeLookAroundFromVisitedSet(long pathElement) {
+        LookAroundAssertion la = (LookAroundAssertion) pathGetNode(pathElement);
+        if (--lookAroundVisitedCount[la.getGlobalSubTreeId()] == 0) {
+            lookAroundsOnPath.clear(la.getGlobalSubTreeId());
+        }
+    }
+
+    private static boolean isEmpty(int[] array) {
+        for (int i : array) {
             if (i != 0) {
                 return false;
             }
@@ -827,20 +1393,145 @@ public abstract class NFATraversalRegexASTVisitor {
         System.out.println("NEW PATH");
         for (int i = 0; i < curPath.length(); i++) {
             long element = curPath.get(i);
-            if (pathIsGroup(element)) {
+            if (PathElement.isGroup(element)) {
                 Group group = (Group) pathGetNode(element);
-                if (pathIsGroupEnter(element)) {
-                    System.out.println(String.format("ENTER (%d)   %s", pathGetGroupAltIndex(element), group));
-                } else if (pathIsGroupExit(element)) {
-                    System.out.println(String.format("EXIT        %s", group));
-                } else if (pathIsGroupPassThrough(element)) {
-                    System.out.println(String.format("PASSTHROUGH %s", group));
+                if (PathElement.isGroupEnter(element)) {
+                    System.out.printf("ENTER (%2d)  %2d %s%n", PathElement.getGroupAltIndex(element), group.getId(), group);
+                } else if (PathElement.isGroupExit(element)) {
+                    System.out.printf("EXIT        %2d %s%n", group.getId(), group);
+                } else if (PathElement.isGroupPassThrough(element)) {
+                    System.out.printf("PASSTHROUGH %2d %s%n", group.getId(), group);
                 } else {
-                    System.out.println(String.format("RUBY ESCAPE %s", group));
+                    System.out.printf("ESCAPE      %2d %s%n", group.getId(), group);
                 }
             } else {
-                System.out.println(String.format("NODE        %s", pathGetNode(element)));
+                System.out.printf("NODE        %2d %s%n", PathElement.getNodeId(element), pathGetNode(element));
             }
+        }
+    }
+
+    @SuppressWarnings("unused")
+    protected void dumpTransitionGuards(long[] guards) {
+        for (long guard : guards) {
+            System.out.println(TransitionGuard.toString(guard));
+        }
+    }
+
+    private static final class DeduplicationKey {
+        private final long[] key;
+        private final int hashCode;
+
+        DeduplicationKey(long[] key) {
+            this.key = key;
+            this.hashCode = Arrays.hashCode(key);
+        }
+
+        @Override
+        public boolean equals(Object obj) {
+            if (!(obj instanceof DeduplicationKey other)) {
+                return false;
+            }
+            return Arrays.equals(key, other.key);
+        }
+
+        @Override
+        public int hashCode() {
+            return hashCode;
+        }
+    }
+
+    private static final class PathElement {
+
+        /**
+         * First field: (short) group alternation index. This value is used to iterate the
+         * alternations of groups referenced in a group-enter path element. <br>
+         * Since the same group can appear multiple times on the path, we cannot reuse
+         * {@link Group}'s implementation of {@link RegexASTVisitorIterable}. Therefore, every
+         * occurrence of a group on the path has its own index for iterating and back-tracking over
+         * its alternatives.
+         */
+        private static final int PATH_GROUP_ALT_INDEX_OFFSET = 0;
+        /**
+         * Second field: (int) id of the path element's {@link RegexASTNode}.
+         */
+        private static final int PATH_NODE_OFFSET = Short.SIZE;
+        /**
+         * Third field: group action. Every path element referencing a group must have one of four
+         * possible group actions:
+         * <ul>
+         * <li>group enter</li>
+         * <li>group exit</li>
+         * <li>group pass through</li>
+         * <li>group escape</li>
+         * </ul>
+         */
+        private static final int GROUP_ACTION_OFFSET = Short.SIZE + Integer.SIZE;
+        private static final long GROUP_ACTION_ENTER = 1L << GROUP_ACTION_OFFSET;
+        private static final long GROUP_ACTION_EXIT = 1L << GROUP_ACTION_OFFSET + 1;
+        private static final long GROUP_ACTION_PASS_THROUGH = 1L << GROUP_ACTION_OFFSET + 2;
+        private static final long GROUP_ACTION_ESCAPE = 1L << GROUP_ACTION_OFFSET + 3;
+        private static final long GROUP_ACTION_ANY = GROUP_ACTION_ENTER | GROUP_ACTION_EXIT | GROUP_ACTION_PASS_THROUGH | GROUP_ACTION_ESCAPE;
+
+        /**
+         * Create a new path element containing the given node.
+         */
+        private static long create(RegexASTNode node) {
+            return (long) node.getId() << PATH_NODE_OFFSET;
+        }
+
+        private static long createGroupEnter(Group group, int groupAltIndex) {
+            return create(group) | (groupAltIndex << PathElement.PATH_GROUP_ALT_INDEX_OFFSET) | PathElement.GROUP_ACTION_ENTER;
+        }
+
+        public static long createGroupPassThrough(Group group, int groupAltIndex) {
+            return create(group) | (groupAltIndex << PathElement.PATH_GROUP_ALT_INDEX_OFFSET) | PathElement.GROUP_ACTION_PASS_THROUGH;
+        }
+
+        public static long createGroupExit(Group group) {
+            return create(group) | PathElement.GROUP_ACTION_EXIT;
+        }
+
+        public static long createGroupEscape(Group group) {
+            return create(group) | PathElement.GROUP_ACTION_ESCAPE;
+        }
+
+        private static int getNodeId(long pathElement) {
+            return (int) (pathElement >>> PATH_NODE_OFFSET);
+        }
+
+        /**
+         * Get the group alternation index of the given path element.
+         */
+        private static int getGroupAltIndex(long pathElement) {
+            return (short) (pathElement >>> PATH_GROUP_ALT_INDEX_OFFSET);
+        }
+
+        /**
+         * Returns {@code true} if the given path element has any group action set. Every path
+         * element containing a group must have one group action.
+         */
+        private static boolean isGroup(long pathElement) {
+            return (pathElement & GROUP_ACTION_ANY) != 0;
+        }
+
+        private static boolean isGroupEnter(long pathElement) {
+            return (pathElement & GROUP_ACTION_ENTER) != 0;
+        }
+
+        private static boolean isGroupExit(long pathElement) {
+            return (pathElement & GROUP_ACTION_EXIT) != 0;
+        }
+
+        private static boolean isGroupPassThrough(long pathElement) {
+            return (pathElement & GROUP_ACTION_PASS_THROUGH) != 0;
+        }
+
+        private static boolean isGroupEscape(long pathElement) {
+            return (pathElement & GROUP_ACTION_ESCAPE) != 0;
+        }
+
+        private static boolean isGroupExitOrEscape(long pathElement) {
+            return (pathElement & (GROUP_ACTION_EXIT | GROUP_ACTION_ESCAPE)) != 0;
         }
     }
 }

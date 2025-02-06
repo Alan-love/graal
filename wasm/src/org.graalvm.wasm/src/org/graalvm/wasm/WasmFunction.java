@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2019, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -40,16 +40,18 @@
  */
 package org.graalvm.wasm;
 
+import com.oracle.truffle.api.CallTarget;
+import com.oracle.truffle.api.CompilerDirectives.CompilationFinal;
 import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
 
-public class WasmFunction {
+public final class WasmFunction {
     private final SymbolTable symbolTable;
     private final int index;
-    private ImportDescriptor importDescriptor;
-    private WasmCodeEntry codeEntry;
+    private final ImportDescriptor importDescriptor;
     private final int typeIndex;
-    private int typeEquivalenceClass;
-    private String debugName;
+    @CompilationFinal private int typeEquivalenceClass;
+    @CompilationFinal private String debugName;
+    @CompilationFinal private CallTarget callTarget;
 
     /**
      * Represents a WebAssembly function.
@@ -58,7 +60,6 @@ public class WasmFunction {
         this.symbolTable = symbolTable;
         this.index = index;
         this.importDescriptor = importDescriptor;
-        this.codeEntry = null;
         this.typeIndex = typeIndex;
         this.typeEquivalenceClass = -1;
     }
@@ -67,20 +68,20 @@ public class WasmFunction {
         return symbolTable.module().name();
     }
 
-    public int numArguments() {
-        return symbolTable.functionTypeArgumentCount(typeIndex);
+    public int paramCount() {
+        return symbolTable.functionTypeParamCount(typeIndex);
     }
 
-    public byte argumentTypeAt(int argumentIndex) {
-        return symbolTable.functionTypeArgumentTypeAt(typeIndex, argumentIndex);
+    public byte paramTypeAt(int argumentIndex) {
+        return symbolTable.functionTypeParamTypeAt(typeIndex, argumentIndex);
     }
 
-    public byte returnType() {
-        return symbolTable.functionTypeReturnType(typeIndex);
+    public int resultCount() {
+        return symbolTable.functionTypeResultCount(typeIndex);
     }
 
-    int returnTypeLength() {
-        return symbolTable.functionTypeReturnTypeLength(typeIndex);
+    public byte resultTypeAt(int returnIndex) {
+        return symbolTable.functionTypeResultTypeAt(typeIndex, returnIndex);
     }
 
     void setTypeEquivalenceClass(int typeEquivalenceClass) {
@@ -95,7 +96,7 @@ public class WasmFunction {
     @TruffleBoundary
     public String name() {
         if (importDescriptor != null) {
-            return importDescriptor.memberName;
+            return importDescriptor.memberName();
         }
         String exportedName = symbolTable.exportedFunctionName(index);
         if (exportedName != null) {
@@ -111,17 +112,6 @@ public class WasmFunction {
         this.debugName = debugName;
     }
 
-    public WasmCodeEntry codeEntry() {
-        return codeEntry;
-    }
-
-    public void setCodeEntry(WasmCodeEntry codeEntry) {
-        if (isImported()) {
-            throw new RuntimeException("Cannot set the code entry for an imported function.");
-        }
-        this.codeEntry = codeEntry;
-    }
-
     public boolean isImported() {
         return importDescriptor != null;
     }
@@ -131,11 +121,11 @@ public class WasmFunction {
     }
 
     public String importedModuleName() {
-        return isImported() ? importDescriptor.moduleName : null;
+        return isImported() ? importDescriptor.moduleName() : null;
     }
 
     public String importedFunctionName() {
-        return isImported() ? importDescriptor.memberName : null;
+        return isImported() ? importDescriptor.memberName() : null;
     }
 
     public int typeIndex() {
@@ -152,5 +142,20 @@ public class WasmFunction {
 
     public int index() {
         return index;
+    }
+
+    public CallTarget target() {
+        return callTarget;
+    }
+
+    public void setTarget(CallTarget callTarget) {
+        assert !isImported() : this;
+        assert this.callTarget == null : this;
+        this.callTarget = callTarget;
+    }
+
+    void setImportedFunctionCallTarget(CallTarget callTarget) {
+        assert isImported() : this;
+        this.callTarget = callTarget;
     }
 }

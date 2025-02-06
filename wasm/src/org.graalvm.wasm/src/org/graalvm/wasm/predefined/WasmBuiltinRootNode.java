@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2019, 2025, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -40,26 +40,34 @@
  */
 package org.graalvm.wasm.predefined;
 
-import org.graalvm.wasm.WasmInstance;
+import com.oracle.truffle.api.frame.VirtualFrame;
 import org.graalvm.wasm.WasmLanguage;
+import org.graalvm.wasm.WasmModule;
 import org.graalvm.wasm.memory.WasmMemory;
+import org.graalvm.wasm.memory.WasmMemoryLibrary;
 import org.graalvm.wasm.nodes.WasmRootNode;
 
 public abstract class WasmBuiltinRootNode extends WasmRootNode {
 
-    public WasmBuiltinRootNode(WasmLanguage language, WasmInstance instance) {
-        super(language, instance, null);
+    @Child protected WasmMemoryLibrary memoryLib;
+
+    protected WasmBuiltinRootNode(WasmLanguage language, WasmModule module) {
+        super(language, null, module);
+        this.memoryLib = insert(WasmMemoryLibrary.getFactory().createDispatched(3));
     }
 
     public abstract String builtinNodeName();
 
-    protected WasmMemory memory() {
-        return instance.memory();
+    protected final WasmMemory memory(VirtualFrame frame, int index) {
+        return instance(frame).memory(index);
+    }
+
+    protected final WasmMemory memory(VirtualFrame frame) {
+        return memory(frame, 0);
     }
 
     @Override
     public String getName() {
         return "wasm-function:" + builtinNodeName();
     }
-
 }

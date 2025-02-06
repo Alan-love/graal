@@ -24,15 +24,19 @@
  */
 package com.oracle.svm.core.genscavenge;
 
+import jdk.graal.compiler.word.Word;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
 import org.graalvm.word.UnsignedWord;
-import org.graalvm.word.WordFactory;
 
-import com.oracle.svm.core.log.Log;
+import com.oracle.svm.core.AlwaysInline;
+import com.oracle.svm.core.Uninterruptible;
 
 /**
- * This data is only updated during a GC.
+ * Note that this data may be updated up to 3 times during a single VM operation (incremental GC,
+ * full GC, full GC that treats soft references as weak). Therefore, this class should only be used
+ * by GC internal code that is aware of this (could result in incorrect "before"/"after" values
+ * otherwise). Non-GC code should use the class {@link HeapAccounting} instead.
  *
  * ChunkBytes refer to bytes reserved (but maybe not occupied). ObjectBytes refer to bytes occupied
  * by objects.
@@ -43,26 +47,24 @@ public final class GCAccounting {
     private long incrementalCollectionTotalNanos = 0;
     private long completeCollectionCount = 0;
     private long completeCollectionTotalNanos = 0;
-    private UnsignedWord collectedTotalChunkBytes = WordFactory.zero();
-    private UnsignedWord allocatedChunkBytes = WordFactory.zero();
-    private UnsignedWord promotedTotalChunkBytes = WordFactory.zero();
-    private UnsignedWord copiedTotalChunkBytes = WordFactory.zero();
+    private UnsignedWord totalCollectedChunkBytes = Word.zero();
+    private UnsignedWord totalAllocatedChunkBytes = Word.zero();
+    private UnsignedWord lastIncrementalCollectionPromotedChunkBytes = Word.zero();
+    private boolean lastIncrementalCollectionOverflowedSurvivors = false;
 
     /* Before and after measures. */
-    private UnsignedWord youngChunkBytesBefore = WordFactory.zero();
-    private UnsignedWord youngChunkBytesAfter = WordFactory.zero();
-    private UnsignedWord oldChunkBytesBefore = WordFactory.zero();
-    private UnsignedWord oldChunkBytesAfter = WordFactory.zero();
-    private UnsignedWord lastCollectionPromotedChunkBytes = WordFactory.zero();
+    private UnsignedWord youngChunkBytesBefore = Word.zero();
+    private UnsignedWord oldChunkBytesBefore = Word.zero();
+    private UnsignedWord oldChunkBytesAfter = Word.zero();
 
     /*
      * Bytes allocated in Objects, as opposed to bytes of chunks. These are only maintained if
      * -R:+PrintGCSummary because they are expensive.
      */
-    private UnsignedWord collectedTotalObjectBytes = WordFactory.zero();
-    private UnsignedWord youngObjectBytesBefore = WordFactory.zero();
-    private UnsignedWord oldObjectBytesBefore = WordFactory.zero();
-    private UnsignedWord allocatedObjectBytes = WordFactory.zero();
+    private UnsignedWord totalCollectedObjectBytes = Word.zero();
+    private UnsignedWord youngObjectBytesBefore = Word.zero();
+    private UnsignedWord oldObjectBytesBefore = Word.zero();
+    private UnsignedWord allocatedObjectBytes = Word.zero();
 
     @Platforms(Platform.HOSTED_ONLY.class)
     GCAccounting() {
@@ -76,10 +78,7 @@ public final class GCAccounting {
         return incrementalCollectionTotalNanos;
     }
 
-    UnsignedWord getAllocatedChunkBytes() {
-        return allocatedChunkBytes;
-    }
-
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     public long getCompleteCollectionCount() {
         return completeCollectionCount;
     }
@@ -88,112 +87,118 @@ public final class GCAccounting {
         return completeCollectionTotalNanos;
     }
 
-    UnsignedWord getCollectedTotalChunkBytes() {
-        return collectedTotalChunkBytes;
+    UnsignedWord getTotalAllocatedChunkBytes() {
+        return totalAllocatedChunkBytes;
     }
 
-    UnsignedWord getCollectedTotalObjectBytes() {
-        return collectedTotalObjectBytes;
+    UnsignedWord getTotalCollectedChunkBytes() {
+        return totalCollectedChunkBytes;
+    }
+
+    UnsignedWord getTotalCollectedObjectBytes() {
+        return totalCollectedObjectBytes;
     }
 
     UnsignedWord getAllocatedObjectBytes() {
         return allocatedObjectBytes;
     }
 
-    public UnsignedWord getOldGenerationAfterChunkBytes() {
+    UnsignedWord getOldGenerationAfterChunkBytes() {
         return oldChunkBytesAfter;
     }
 
-    UnsignedWord getYoungChunkBytesAfter() {
-        return youngChunkBytesAfter;
+    UnsignedWord getYoungChunkBytesBefore() {
+        return youngChunkBytesBefore;
     }
 
-    public static UnsignedWord getSurvivorSpaceAfterChunkBytes(int survivorIndex) {
-        return HeapImpl.getHeapImpl().getYoungGeneration().getSurvivorFromSpaceAt(survivorIndex).getChunkBytes();
+    UnsignedWord getLastIncrementalCollectionPromotedChunkBytes() {
+        return lastIncrementalCollectionPromotedChunkBytes;
     }
 
-    UnsignedWord getLastCollectionPromotedChunkBytes() {
-        return lastCollectionPromotedChunkBytes;
+    public boolean hasLastIncrementalCollectionOverflowedSurvivors() {
+        return lastIncrementalCollectionOverflowedSurvivors;
     }
 
-    void beforeCollection() {
-        Log trace = Log.noopLog().string("[GCImpl.Accounting.beforeCollection:").newline();
+    void beforeCollectOnce(boolean completeCollection) {
         /* Gather some space statistics. */
         HeapImpl heap = HeapImpl.getHeapImpl();
         YoungGeneration youngGen = heap.getYoungGeneration();
+        OldGeneration oldGen = heap.getOldGeneration();
+
         youngChunkBytesBefore = youngGen.getChunkBytes();
-        /* This is called before the collection, so OldSpace is FromSpace. */
-        Space oldSpace = heap.getOldGeneration().getFromSpace();
-        oldChunkBytesBefore = oldSpace.getChunkBytes();
+        oldChunkBytesBefore = oldGen.getChunkBytes();
+
         /* Objects are allocated in the young generation. */
-        allocatedChunkBytes = allocatedChunkBytes.add(youngChunkBytesBefore);
-        if (HeapOptions.PrintGCSummary.getValue()) {
-            youngObjectBytesBefore = youngGen.computeObjectBytes();
-            oldObjectBytesBefore = oldSpace.computeObjectBytes();
-            allocatedObjectBytes = allocatedObjectBytes.add(youngObjectBytesBefore);
-        }
-        trace.string("  youngChunkBytesBefore: ").unsigned(youngChunkBytesBefore)
-                        .string("  oldChunkBytesBefore: ").unsigned(oldChunkBytesBefore);
-        trace.string("]").newline();
-    }
+        totalAllocatedChunkBytes = totalAllocatedChunkBytes.add(youngGen.getEden().getChunkBytes());
 
-    void afterCollection(boolean completeCollection, Timer collectionTimer) {
-        if (completeCollection) {
-            afterCompleteCollection(collectionTimer);
-        } else {
-            afterIncrementalCollection(collectionTimer);
+        if (SerialGCOptions.PrintGCSummary.getValue()) {
+            UnsignedWord edenObjectBytesBefore = youngGen.getEden().computeObjectBytes();
+            youngObjectBytesBefore = edenObjectBytesBefore.add(youngGen.computeSurvivorObjectBytes());
+            oldObjectBytesBefore = oldGen.computeObjectBytes();
+            allocatedObjectBytes = allocatedObjectBytes.add(edenObjectBytesBefore);
+        }
+        if (!completeCollection) {
+            lastIncrementalCollectionOverflowedSurvivors = false;
         }
     }
 
-    private void afterIncrementalCollection(Timer collectionTimer) {
-        Log trace = Log.noopLog().string("[GCImpl.Accounting.afterIncrementalCollection:");
-        /*
-         * Aggregating collection information is needed because any given collection policy may not
-         * be called for all collections, but may want to make decisions based on the aggregate
-         * values.
-         */
-        incrementalCollectionCount += 1;
-        afterCollectionCommon();
-        /* Incremental collections only promote. */
-        lastCollectionPromotedChunkBytes = oldChunkBytesAfter.subtract(oldChunkBytesBefore);
-        promotedTotalChunkBytes = promotedTotalChunkBytes.add(lastCollectionPromotedChunkBytes);
-        incrementalCollectionTotalNanos += collectionTimer.getMeasuredNanos();
-        trace.string("  incrementalCollectionCount: ").signed(incrementalCollectionCount)
-                        .string("  oldChunkBytesAfter: ").unsigned(oldChunkBytesAfter)
-                        .string("  oldChunkBytesBefore: ").unsigned(oldChunkBytesBefore)
-                        .string("  promotedChunkBytes: ").unsigned(lastCollectionPromotedChunkBytes);
-        trace.string("]").newline();
+    /** Called after an object has been promoted from the young generation to the old generation. */
+    @AlwaysInline("GC performance")
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    void onSurvivorOverflowed() {
+        lastIncrementalCollectionOverflowedSurvivors = true;
     }
 
-    private void afterCompleteCollection(Timer collectionTimer) {
-        Log trace = Log.noopLog().string("[GCImpl.Accounting.afterCompleteCollection:");
-        completeCollectionCount += 1;
-        afterCollectionCommon();
-        /* Complete collections only copy, and they copy everything. */
-        copiedTotalChunkBytes = copiedTotalChunkBytes.add(oldChunkBytesAfter);
-        completeCollectionTotalNanos += collectionTimer.getMeasuredNanos();
-        trace.string("  completeCollectionCount: ").signed(completeCollectionCount)
-                        .string("  oldChunkBytesAfter: ").unsigned(oldChunkBytesAfter);
-        trace.string("]").newline();
-    }
-
-    void afterCollectionCommon() {
+    void afterCollectOnce(boolean completeCollection) {
         HeapImpl heap = HeapImpl.getHeapImpl();
-        // This is called after the collection, after the space flip, so OldSpace is FromSpace.
         YoungGeneration youngGen = heap.getYoungGeneration();
-        youngChunkBytesAfter = youngGen.getChunkBytes();
-        Space oldSpace = heap.getOldGeneration().getFromSpace();
-        oldChunkBytesAfter = oldSpace.getChunkBytes();
+        OldGeneration oldGen = heap.getOldGeneration();
+
+        UnsignedWord youngChunkBytesAfter = youngGen.getChunkBytes();
+        oldChunkBytesAfter = oldGen.getChunkBytes();
+
         UnsignedWord beforeChunkBytes = youngChunkBytesBefore.add(oldChunkBytesBefore);
-        UnsignedWord afterChunkBytes = oldChunkBytesAfter.add(youngChunkBytesAfter);
-        UnsignedWord collectedChunkBytes = beforeChunkBytes.subtract(afterChunkBytes);
-        collectedTotalChunkBytes = collectedTotalChunkBytes.add(collectedChunkBytes);
-        if (HeapOptions.PrintGCSummary.getValue()) {
-            UnsignedWord youngObjectBytesAfter = youngGen.computeObjectBytes();
-            UnsignedWord oldObjectBytesAfter = oldSpace.computeObjectBytes();
+        UnsignedWord afterChunkBytes = youngChunkBytesAfter.add(oldChunkBytesAfter);
+
+        /*
+         * A GC may slightly increase the number of chunk bytes if it doesn't free any memory (the
+         * order of objects may change, which can affect the bytes consumed by fragmentation).
+         */
+        if (beforeChunkBytes.aboveOrEqual(afterChunkBytes)) {
+            UnsignedWord collectedChunkBytes = beforeChunkBytes.subtract(afterChunkBytes);
+            totalCollectedChunkBytes = totalCollectedChunkBytes.add(collectedChunkBytes);
+        }
+
+        if (SerialGCOptions.PrintGCSummary.getValue()) {
+            UnsignedWord afterObjectBytesAfter = youngGen.computeObjectBytes().add(oldGen.computeObjectBytes());
             UnsignedWord beforeObjectBytes = youngObjectBytesBefore.add(oldObjectBytesBefore);
-            UnsignedWord collectedObjectBytes = beforeObjectBytes.subtract(oldObjectBytesAfter).subtract(youngObjectBytesAfter);
-            collectedTotalObjectBytes = collectedTotalObjectBytes.add(collectedObjectBytes);
+            /*
+             * Object size may increase (e.g., identity hashcode field may be added to promoted
+             * objects).
+             */
+            if (beforeObjectBytes.aboveOrEqual(afterObjectBytesAfter)) {
+                UnsignedWord collectedObjectBytes = beforeObjectBytes.subtract(afterObjectBytesAfter);
+                totalCollectedObjectBytes = totalCollectedObjectBytes.add(collectedObjectBytes);
+            }
+        }
+
+        if (!completeCollection) {
+            /*
+             * Aggregating collection information is needed because a collection policy might not be
+             * called for all collections, but may want to make decisions based on the aggregate
+             * values.
+             */
+            lastIncrementalCollectionPromotedChunkBytes = oldChunkBytesAfter.subtract(oldChunkBytesBefore);
+        }
+    }
+
+    void updateCollectionCountAndTime(boolean completeCollection, long collectionTime) {
+        if (completeCollection) {
+            completeCollectionCount += 1;
+            completeCollectionTotalNanos += collectionTime;
+        } else {
+            incrementalCollectionCount += 1;
+            incrementalCollectionTotalNanos += collectionTime;
         }
     }
 }

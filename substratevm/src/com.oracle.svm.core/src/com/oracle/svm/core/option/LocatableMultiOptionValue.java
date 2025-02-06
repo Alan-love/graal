@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2021, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -26,30 +26,36 @@ package com.oracle.svm.core.option;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
+import java.util.Optional;
+import java.util.Set;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
-import org.graalvm.collections.Pair;
-
-import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.common.option.MultiOptionValue;
+import com.oracle.svm.util.ClassUtil;
 
 public abstract class LocatableMultiOptionValue<T> implements MultiOptionValue<T> {
 
-    private final Class<T> valueType;
-    private final List<Pair<T, String>> values;
+    public record ValueWithOrigin<T>(T value, OptionOrigin origin) {
+    }
 
-    private LocatableMultiOptionValue(Class<T> valueType) {
+    protected static final String NO_DELIMITER = "";
+
+    private final String delimiter;
+    protected final Class<T> valueType;
+    protected final List<ValueWithOrigin<T>> values;
+
+    protected LocatableMultiOptionValue(Class<T> valueType, String delimiter, List<T> defaults) {
         this.valueType = valueType;
+        this.delimiter = delimiter;
         values = new ArrayList<>();
+        values.addAll(defaults.stream().map(val -> new ValueWithOrigin<>(val, OptionOrigin.from(null))).collect(Collectors.toList()));
     }
 
-    private LocatableMultiOptionValue(Class<T> valueType, List<T> defaults) {
-        this(valueType);
-        values.addAll(defaults.stream().map(val -> Pair.create(val, "default")).collect(Collectors.toList()));
-    }
-
-    private LocatableMultiOptionValue(LocatableMultiOptionValue<T> other) {
+    protected LocatableMultiOptionValue(LocatableMultiOptionValue<T> other) {
         this.valueType = other.valueType;
+        this.delimiter = other.delimiter;
         this.values = new ArrayList<>(other.values);
     }
 
@@ -59,46 +65,35 @@ public abstract class LocatableMultiOptionValue<T> implements MultiOptionValue<T
     }
 
     @Override
-    public void valueUpdate(Object value) {
-        Object rawValue = LocatableOption.rawValue(value);
-        String origin = LocatableOption.valueOrigin(value);
-        if (!valueType.isInstance(rawValue)) {
-            VMError.shouldNotReachHere("Cannot update LocatableMultiOptionValue of type " + valueType + " with value of type " + rawValue.getClass());
-        }
-        values.add(Pair.create(valueType.cast(rawValue), origin));
+    public String getDelimiter() {
+        return delimiter;
     }
 
     @Override
     public List<T> values() {
-        return values.stream().map(Pair::getLeft).collect(Collectors.toList());
+        return getValuesWithOrigins().map(ValueWithOrigin::value).collect(Collectors.toList());
     }
 
-    public Stream<Pair<T, String>> getValuesWithOrigins() {
+    public Set<T> valuesAsSet() {
+        return getValuesWithOrigins().map(ValueWithOrigin::value).collect(Collectors.toSet());
+    }
+
+    @Override
+    public Optional<T> lastValue() {
+        return lastValueWithOrigin().map(ValueWithOrigin::value);
+    }
+
+    public Optional<ValueWithOrigin<T>> lastValueWithOrigin() {
+        return values.isEmpty() ? Optional.empty() : Optional.of(values.getLast());
+    }
+
+    public Stream<ValueWithOrigin<T>> getValuesWithOrigins() {
         return values.stream();
     }
 
     @Override
     public String toString() {
-        return "<" + valueType.getSimpleName().toLowerCase() + ">*";
+        return "<" + ClassUtil.getUnqualifiedName(valueType).toLowerCase(Locale.ROOT) + ">*";
     }
 
-    public static class Strings extends LocatableMultiOptionValue<String> {
-
-        private Strings(Strings other) {
-            super(other);
-        }
-
-        @Override
-        public MultiOptionValue<String> createCopy() {
-            return new Strings(this);
-        }
-
-        public Strings() {
-            super(String.class);
-        }
-
-        public Strings(List<String> defaultStrings) {
-            super(String.class, defaultStrings);
-        }
-    }
 }

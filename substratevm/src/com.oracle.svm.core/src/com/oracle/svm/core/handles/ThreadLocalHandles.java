@@ -26,12 +26,12 @@ package com.oracle.svm.core.handles;
 
 import java.util.Arrays;
 
+import jdk.graal.compiler.word.Word;
 import org.graalvm.nativeimage.ObjectHandle;
 import org.graalvm.word.SignedWord;
-import org.graalvm.word.WordFactory;
 
-import com.oracle.svm.core.annotate.NeverInline;
-import com.oracle.svm.core.annotate.Uninterruptible;
+import com.oracle.svm.core.NeverInline;
+import com.oracle.svm.core.Uninterruptible;
 
 /**
  * Implementation of local object handles, which are bound to a specific thread and can be created
@@ -46,9 +46,10 @@ public final class ThreadLocalHandles<T extends ObjectHandle> {
 
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     public static <U extends SignedWord> U nullHandle() {
-        return WordFactory.signed(0);
+        return Word.signed(0);
     }
 
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     public static <U extends ObjectHandle> boolean isInRange(U handle) {
         return handle.rawValue() >= MIN_VALUE && handle.rawValue() <= MAX_VALUE;
     }
@@ -90,13 +91,25 @@ public final class ThreadLocalHandles<T extends ObjectHandle> {
     @SuppressWarnings("unchecked")
     public T create(Object obj) {
         if (obj == null) {
-            return (T) nullHandle();
+            return nullHandle();
         }
         ensureCapacity(1);
+        T handle = tryCreateNonNull(obj);
+        assert !handle.equal(nullHandle());
+        return handle;
+    }
+
+    @SuppressWarnings("unchecked")
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    public T tryCreateNonNull(Object obj) {
+        assert obj != null;
+        if (top >= objects.length) {
+            return nullHandle();
+        }
         int index = top;
         objects[index] = obj;
         top++;
-        return (T) WordFactory.signed(index);
+        return Word.signed(index);
     }
 
     @SuppressWarnings("unchecked")
@@ -116,6 +129,7 @@ public final class ThreadLocalHandles<T extends ObjectHandle> {
         popFramesIncluding(frameCount);
     }
 
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     public void popFramesIncluding(int frame) {
         assert frame > 0 && frame <= frameCount;
         int previousTop = top;

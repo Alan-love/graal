@@ -1,8 +1,14 @@
+---
+layout: docs
+toc_group: truffle
+link_title: Auxiliary Engine Caching
+permalink: /graalvm-as-a-platform/language-implementation-framework/AuxiliaryEngineCachingEnterprise/
+---
 # Auxiliary Engine Caching
 
 The following document describes how the auxiliary engine cache of GraalVM works.
 
-This feature is only available in GraalVM Enterprise Edition. In the community edition, these options are not available.
+This feature is only available in Oracle GraalVM. In GraalVM Community Edition, these options are not available.
 
 ## Introduction
 
@@ -13,7 +19,7 @@ This includes:
 2. Execution and profiling of the guest application in the interpreter.
 3. Compilation of the AST to machine code.
 
-Within a single OS process, the work performed during warmup can be shared by specifying an [explicit engine](https://www.graalvm.org/reference-manual/embed-languages/#code-caching-across-multiple-contexts).
+Within a single OS process, the work performed during warmup can be shared by specifying an [explicit engine](../../docs/reference-manual/embedding/embed-languages.md#code-caching-across-multiple-contexts).
 This requires language implementations to disable context-related optimizations to avoid deoptimizations between contexts that share code.
 Auxiliary engine caching builds upon the mechanism for disabling context-related optimizations and adds the capability to persist an engine with ASTs and optimized machine code to disk.
 This way, the work performed during warmup can be significantly reduced in the first application context of a new process.
@@ -25,15 +31,15 @@ This reduces the warmup time of an application significantly.
 
 ## Getting Started
 
-Starting from a GraalVM EE installation, you first need to (re)build an image with auxiliary engine caching capabilities.
+Starting from Oracle GraalVM installation, you first need to (re)build an image with auxiliary engine caching capabilities.
 For example, one can rebuild the JavaScript image by adding the auxiliary engine cache feature:
 
 ```
 graalvm/bin/native-image --macro:js-launcher -H:+AuxiliaryEngineCache -H:ReservedAuxiliaryImageBytes=1073741824
 ```
 
-The `--macro` argument value depends on the guest language 
-By default, auxiliary images of up to 1GB are possible. 
+The `--macro` argument value depends on the guest language
+By default, auxiliary images of up to 1GB are possible.
 The maximum size can be increased or decreased as needed.
 The amount of reserved bytes does not actually impact the memory consumed by the application.
 In future versions, the auxiliary engine cache will be enabled by default when the `--macro:js-launcher` macro is used.
@@ -135,7 +141,7 @@ If the language does not support it, then no data will be persisted.
 * The persisted auxiliary engine image can only be used with the same SVM native image that it was created with.
 Using the engine image with any other native-image will fail.
 
-* There can only be one active auxiliary image per native-image isolate. 
+* There can only be one active auxiliary image per native-image isolate.
 Trying to load multiple auxiliary images at the same time will fail.
 Currently, auxiliary images can also not be unloaded, but it is planned to lift this restriction in the future.
 
@@ -155,7 +161,7 @@ There are several options useful for debugging auxiliary engines caching when ru
 ## Development and Debugging on HotSpot
 
 It can be useful to debug language implementation issues related to auxiliary image on HotSpot.
-On GraalVM EE in JVM mode, we have additional options that can be used to help debug issues with this feature:
+On Oracle GraalVM in JVM mode, we have additional options that can be used to help debug issues with this feature:
 Since storing partial heaps on HotSpot is not supported, these debug features do not work on HotSpot.
 
 * `--engine.DebugCacheStore=<boolean>` Prepares the engine for caching and stores it to a static field instead of writing it to disk.
@@ -166,7 +172,7 @@ Since storing partial heaps on HotSpot is not supported, these debug features do
 For example:
 
 ```
-js --jvm  --experimental-options --engine.TraceCompilation --engine.DebugCacheTrace --engine.DebugCacheStore --engine.DebugCacheCompile=executed fib.js
+js --experimental-options --engine.TraceCompilation --engine.DebugCacheTrace --engine.DebugCacheStore --engine.DebugCacheCompile=executed fib.js
 ```
 
 Prints the following output:

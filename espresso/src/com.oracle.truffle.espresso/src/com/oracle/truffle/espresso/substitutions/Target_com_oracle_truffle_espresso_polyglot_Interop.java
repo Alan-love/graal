@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2020, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -22,27 +22,118 @@
  */
 package com.oracle.truffle.espresso.substitutions;
 
+import java.math.BigInteger;
+import java.nio.ByteOrder;
+
 import com.oracle.truffle.api.CompilerDirectives;
 import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
+import com.oracle.truffle.api.dsl.Bind;
+import com.oracle.truffle.api.dsl.Cached;
+import com.oracle.truffle.api.dsl.Cached.Exclusive;
+import com.oracle.truffle.api.dsl.Cached.Shared;
+import com.oracle.truffle.api.dsl.Fallback;
+import com.oracle.truffle.api.dsl.GenerateCached;
+import com.oracle.truffle.api.dsl.GenerateInline;
+import com.oracle.truffle.api.dsl.ImportStatic;
+import com.oracle.truffle.api.dsl.NeverDefault;
+import com.oracle.truffle.api.dsl.Specialization;
 import com.oracle.truffle.api.exception.AbstractTruffleException;
 import com.oracle.truffle.api.interop.ArityException;
 import com.oracle.truffle.api.interop.ExceptionType;
 import com.oracle.truffle.api.interop.InteropException;
 import com.oracle.truffle.api.interop.InteropLibrary;
 import com.oracle.truffle.api.interop.InvalidArrayIndexException;
+import com.oracle.truffle.api.interop.InvalidBufferOffsetException;
+import com.oracle.truffle.api.interop.StopIterationException;
 import com.oracle.truffle.api.interop.UnknownIdentifierException;
+import com.oracle.truffle.api.interop.UnknownKeyException;
 import com.oracle.truffle.api.interop.UnsupportedMessageException;
 import com.oracle.truffle.api.interop.UnsupportedTypeException;
+import com.oracle.truffle.api.library.CachedLibrary;
+import com.oracle.truffle.api.nodes.DirectCallNode;
+import com.oracle.truffle.api.nodes.Node;
+import com.oracle.truffle.api.profiles.BranchProfile;
+import com.oracle.truffle.api.profiles.InlinedBranchProfile;
+import com.oracle.truffle.api.profiles.InlinedConditionProfile;
 import com.oracle.truffle.api.utilities.TriState;
+import com.oracle.truffle.espresso.EspressoLanguage;
+import com.oracle.truffle.espresso.impl.Klass;
+import com.oracle.truffle.espresso.impl.PrimitiveKlass;
 import com.oracle.truffle.espresso.meta.EspressoError;
 import com.oracle.truffle.espresso.meta.Meta;
+import com.oracle.truffle.espresso.nodes.EspressoInlineNode;
+import com.oracle.truffle.espresso.nodes.interop.LookupInternalTypeConverterNode;
+import com.oracle.truffle.espresso.nodes.interop.LookupTypeConverterNode;
+import com.oracle.truffle.espresso.nodes.interop.MethodArgsUtils;
+import com.oracle.truffle.espresso.nodes.interop.PolyglotTypeMappings;
+import com.oracle.truffle.espresso.nodes.interop.ToEspressoNode;
+import com.oracle.truffle.espresso.nodes.interop.ToReference;
+import com.oracle.truffle.espresso.runtime.EspressoContext;
 import com.oracle.truffle.espresso.runtime.EspressoException;
-import com.oracle.truffle.espresso.runtime.StaticObject;
+import com.oracle.truffle.espresso.runtime.staticobject.StaticObject;
+import com.oracle.truffle.espresso.vm.VM;
 
 @EspressoSubstitutions
 public final class Target_com_oracle_truffle_espresso_polyglot_Interop {
 
-    private static final InteropLibrary UNCACHED = InteropLibrary.getUncached();
+    static final class InteropUtils {
+
+        static @JavaType(Object.class) StaticObject maybeWrapAsObject(Object value, InteropLibrary valueInterop, EspressoContext context) {
+            if (value instanceof StaticObject) {
+                // Already wrapped.
+                return (StaticObject) value;
+            }
+            return StaticObject.createForeign(context.getLanguage(), context.getMeta().java_lang_Object, value, valueInterop);
+        }
+
+        static @JavaType(Throwable.class) StaticObject maybeWrapAsForeignException(Object value, InteropLibrary valueInterop, EspressoContext context) {
+            assert InteropLibrary.getUncached().isException(value);
+            if (value instanceof StaticObject) {
+                // Already wrapped.
+                return (StaticObject) value;
+            }
+            // Wrap foreign object as ForeignException.
+            return StaticObject.createForeignException(context, value, valueInterop);
+        }
+
+        static String toHostString(Object value, InteropLibrary valueInterop) {
+            assert InteropLibrary.getUncached().isString(value);
+            try {
+                return valueInterop.asString(value);
+            } catch (UnsupportedMessageException e) {
+                CompilerDirectives.transferToInterpreterAndInvalidate();
+                throw EspressoError.shouldNotReachHere(e);
+            }
+        }
+
+        /*
+         * This method is used to unwrap an espresso object prior to leaving espresso. Conversion to
+         * boxed primitive host values will occur.
+         */
+        static Object unwrap(EspressoLanguage language, StaticObject object, Meta meta) {
+            return com.oracle.truffle.espresso.runtime.InteropUtils.unwrap(language, object, meta);
+        }
+
+        /*
+         * This method is used to unwrap an espresso object to temporarily use the original interop
+         * value. Foreign exception and converted foreign to guest objects are not unwrapped by this
+         * method.
+         */
+        static Object unwrapForeign(EspressoLanguage language, StaticObject object) {
+            if (object.isForeignObject()) {
+                return object.rawForeignObject(language);
+            }
+            return object;
+        }
+
+        @TruffleBoundary
+        @NeverDefault
+        static @JavaType(ByteOrder.class) StaticObject getLittleEndian(EspressoContext context) {
+            Meta meta = context.getMeta();
+            StaticObject staticStorage = meta.java_nio_ByteOrder.tryInitializeAndGetStatics();
+            return meta.java_nio_ByteOrder_LITTLE_ENDIAN.getObject(staticStorage);
+        }
+    }
 
     /**
      * Returns <code>true</code> if the receiver represents a <code>null</code> like value, else
@@ -52,8 +143,19 @@ public final class Target_com_oracle_truffle_espresso_polyglot_Interop {
      * @see InteropLibrary#isNull(Object)
      */
     @Substitution
-    public static boolean isNull(@Host(Object.class) StaticObject receiver) {
-        return UNCACHED.isNull(unwrap(receiver));
+    @GenerateInline(false) // not available for Substitutions
+    @ImportStatic(InteropUtils.class)
+    abstract static class IsNull extends SubstitutionNode {
+        static final int LIMIT = 4;
+
+        abstract boolean execute(@JavaType(Object.class) StaticObject receiver);
+
+        @Specialization
+        boolean doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop) {
+            return interop.isNull(InteropUtils.unwrapForeign(getLanguage(), receiver));
+        }
     }
 
     // region Boolean Messages
@@ -65,8 +167,18 @@ public final class Target_com_oracle_truffle_espresso_polyglot_Interop {
      * @see InteropLibrary#isBoolean(Object)
      */
     @Substitution
-    public static boolean isBoolean(@Host(Object.class) StaticObject receiver) {
-        return UNCACHED.isBoolean(unwrap(receiver));
+    @GenerateInline(false) // not available for Substitutions
+    abstract static class IsBoolean extends SubstitutionNode {
+        static final int LIMIT = 4;
+
+        abstract boolean execute(@JavaType(Object.class) StaticObject receiver);
+
+        @Specialization
+        boolean doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop) {
+            return interop.isBoolean(InteropUtils.unwrapForeign(getLanguage(), receiver));
+        }
     }
 
     /**
@@ -76,12 +188,26 @@ public final class Target_com_oracle_truffle_espresso_polyglot_Interop {
      * @see InteropLibrary#asBoolean(Object)
      */
     @Substitution
-    @Throws(UnsupportedMessageException.class)
-    public static boolean asBoolean(@Host(Object.class) StaticObject receiver, @InjectMeta Meta meta) {
-        try {
-            return UNCACHED.asBoolean(unwrap(receiver));
-        } catch (InteropException e) {
-            throw throwInteropException(e, meta);
+    @GenerateInline(false) // not available for Substitutions
+    @Throws(others = @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/UnsupportedMessageException;"))
+    abstract static class AsBoolean extends SubstitutionNode {
+        static final int LIMIT = 4;
+
+        abstract boolean execute(@JavaType(Object.class) StaticObject receiver);
+
+        @Specialization
+        static boolean doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @Bind Node node,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop,
+                        @Cached ThrowInteropExceptionAsGuest throwInteropExceptionAsGuest,
+                        @Cached InlinedBranchProfile exceptionProfile) {
+            try {
+                return interop.asBoolean(InteropUtils.unwrapForeign(EspressoLanguage.get(node), receiver));
+            } catch (InteropException e) {
+                exceptionProfile.enter(node);
+                throw throwInteropExceptionAsGuest.execute(node, e);
+            }
         }
     }
 
@@ -96,8 +222,18 @@ public final class Target_com_oracle_truffle_espresso_polyglot_Interop {
      * @see InteropLibrary#isString(Object)
      */
     @Substitution
-    public static boolean isString(@Host(Object.class) StaticObject receiver) {
-        return UNCACHED.isString(unwrap(receiver));
+    @GenerateInline(false) // not available for Substitutions
+    abstract static class IsString extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract boolean execute(@JavaType(Object.class) StaticObject receiver);
+
+        @Specialization
+        boolean doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop) {
+            return interop.isString(InteropUtils.unwrapForeign(getLanguage(), receiver));
+        }
     }
 
     /**
@@ -107,12 +243,29 @@ public final class Target_com_oracle_truffle_espresso_polyglot_Interop {
      * @see InteropLibrary#asString(Object)
      */
     @Substitution
-    @Throws(UnsupportedMessageException.class)
-    public static @Host(String.class) StaticObject asString(@Host(Object.class) StaticObject receiver, @InjectMeta Meta meta) {
-        try {
-            return meta.toGuestString(UNCACHED.asString(unwrap(receiver)));
-        } catch (InteropException e) {
-            throw throwInteropException(e, meta);
+    @GenerateInline(false) // not available for Substitutions
+    @Throws(others = @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/UnsupportedMessageException;"))
+    abstract static class AsString extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract @JavaType(String.class) StaticObject execute(@JavaType(Object.class) StaticObject receiver);
+
+        @Specialization
+        @JavaType(String.class)
+        static StaticObject doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @Bind Node node,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop,
+                        @Cached ThrowInteropExceptionAsGuest throwInteropExceptionAsGuest,
+                        @Cached InlinedBranchProfile exceptionProfile) {
+            EspressoLanguage language = EspressoLanguage.get(node);
+            Meta meta = EspressoContext.get(node).getMeta();
+            try {
+                return meta.toGuestString(interop.asString(InteropUtils.unwrapForeign(language, receiver)));
+            } catch (InteropException e) {
+                exceptionProfile.enter(node);
+                throw throwInteropExceptionAsGuest.execute(node, e);
+            }
         }
     }
 
@@ -127,8 +280,18 @@ public final class Target_com_oracle_truffle_espresso_polyglot_Interop {
      * @see InteropLibrary#isNumber(Object)
      */
     @Substitution
-    public static boolean isNumber(@Host(Object.class) StaticObject receiver) {
-        return UNCACHED.isNumber(unwrap(receiver));
+    @GenerateInline(false) // not available for Substitutions
+    abstract static class IsNumber extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract boolean execute(@JavaType(Object.class) StaticObject receiver);
+
+        @Specialization
+        boolean doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop) {
+            return interop.isNumber(InteropUtils.unwrapForeign(getLanguage(), receiver));
+        }
     }
 
     /**
@@ -139,8 +302,18 @@ public final class Target_com_oracle_truffle_espresso_polyglot_Interop {
      * @see InteropLibrary#fitsInByte(Object)
      */
     @Substitution
-    public static boolean fitsInByte(@Host(Object.class) StaticObject receiver) {
-        return UNCACHED.fitsInByte(unwrap(receiver));
+    @GenerateInline(false) // not available for Substitutions
+    abstract static class FitsInByte extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract boolean execute(@JavaType(Object.class) StaticObject receiver);
+
+        @Specialization
+        boolean doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop) {
+            return interop.fitsInByte(InteropUtils.unwrapForeign(getLanguage(), receiver));
+        }
     }
 
     /**
@@ -151,8 +324,18 @@ public final class Target_com_oracle_truffle_espresso_polyglot_Interop {
      * @see InteropLibrary#fitsInShort(Object)
      */
     @Substitution
-    public static boolean fitsInShort(@Host(Object.class) StaticObject receiver) {
-        return UNCACHED.fitsInShort(unwrap(receiver));
+    @GenerateInline(false) // not available for Substitutions
+    abstract static class FitsInShort extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract boolean execute(@JavaType(Object.class) StaticObject receiver);
+
+        @Specialization
+        boolean doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop) {
+            return interop.fitsInShort(InteropUtils.unwrapForeign(getLanguage(), receiver));
+        }
     }
 
     /**
@@ -163,8 +346,18 @@ public final class Target_com_oracle_truffle_espresso_polyglot_Interop {
      * @see InteropLibrary#fitsInInt(Object)
      */
     @Substitution
-    public static boolean fitsInInt(@Host(Object.class) StaticObject receiver) {
-        return UNCACHED.fitsInInt(unwrap(receiver));
+    @GenerateInline(false) // not available for Substitutions
+    abstract static class FitsInInt extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract boolean execute(@JavaType(Object.class) StaticObject receiver);
+
+        @Specialization
+        boolean doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop) {
+            return interop.fitsInInt(InteropUtils.unwrapForeign(getLanguage(), receiver));
+        }
     }
 
     /**
@@ -175,8 +368,18 @@ public final class Target_com_oracle_truffle_espresso_polyglot_Interop {
      * @see InteropLibrary#fitsInLong(Object)
      */
     @Substitution
-    public static boolean fitsInLong(@Host(Object.class) StaticObject receiver) {
-        return UNCACHED.fitsInLong(unwrap(receiver));
+    @GenerateInline(false) // not available for Substitutions
+    abstract static class FitsInLong extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract boolean execute(@JavaType(Object.class) StaticObject receiver);
+
+        @Specialization
+        boolean doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop) {
+            return interop.fitsInLong(InteropUtils.unwrapForeign(getLanguage(), receiver));
+        }
     }
 
     /**
@@ -187,8 +390,18 @@ public final class Target_com_oracle_truffle_espresso_polyglot_Interop {
      * @see InteropLibrary#fitsInFloat(Object)
      */
     @Substitution
-    public static boolean fitsInFloat(@Host(Object.class) StaticObject receiver) {
-        return UNCACHED.fitsInFloat(unwrap(receiver));
+    @GenerateInline(false) // not available for Substitutions
+    abstract static class FitsInFloat extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract boolean execute(@JavaType(Object.class) StaticObject receiver);
+
+        @Specialization
+        boolean doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop) {
+            return interop.fitsInFloat(InteropUtils.unwrapForeign(getLanguage(), receiver));
+        }
     }
 
     /**
@@ -199,8 +412,40 @@ public final class Target_com_oracle_truffle_espresso_polyglot_Interop {
      * @see InteropLibrary#fitsInDouble(Object)
      */
     @Substitution
-    public static boolean fitsInDouble(@Host(Object.class) StaticObject receiver) {
-        return UNCACHED.fitsInDouble(unwrap(receiver));
+    @GenerateInline(false) // not available for Substitutions
+    abstract static class FitsInDouble extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract boolean execute(@JavaType(Object.class) StaticObject receiver);
+
+        @Specialization
+        boolean doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop) {
+            return interop.fitsInDouble(InteropUtils.unwrapForeign(getLanguage(), receiver));
+        }
+    }
+
+    /**
+     * Returns <code>true</code> if the receiver represents a <code>number</code> and its value fits
+     * in a Java BigInteger without loss of precision, else <code>false</code>. Invoking this
+     * message does not cause any observable side-effects.
+     *
+     * @see InteropLibrary#fitsInBigInteger(Object)
+     */
+    @Substitution
+    @GenerateInline(false) // not available for Substitutions
+    abstract static class FitsInBigInteger extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract boolean execute(@JavaType(Object.class) StaticObject receiver);
+
+        @Specialization
+        boolean doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop) {
+            return interop.fitsInBigInteger(InteropUtils.unwrapForeign(getLanguage(), receiver));
+        }
     }
 
     /**
@@ -210,12 +455,26 @@ public final class Target_com_oracle_truffle_espresso_polyglot_Interop {
      * @see InteropLibrary#asByte(Object)
      */
     @Substitution
-    @Throws(UnsupportedMessageException.class)
-    public static byte asByte(@Host(Object.class) StaticObject receiver, @InjectMeta Meta meta) {
-        try {
-            return UNCACHED.asByte(unwrap(receiver));
-        } catch (InteropException e) {
-            throw throwInteropException(e, meta);
+    @GenerateInline(false) // not available for Substitutions
+    @Throws(others = @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/UnsupportedMessageException;"))
+    abstract static class AsByte extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract byte execute(@JavaType(Object.class) StaticObject receiver);
+
+        @Specialization
+        static byte doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @Bind Node node,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop,
+                        @Cached ThrowInteropExceptionAsGuest throwInteropExceptionAsGuest,
+                        @Cached InlinedBranchProfile exceptionProfile) {
+            try {
+                return interop.asByte(InteropUtils.unwrapForeign(EspressoLanguage.get(node), receiver));
+            } catch (InteropException e) {
+                exceptionProfile.enter(node);
+                throw throwInteropExceptionAsGuest.execute(node, e);
+            }
         }
     }
 
@@ -226,12 +485,26 @@ public final class Target_com_oracle_truffle_espresso_polyglot_Interop {
      * @see InteropLibrary#asShort(Object)
      */
     @Substitution
-    @Throws(UnsupportedMessageException.class)
-    public static short asShort(@Host(Object.class) StaticObject receiver, @InjectMeta Meta meta) {
-        try {
-            return UNCACHED.asShort(unwrap(receiver));
-        } catch (InteropException e) {
-            throw throwInteropException(e, meta);
+    @GenerateInline(false) // not available for Substitutions
+    @Throws(others = @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/UnsupportedMessageException;"))
+    abstract static class AsShort extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract short execute(@JavaType(Object.class) StaticObject receiver);
+
+        @Specialization
+        static short doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @Bind Node node,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop,
+                        @Cached ThrowInteropExceptionAsGuest throwInteropExceptionAsGuest,
+                        @Cached InlinedBranchProfile exceptionProfile) {
+            try {
+                return interop.asShort(InteropUtils.unwrapForeign(EspressoLanguage.get(node), receiver));
+            } catch (InteropException e) {
+                exceptionProfile.enter(node);
+                throw throwInteropExceptionAsGuest.execute(node, e);
+            }
         }
     }
 
@@ -242,12 +515,26 @@ public final class Target_com_oracle_truffle_espresso_polyglot_Interop {
      * @see InteropLibrary#asInt(Object)
      */
     @Substitution
-    @Throws(UnsupportedMessageException.class)
-    public static int asInt(@Host(Object.class) StaticObject receiver, @InjectMeta Meta meta) {
-        try {
-            return UNCACHED.asInt(unwrap(receiver));
-        } catch (InteropException e) {
-            throw throwInteropException(e, meta);
+    @GenerateInline(false) // not available for Substitutions
+    @Throws(others = @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/UnsupportedMessageException;"))
+    abstract static class AsInt extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract int execute(@JavaType(Object.class) StaticObject receiver);
+
+        @Specialization
+        static int doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @Bind Node node,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop,
+                        @Cached ThrowInteropExceptionAsGuest throwInteropExceptionAsGuest,
+                        @Cached InlinedBranchProfile exceptionProfile) {
+            try {
+                return interop.asInt(InteropUtils.unwrapForeign(EspressoLanguage.get(node), receiver));
+            } catch (InteropException e) {
+                exceptionProfile.enter(node);
+                throw throwInteropExceptionAsGuest.execute(node, e);
+            }
         }
     }
 
@@ -258,12 +545,26 @@ public final class Target_com_oracle_truffle_espresso_polyglot_Interop {
      * @see InteropLibrary#asLong(Object)
      */
     @Substitution
-    @Throws(UnsupportedMessageException.class)
-    public static long asLong(@Host(Object.class) StaticObject receiver, @InjectMeta Meta meta) {
-        try {
-            return UNCACHED.asLong(unwrap(receiver));
-        } catch (InteropException e) {
-            throw throwInteropException(e, meta);
+    @GenerateInline(false) // not available for Substitutions
+    @Throws(others = @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/UnsupportedMessageException;"))
+    abstract static class AsLong extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract long execute(@JavaType(Object.class) StaticObject receiver);
+
+        @Specialization
+        static long doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @Bind Node node,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop,
+                        @Cached ThrowInteropExceptionAsGuest throwInteropExceptionAsGuest,
+                        @Cached InlinedBranchProfile exceptionProfile) {
+            try {
+                return interop.asLong(InteropUtils.unwrapForeign(EspressoLanguage.get(node), receiver));
+            } catch (InteropException e) {
+                exceptionProfile.enter(node);
+                throw throwInteropExceptionAsGuest.execute(node, e);
+            }
         }
     }
 
@@ -274,12 +575,26 @@ public final class Target_com_oracle_truffle_espresso_polyglot_Interop {
      * @see InteropLibrary#asFloat(Object)
      */
     @Substitution
-    @Throws(UnsupportedMessageException.class)
-    public static float asFloat(@Host(Object.class) StaticObject receiver, @InjectMeta Meta meta) {
-        try {
-            return UNCACHED.asFloat(unwrap(receiver));
-        } catch (InteropException e) {
-            throw throwInteropException(e, meta);
+    @GenerateInline(false) // not available for Substitutions
+    @Throws(others = @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/UnsupportedMessageException;"))
+    abstract static class AsFloat extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract float execute(@JavaType(Object.class) StaticObject receiver);
+
+        @Specialization
+        static float doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @Bind Node node,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop,
+                        @Cached ThrowInteropExceptionAsGuest throwInteropExceptionAsGuest,
+                        @Cached InlinedBranchProfile exceptionProfile) {
+            try {
+                return interop.asFloat(InteropUtils.unwrapForeign(EspressoLanguage.get(node), receiver));
+            } catch (InteropException e) {
+                exceptionProfile.enter(node);
+                throw throwInteropExceptionAsGuest.execute(node, e);
+            }
         }
     }
 
@@ -290,12 +605,66 @@ public final class Target_com_oracle_truffle_espresso_polyglot_Interop {
      * @see InteropLibrary#asDouble(Object)
      */
     @Substitution
-    @Throws(UnsupportedMessageException.class)
-    public static double asDouble(@Host(Object.class) StaticObject receiver, @InjectMeta Meta meta) {
-        try {
-            return UNCACHED.asDouble(unwrap(receiver));
-        } catch (InteropException e) {
-            throw throwInteropException(e, meta);
+    @GenerateInline(false) // not available for Substitutions
+    @Throws(others = @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/UnsupportedMessageException;"))
+    abstract static class AsDouble extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract double execute(@JavaType(Object.class) StaticObject receiver);
+
+        @Specialization
+        static double doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @Bind Node node,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop,
+                        @Cached ThrowInteropExceptionAsGuest throwInteropExceptionAsGuest,
+                        @Cached InlinedBranchProfile exceptionProfile) {
+            try {
+                return interop.asDouble(InteropUtils.unwrapForeign(EspressoLanguage.get(node), receiver));
+            } catch (InteropException e) {
+                exceptionProfile.enter(node);
+                throw throwInteropExceptionAsGuest.execute(node, e);
+            }
+        }
+    }
+
+    /**
+     * Returns the receiver value as Java BigInteger if the number fits without loss of precision.
+     * Invoking this message does not cause any observable side-effects.
+     *
+     * @see InteropLibrary#asBigInteger(Object)
+     */
+    @Substitution
+    @GenerateInline(false) // not available for Substitutions
+    @Throws(others = @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/UnsupportedMessageException;"))
+    abstract static class AsBigInteger extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract @JavaType(BigInteger.class) StaticObject execute(@JavaType(Object.class) StaticObject receiver);
+
+        @Specialization
+        @JavaType(BigInteger.class)
+        static StaticObject doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @Bind Node node,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop,
+                        @Cached ThrowInteropExceptionAsGuest throwInteropExceptionAsGuest,
+                        @Cached InlinedBranchProfile exceptionProfile) {
+            try {
+                BigInteger bigInteger = interop.asBigInteger(InteropUtils.unwrapForeign(EspressoLanguage.get(node), receiver));
+                return toGuestBigInteger(EspressoContext.get(node).getMeta(), bigInteger);
+            } catch (InteropException e) {
+                exceptionProfile.enter(node);
+                throw throwInteropExceptionAsGuest.execute(node, e);
+            }
+        }
+
+        @TruffleBoundary
+        private static StaticObject toGuestBigInteger(Meta meta, BigInteger bigInteger) {
+            byte[] bytes = bigInteger.toByteArray();
+            StaticObject guestBigInteger = meta.getAllocator().createNew(meta.java_math_BigInteger);
+            meta.java_math_BigInteger_init.invokeDirectSpecial(guestBigInteger, StaticObject.wrap(bytes, meta));
+            return guestBigInteger;
         }
     }
 
@@ -319,8 +688,18 @@ public final class Target_com_oracle_truffle_espresso_polyglot_Interop {
      * @since 19.3
      */
     @Substitution
-    public static boolean isException(@Host(Object.class) StaticObject receiver) {
-        return UNCACHED.isException(unwrap(receiver));
+    @GenerateInline(false) // not available for Substitutions
+    abstract static class IsException extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract boolean execute(@JavaType(Object.class) StaticObject receiver);
+
+        @Specialization
+        boolean doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop) {
+            return interop.isException(InteropUtils.unwrapForeign(getLanguage(), receiver));
+        }
     }
 
     /**
@@ -338,12 +717,27 @@ public final class Target_com_oracle_truffle_espresso_polyglot_Interop {
      * @since 19.3
      */
     @Substitution
-    @Throws(UnsupportedMessageException.class)
-    public static @Host(RuntimeException.class) StaticObject throwException(@Host(Object.class) StaticObject receiver, @InjectMeta Meta meta) {
-        try {
-            throw UNCACHED.throwException(unwrap(receiver));
-        } catch (InteropException e) {
-            throw throwInteropException(e, meta);
+    @GenerateInline(false) // not available for Substitutions
+    @Throws(others = @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/UnsupportedMessageException;"))
+    abstract static class ThrowException extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract @JavaType(RuntimeException.class) StaticObject execute(@JavaType(Object.class) StaticObject receiver);
+
+        @Specialization
+        @JavaType(RuntimeException.class)
+        static StaticObject doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @Bind Node node,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop,
+                        @Cached ThrowInteropExceptionAsGuest throwInteropExceptionAsGuest,
+                        @Cached InlinedBranchProfile exceptionProfile) {
+            try {
+                throw interop.throwException(InteropUtils.unwrapForeign(EspressoLanguage.get(node), receiver));
+            } catch (InteropException e) {
+                exceptionProfile.enter(node);
+                throw throwInteropExceptionAsGuest.execute(node, e);
+            }
         }
     }
 
@@ -355,26 +749,40 @@ public final class Target_com_oracle_truffle_espresso_polyglot_Interop {
      * @since 20.3
      */
     @Substitution
-    @Throws(UnsupportedMessageException.class)
-    public static @Host(typeName = "Lcom/oracle/truffle/espresso/polyglot/ExceptionType;") StaticObject getExceptionType(
-                    @Host(Object.class) StaticObject receiver,
-                    @InjectMeta Meta meta) {
-        try {
-            ExceptionType exceptionType = UNCACHED.getExceptionType(unwrap(receiver));
-            StaticObject staticStorage = meta.polyglot.ExceptionType.tryInitializeAndGetStatics();
-            // @formatter:off
-            switch (exceptionType) {
-                case EXIT          : return meta.polyglot.ExceptionType_EXIT.getObject(staticStorage);
-                case INTERRUPT     : return meta.polyglot.ExceptionType_INTERRUPT.getObject(staticStorage);
-                case RUNTIME_ERROR : return meta.polyglot.ExceptionType_RUNTIME_ERROR.getObject(staticStorage);
-                case PARSE_ERROR   : return meta.polyglot.ExceptionType_PARSE_ERROR.getObject(staticStorage);
-                default:
-                    CompilerDirectives.transferToInterpreter();
-                    throw EspressoError.shouldNotReachHere("Unexpected ExceptionType: ", exceptionType);
+    @GenerateInline(false) // not available for Substitutions
+    @Throws(others = @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/UnsupportedMessageException;"))
+    abstract static class GetExceptionType extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/ExceptionType;") StaticObject execute(@JavaType(Object.class) StaticObject receiver);
+
+        @Specialization
+        @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/ExceptionType;")
+        static StaticObject doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @Bind Node node,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop,
+                        @Cached ThrowInteropExceptionAsGuest throwInteropExceptionAsGuest,
+                        @Cached InlinedBranchProfile exceptionProfile) {
+            try {
+                ExceptionType exceptionType = interop.getExceptionType(InteropUtils.unwrapForeign(EspressoLanguage.get(node), receiver));
+                Meta meta = EspressoContext.get(node).getMeta();
+                StaticObject staticStorage = meta.polyglot.ExceptionType.tryInitializeAndGetStatics();
+                // @formatter:off
+                switch (exceptionType) {
+                    case EXIT          : return meta.polyglot.ExceptionType_EXIT.getObject(staticStorage);
+                    case INTERRUPT     : return meta.polyglot.ExceptionType_INTERRUPT.getObject(staticStorage);
+                    case RUNTIME_ERROR : return meta.polyglot.ExceptionType_RUNTIME_ERROR.getObject(staticStorage);
+                    case PARSE_ERROR   : return meta.polyglot.ExceptionType_PARSE_ERROR.getObject(staticStorage);
+                    default:
+                        CompilerDirectives.transferToInterpreterAndInvalidate();
+                        throw EspressoError.shouldNotReachHere("Unexpected ExceptionType: " + exceptionType);
+                }
+                // @formatter:on
+            } catch (InteropException e) {
+                exceptionProfile.enter(node);
+                throw throwInteropExceptionAsGuest.execute(node, e);
             }
-            // @formatter:on
-        } catch (InteropException e) {
-            throw throwInteropException(e, meta);
         }
     }
 
@@ -388,32 +796,62 @@ public final class Target_com_oracle_truffle_espresso_polyglot_Interop {
      * @since 20.3
      */
     @Substitution
-    @Throws(UnsupportedMessageException.class)
-    public static boolean isExceptionIncompleteSource(@Host(Object.class) StaticObject receiver, @InjectMeta Meta meta) {
-        try {
-            return UNCACHED.isExceptionIncompleteSource(unwrap(receiver));
-        } catch (InteropException e) {
-            throw throwInteropException(e, meta);
+    @GenerateInline(false) // not available for Substitutions
+    @Throws(others = @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/UnsupportedMessageException;"))
+    abstract static class IsExceptionIncompleteSource extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract boolean execute(@JavaType(Object.class) StaticObject receiver);
+
+        @Specialization
+        static boolean doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @Bind Node node,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop,
+                        @Cached ThrowInteropExceptionAsGuest throwInteropExceptionAsGuest,
+                        @Cached InlinedBranchProfile error) {
+            try {
+                return interop.isExceptionIncompleteSource(InteropUtils.unwrapForeign(EspressoLanguage.get(node), receiver));
+            } catch (InteropException e) {
+                error.enter(node);
+                throw throwInteropExceptionAsGuest.execute(node, e);
+            }
         }
     }
 
     /**
      * Returns exception exit status of the receiver. Throws {@code UnsupportedMessageException}
      * when the receiver is not an {@link InteropLibrary#isException(Object) exception} of the
-     * {@link ExceptionType#EXIT exit type}. A return value zero indicates that the execution of the
-     * application was successful, a non-zero value that it failed. The individual interpretation of
-     * non-zero values depends on the application.
+     * {@link ExceptionType#EXIT exit type}. See
+     * <a href= "https://github.com/oracle/graal/blob/master/truffle/docs/Exit.md">Context Exit</a>
+     * for further information. A return value zero indicates that the execution of the application
+     * was successful, a non-zero value that it failed. The individual interpretation of non-zero
+     * values depends on the application.
      *
      * @see InteropLibrary#getExceptionExitStatus(Object)
      * @since 20.3
      */
     @Substitution
-    @Throws(UnsupportedMessageException.class)
-    public static int getExceptionExitStatus(@Host(Object.class) StaticObject receiver, @InjectMeta Meta meta) {
-        try {
-            return UNCACHED.getExceptionExitStatus(unwrap(receiver));
-        } catch (InteropException e) {
-            throw throwInteropException(e, meta);
+    @GenerateInline(false) // not available for Substitutions
+    @Throws(others = @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/UnsupportedMessageException;"))
+    abstract static class GetExceptionExitStatus extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract int execute(@JavaType(Object.class) StaticObject receiver);
+
+        @Specialization
+        static int doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @Bind Node node,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop,
+                        @Cached ThrowInteropExceptionAsGuest throwInteropExceptionAsGuest,
+                        @Cached InlinedBranchProfile error) {
+            try {
+                return interop.getExceptionExitStatus(InteropUtils.unwrapForeign(EspressoLanguage.get(node), receiver));
+            } catch (InteropException e) {
+                error.enter(node);
+                throw throwInteropExceptionAsGuest.execute(node, e);
+            }
         }
     }
 
@@ -426,8 +864,18 @@ public final class Target_com_oracle_truffle_espresso_polyglot_Interop {
      * @since 20.3
      */
     @Substitution
-    public static boolean hasExceptionCause(@Host(Object.class) StaticObject receiver) {
-        return UNCACHED.hasExceptionCause(unwrap(receiver));
+    @GenerateInline(false) // not available for Substitutions
+    abstract static class HasExceptionCause extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract boolean execute(@JavaType(Object.class) StaticObject receiver);
+
+        @Specialization
+        boolean doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop) {
+            return interop.hasExceptionCause(InteropUtils.unwrapForeign(getLanguage(), receiver));
+        }
     }
 
     /**
@@ -440,19 +888,32 @@ public final class Target_com_oracle_truffle_espresso_polyglot_Interop {
      * @since 20.3
      */
     @Substitution
-    @Throws(UnsupportedMessageException.class)
-    public static @Host(Object.class) StaticObject getExceptionCause(@Host(Object.class) StaticObject receiver, @InjectMeta Meta meta) {
-        try {
-            Object cause = UNCACHED.getExceptionCause(unwrap(receiver));
-            assert UNCACHED.isException(cause);
-            assert !UNCACHED.isNull(cause);
-            if (cause instanceof StaticObject) {
-                return (StaticObject) cause; // Already typed, do not re-type.
+    @GenerateInline(false) // not available for Substitutions
+    @Throws(others = @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/UnsupportedMessageException;"))
+    abstract static class GetExceptionCause extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract @JavaType(Object.class) StaticObject execute(@JavaType(Object.class) StaticObject receiver);
+
+        @Specialization
+        @JavaType(Object.class)
+        static StaticObject doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @Bind Node node,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary causeInterop,
+                        @Cached ThrowInteropExceptionAsGuest throwInteropExceptionAsGuest,
+                        @Cached InlinedBranchProfile error) {
+            try {
+                Object cause = interop.getExceptionCause(InteropUtils.unwrapForeign(EspressoLanguage.get(node), receiver));
+                assert InteropLibrary.getUncached().isException(cause);
+                assert !InteropLibrary.getUncached().isNull(cause);
+                // The cause must be an exception; if foreign, wrap it as ForeignException.
+                return InteropUtils.maybeWrapAsForeignException(cause, causeInterop, EspressoContext.get(node));
+            } catch (InteropException e) {
+                error.enter(node);
+                throw throwInteropExceptionAsGuest.execute(node, e);
             }
-            // The cause must be an exception, wrap it as ForeignException.
-            return StaticObject.createForeignException(meta, cause, UNCACHED);
-        } catch (InteropException e) {
-            throw throwInteropException(e, meta);
         }
     }
 
@@ -464,8 +925,18 @@ public final class Target_com_oracle_truffle_espresso_polyglot_Interop {
      * @since 20.3
      */
     @Substitution
-    public static boolean hasExceptionMessage(@Host(Object.class) StaticObject receiver) {
-        return UNCACHED.hasExceptionMessage(unwrap(receiver));
+    @GenerateInline(false) // not available for Substitutions
+    abstract static class HasExceptionMessage extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract boolean execute(@JavaType(Object.class) StaticObject receiver);
+
+        @Specialization
+        boolean doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop) {
+            return interop.hasExceptionMessage(InteropUtils.unwrapForeign(getLanguage(), receiver));
+        }
     }
 
     /**
@@ -478,20 +949,33 @@ public final class Target_com_oracle_truffle_espresso_polyglot_Interop {
      * @since 20.3
      */
     @Substitution
-    @Throws(UnsupportedMessageException.class)
-    public static @Host(Object.class) StaticObject getExceptionMessage(@Host(Object.class) StaticObject receiver, @InjectMeta Meta meta) {
-        try {
-            Object message = UNCACHED.getExceptionMessage(unwrap(receiver));
-            assert UNCACHED.isString(message);
-            if (message instanceof StaticObject) {
-                return (StaticObject) message;
+    @GenerateInline(false) // not available for Substitutions
+    @Throws(others = @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/UnsupportedMessageException;"))
+    abstract static class GetExceptionMessage extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract @JavaType(Object.class) StaticObject execute(@JavaType(Object.class) StaticObject receiver);
+
+        @Specialization
+        @JavaType(Object.class)
+        static StaticObject doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @Bind Node node,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary messageInterop,
+                        @Cached ThrowInteropExceptionAsGuest throwInteropExceptionAsGuest,
+                        @Cached InlinedBranchProfile exceptionProfile) {
+            try {
+                Object message = interop.getExceptionMessage(InteropUtils.unwrapForeign(EspressoLanguage.get(node), receiver));
+                assert InteropLibrary.getUncached().isString(message);
+                // TODO(peterssen): Cannot wrap as String even if the foreign object is String-like.
+                // Executing String methods, that rely on it having a .value field is not supported
+                // yet in Espresso.
+                return InteropUtils.maybeWrapAsObject(message, messageInterop, EspressoContext.get(node));
+            } catch (InteropException e) {
+                exceptionProfile.enter(node);
+                throw throwInteropExceptionAsGuest.execute(node, e);
             }
-            // TODO(peterssen): Cannot wrap as String even if the foreign object is String-like.
-            // Executing String methods, that rely on it having a .value field is not supported yet
-            // in Espresso.
-            return StaticObject.createForeign(meta.java_lang_Object, message, UNCACHED);
-        } catch (InteropException e) {
-            throw throwInteropException(e, meta);
         }
     }
 
@@ -503,8 +987,18 @@ public final class Target_com_oracle_truffle_espresso_polyglot_Interop {
      * @since 20.3
      */
     @Substitution
-    public static boolean hasExceptionStackTrace(@Host(Object.class) StaticObject receiver) {
-        return UNCACHED.hasExceptionStackTrace(unwrap(receiver));
+    @GenerateInline(false) // not available for Substitutions
+    abstract static class HasExceptionStackTrace extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract boolean execute(@JavaType(Object.class) StaticObject receiver);
+
+        @Specialization
+        boolean doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop) {
+            return interop.hasExceptionStackTrace(InteropUtils.unwrapForeign(getLanguage(), receiver));
+        }
     }
 
     /**
@@ -522,17 +1016,30 @@ public final class Target_com_oracle_truffle_espresso_polyglot_Interop {
      * @since 20.3
      */
     @Substitution
-    @Throws(UnsupportedMessageException.class)
-    public static @Host(Object.class) StaticObject getExceptionStackTrace(@Host(Object.class) StaticObject receiver, @InjectMeta Meta meta) {
-        try {
-            Object stackTrace = UNCACHED.getExceptionStackTrace(unwrap(receiver));
-            if (stackTrace instanceof StaticObject) {
-                return (StaticObject) stackTrace;
+    @GenerateInline(false) // not available for Substitutions
+    @Throws(others = @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/UnsupportedMessageException;"))
+    abstract static class GetExceptionStackTrace extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract @JavaType(Object.class) StaticObject execute(@JavaType(Object.class) StaticObject receiver);
+
+        @Specialization
+        @JavaType(Object.class)
+        static StaticObject doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @Bind Node node,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary stackTraceInterop,
+                        @Cached ThrowInteropExceptionAsGuest throwInteropExceptionAsGuest,
+                        @Cached InlinedBranchProfile exceptionProfile) {
+            try {
+                Object stackTrace = interop.getExceptionStackTrace(InteropUtils.unwrapForeign(EspressoLanguage.get(node), receiver));
+                assert InteropLibrary.getUncached().hasArrayElements(stackTrace);
+                return InteropUtils.maybeWrapAsObject(stackTrace, stackTraceInterop, EspressoContext.get(node));
+            } catch (InteropException e) {
+                exceptionProfile.enter(node);
+                throw throwInteropExceptionAsGuest.execute(node, e);
             }
-            // Return foreign object as an opaque j.l.Object.
-            return StaticObject.createForeign(meta.java_lang_Object, stackTrace, UNCACHED);
-        } catch (InteropException e) {
-            throw throwInteropException(e, meta);
         }
     }
 
@@ -553,8 +1060,18 @@ public final class Target_com_oracle_truffle_espresso_polyglot_Interop {
      * @since 19.0
      */
     @Substitution
-    public static boolean hasArrayElements(@Host(Object.class) StaticObject receiver) {
-        return UNCACHED.hasArrayElements(unwrap(receiver));
+    @GenerateInline(false) // not available for Substitutions
+    abstract static class HasArrayElements extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract boolean execute(@JavaType(Object.class) StaticObject receiver);
+
+        @Specialization
+        boolean doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop) {
+            return interop.hasArrayElements(InteropUtils.unwrapForeign(getLanguage(), receiver));
+        }
     }
 
     /**
@@ -565,22 +1082,33 @@ public final class Target_com_oracle_truffle_espresso_polyglot_Interop {
      * @since 19.0
      */
     @Substitution
-    @Throws({UnsupportedMessageException.class, InvalidArrayIndexException.class})
-    public static @Host(Object.class) StaticObject readArrayElement(@Host(Object.class) StaticObject receiver, long index, @InjectMeta Meta meta) {
-        try {
-            Object value = UNCACHED.readArrayElement(unwrap(receiver), index);
-            if (value instanceof StaticObject) {
-                return (StaticObject) value;
+    @GenerateInline(false) // not available for Substitutions
+    @Throws(others = {
+                    @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/UnsupportedMessageException;"),
+                    @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/InvalidArrayIndexException;"),
+    })
+    abstract static class ReadArrayElement extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract @JavaType(Object.class) StaticObject execute(@JavaType(Object.class) StaticObject receiver, long index);
+
+        @Specialization
+        @JavaType(Object.class)
+        static StaticObject doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        long index,
+                        @Bind Node node,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary valueInterop,
+                        @Cached ThrowInteropExceptionAsGuest throwInteropExceptionAsGuest,
+                        @Cached InlinedBranchProfile exceptionProfile) {
+            try {
+                Object value = interop.readArrayElement(InteropUtils.unwrapForeign(EspressoLanguage.get(node), receiver), index);
+                return InteropUtils.maybeWrapAsObject(value, valueInterop, EspressoContext.get(node));
+            } catch (InteropException e) {
+                exceptionProfile.enter(node);
+                throw throwInteropExceptionAsGuest.execute(node, e);
             }
-            /*
-             * The foreign object *could* be wrapped into a more precise Java type, but inferring
-             * this Java type from the interop "kind" (string, primitive, exception, array...) is
-             * ambiguous and inefficient. The caller is responsible to re-wrap or convert the result
-             * as needed.
-             */
-            return StaticObject.createForeign(meta.java_lang_Object, value, UNCACHED);
-        } catch (InteropException e) {
-            throw throwInteropException(e, meta);
         }
     }
 
@@ -591,12 +1119,26 @@ public final class Target_com_oracle_truffle_espresso_polyglot_Interop {
      * @since 19.0
      */
     @Substitution
-    @Throws(UnsupportedMessageException.class)
-    public static long getArraySize(@Host(Object.class) StaticObject receiver, @InjectMeta Meta meta) {
-        try {
-            return UNCACHED.getArraySize(unwrap(receiver));
-        } catch (InteropException e) {
-            throw throwInteropException(e, meta);
+    @GenerateInline(false) // not available for Substitutions
+    @Throws(others = @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/UnsupportedMessageException;"))
+    abstract static class GetArraySize extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract long execute(@JavaType(Object.class) StaticObject receiver);
+
+        @Specialization
+        static long doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @Bind Node node,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop,
+                        @Cached ThrowInteropExceptionAsGuest throwInteropExceptionAsGuest,
+                        @Cached InlinedBranchProfile exceptionProfile) {
+            try {
+                return interop.getArraySize(InteropUtils.unwrapForeign(EspressoLanguage.get(node), receiver));
+            } catch (InteropException e) {
+                exceptionProfile.enter(node);
+                throw throwInteropExceptionAsGuest.execute(node, e);
+            }
         }
     }
 
@@ -611,8 +1153,19 @@ public final class Target_com_oracle_truffle_espresso_polyglot_Interop {
      * @since 19.0
      */
     @Substitution
-    public static boolean isArrayElementReadable(@Host(Object.class) StaticObject receiver, long index) {
-        return UNCACHED.isArrayElementReadable(unwrap(receiver), index);
+    @GenerateInline(false) // not available for Substitutions
+    abstract static class IsArrayElementReadable extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract boolean execute(@JavaType(Object.class) StaticObject receiver, long index);
+
+        @Specialization
+        boolean doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        long index,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop) {
+            return interop.isArrayElementReadable(InteropUtils.unwrapForeign(getLanguage(), receiver), index);
+        }
     }
 
     /**
@@ -626,18 +1179,46 @@ public final class Target_com_oracle_truffle_espresso_polyglot_Interop {
      * @since 19.0
      */
     @Substitution
-    @Throws({UnsupportedMessageException.class, UnsupportedTypeException.class, InvalidArrayIndexException.class})
-    public static void writeArrayElement(@Host(Object.class) StaticObject receiver, long index, @Host(Object.class) StaticObject value, @InjectMeta Meta meta) {
-        try {
-            if (receiver.isEspressoObject()) {
-                // Do not throw away the types if the receiver is an Espresso object.
-                UNCACHED.writeArrayElement(receiver, index, value);
-            } else {
-                // Write to foreign array, full unwrap.
-                UNCACHED.writeArrayElement(unwrap(receiver), index, unwrap(value));
+    @GenerateInline(false) // not available for Substitutions
+    @Throws(others = {
+                    @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/UnsupportedMessageException;"),
+                    @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/UnsupportedTypeException;"),
+                    @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/InvalidArrayIndexException;"),
+    })
+    abstract static class WriteArrayElement extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract void execute(@JavaType(Object.class) StaticObject receiver, long index, @JavaType(Object.class) StaticObject value);
+
+        @Specialization
+        static void doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        long index,
+                        @JavaType(Object.class) StaticObject value,
+                        @Bind Node node,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary exceptionInterop,
+                        @Cached ThrowInteropExceptionAsGuest throwInteropExceptionAsGuest,
+                        @Cached LookupTypeConverterNode lookupTypeConverterNode,
+                        @Cached LookupInternalTypeConverterNode lookupInternalTypeConverterNode,
+                        @Cached(inline = false) BranchProfile exceptionProfile,
+                        @Cached InlinedConditionProfile isForeignProfile) {
+            try {
+                if (isForeignProfile.profile(node, receiver.isForeignObject())) {
+                    // Write to foreign array, full unwrap.
+                    EspressoLanguage language = EspressoLanguage.get(node);
+                    Meta meta = EspressoContext.get(node).getMeta();
+                    interop.writeArrayElement(InteropUtils.unwrapForeign(language, receiver), index, InteropUtils.unwrap(language, value, meta));
+                } else {
+                    // Do not throw away the types if the receiver is an Espresso object.
+                    interop.writeArrayElement(receiver, index, value);
+                }
+            } catch (InteropException e) {
+                exceptionProfile.enter();
+                throw throwInteropExceptionAsGuest.execute(node, e);
+            } catch (AbstractTruffleException ex) {
+                throw handleAbstractTruffleException(exceptionInterop, EspressoContext.get(node), lookupTypeConverterNode, lookupInternalTypeConverterNode, exceptionProfile, ex);
             }
-        } catch (InteropException e) {
-            throw throwInteropException(e, meta);
         }
     }
 
@@ -656,12 +1237,30 @@ public final class Target_com_oracle_truffle_espresso_polyglot_Interop {
      * @since 19.0
      */
     @Substitution
-    @Throws({UnsupportedMessageException.class, InvalidArrayIndexException.class})
-    public static void removeArrayElement(@Host(Object.class) StaticObject receiver, long index, @InjectMeta Meta meta) {
-        try {
-            UNCACHED.removeArrayElement(unwrap(receiver), index);
-        } catch (InteropException e) {
-            throw throwInteropException(e, meta);
+    @GenerateInline(false) // not available for Substitutions
+    @Throws(others = {
+                    @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/UnsupportedMessageException;"),
+                    @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/InvalidArrayIndexException;"),
+    })
+    abstract static class RemoveArrayElement extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract void execute(@JavaType(Object.class) StaticObject receiver, long index);
+
+        @Specialization
+        static void doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        long index,
+                        @Bind Node node,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop,
+                        @Cached ThrowInteropExceptionAsGuest throwInteropExceptionAsGuest,
+                        @Cached InlinedBranchProfile exceptionProfile) {
+            try {
+                interop.removeArrayElement(InteropUtils.unwrapForeign(EspressoLanguage.get(node), receiver), index);
+            } catch (InteropException e) {
+                exceptionProfile.enter(node);
+                throw throwInteropExceptionAsGuest.execute(node, e);
+            }
         }
     }
 
@@ -677,8 +1276,19 @@ public final class Target_com_oracle_truffle_espresso_polyglot_Interop {
      * @since 19.0
      */
     @Substitution
-    public static boolean isArrayElementModifiable(@Host(Object.class) StaticObject receiver, long index) {
-        return UNCACHED.isArrayElementModifiable(unwrap(receiver), index);
+    @GenerateInline(false) // not available for Substitutions
+    abstract static class IsArrayElementModifiable extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract boolean execute(@JavaType(Object.class) StaticObject receiver, long index);
+
+        @Specialization
+        boolean doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        long index,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop) {
+            return interop.isArrayElementModifiable(InteropUtils.unwrapForeign(getLanguage(), receiver), index);
+        }
     }
 
     /**
@@ -693,8 +1303,19 @@ public final class Target_com_oracle_truffle_espresso_polyglot_Interop {
      * @since 19.0
      */
     @Substitution
-    public static boolean isArrayElementInsertable(@Host(Object.class) StaticObject receiver, long index) {
-        return UNCACHED.isArrayElementModifiable(unwrap(receiver), index);
+    @GenerateInline(false) // not available for Substitutions
+    abstract static class IsArrayElementInsertable extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract boolean execute(@JavaType(Object.class) StaticObject receiver, long index);
+
+        @Specialization
+        boolean doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        long index,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop) {
+            return interop.isArrayElementInsertable(InteropUtils.unwrapForeign(getLanguage(), receiver), index);
+        }
     }
 
     /**
@@ -709,8 +1330,19 @@ public final class Target_com_oracle_truffle_espresso_polyglot_Interop {
      * @since 19.0
      */
     @Substitution
-    public static boolean isArrayElementRemovable(@Host(Object.class) StaticObject receiver, long index) {
-        return UNCACHED.isArrayElementRemovable(unwrap(receiver), index);
+    @GenerateInline(false) // not available for Substitutions
+    abstract static class IsArrayElementRemovable extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract boolean execute(@JavaType(Object.class) StaticObject receiver, long index);
+
+        @Specialization
+        boolean doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        long index,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop) {
+            return interop.isArrayElementRemovable(InteropUtils.unwrapForeign(getLanguage(), receiver), index);
+        }
     }
 
     // endregion Array Messages
@@ -739,8 +1371,18 @@ public final class Target_com_oracle_truffle_espresso_polyglot_Interop {
      * @since 20.1
      */
     @Substitution
-    public static boolean hasMetaObject(@Host(Object.class) StaticObject receiver) {
-        return UNCACHED.hasMetaObject(unwrap(receiver));
+    @GenerateInline(false) // not available for Substitutions
+    abstract static class HasMetaObject extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract boolean execute(@JavaType(Object.class) StaticObject receiver);
+
+        @Specialization
+        boolean doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop) {
+            return interop.hasMetaObject(InteropUtils.unwrapForeign(getLanguage(), receiver));
+        }
     }
 
     /**
@@ -765,16 +1407,30 @@ public final class Target_com_oracle_truffle_espresso_polyglot_Interop {
      * @since 20.1
      */
     @Substitution
-    @Throws(UnsupportedMessageException.class)
-    public static @Host(Object.class) StaticObject getMetaObject(@Host(Object.class) StaticObject receiver, @InjectMeta Meta meta) {
-        try {
-            Object metaObject = UNCACHED.getMetaObject(unwrap(receiver));
-            if (metaObject instanceof StaticObject) {
-                return (StaticObject) metaObject;
+    @GenerateInline(false) // not available for Substitutions
+    @Throws(others = @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/UnsupportedMessageException;"))
+    abstract static class GetMetaObject extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract @JavaType(Object.class) StaticObject execute(@JavaType(Object.class) StaticObject receiver);
+
+        @Specialization
+        @JavaType(Object.class)
+        static StaticObject doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @Bind Node node,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary metaObjectInterop,
+                        @Cached ThrowInteropExceptionAsGuest throwInteropExceptionAsGuest,
+                        @Cached InlinedBranchProfile exceptionProfile) {
+            try {
+                Object metaObject = interop.getMetaObject(InteropUtils.unwrapForeign(EspressoLanguage.get(node), receiver));
+                assert InteropLibrary.getUncached().isMetaObject(metaObject);
+                return InteropUtils.maybeWrapAsObject(metaObject, metaObjectInterop, EspressoContext.get(node));
+            } catch (InteropException e) {
+                exceptionProfile.enter(node);
+                throw throwInteropExceptionAsGuest.execute(node, e);
             }
-            return StaticObject.createForeign(meta.java_lang_Object, metaObject, UNCACHED);
-        } catch (InteropException e) {
-            throw throwInteropException(e, meta);
         }
     }
 
@@ -786,28 +1442,27 @@ public final class Target_com_oracle_truffle_espresso_polyglot_Interop {
      * receiver class name and its {@link System#identityHashCode(Object) identity hash code} is
      * used as string representation.
      *
-     * @param allowSideEffects whether side-effects are allowed in the production of the string.
-     * @since 20.1
-     */
-    @Substitution
-    public static @Host(Object.class) StaticObject toDisplayString(@Host(Object.class) StaticObject receiver, boolean allowSideEffects, @InjectMeta Meta meta) {
-        Object displayString = UNCACHED.toDisplayString(unwrap(receiver), allowSideEffects);
-        if (displayString instanceof StaticObject) {
-            return (StaticObject) displayString;
-        }
-        return StaticObject.createForeign(meta.java_lang_Object, displayString, UNCACHED);
-    }
-
-    /**
-     * Converts the receiver to a human readable {@link InteropLibrary#isString(Object) string} of
-     * the language. Short-cut for
-     * <code>{@link InteropLibrary#toDisplayString(Object) toDisplayString}(true)</code>.
-     *
      * @see InteropLibrary#toDisplayString(Object, boolean)
      * @since 20.1
      */
-    public static @Host(Object.class) StaticObject toDisplayString(@Host(Object.class) StaticObject receiver, @InjectMeta Meta meta) {
-        return toDisplayString(receiver, true, meta);
+    @Substitution
+    @GenerateInline(false) // not available for Substitutions
+    abstract static class ToDisplayString extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract @JavaType(Object.class) StaticObject execute(@JavaType(Object.class) StaticObject receiver, boolean allowSideEffects);
+
+        @Specialization
+        @JavaType(Object.class)
+        StaticObject doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        boolean allowSideEffects,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary displayStringInterop) {
+            Object displayString = interop.toDisplayString(InteropUtils.unwrapForeign(getLanguage(), receiver), allowSideEffects);
+            assert InteropLibrary.getUncached().isString(displayString);
+            return InteropUtils.maybeWrapAsObject(displayString, displayStringInterop, getContext());
+        }
     }
 
     /**
@@ -829,8 +1484,18 @@ public final class Target_com_oracle_truffle_espresso_polyglot_Interop {
      * @since 20.1
      */
     @Substitution
-    public static boolean isMetaObject(@Host(Object.class) StaticObject receiver) {
-        return UNCACHED.isMetaObject(unwrap(receiver));
+    @GenerateInline(false) // not available for Substitutions
+    abstract static class IsMetaObject extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract boolean execute(@JavaType(Object.class) StaticObject receiver);
+
+        @Specialization
+        boolean doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop) {
+            return interop.isMetaObject(InteropUtils.unwrapForeign(getLanguage(), receiver));
+        }
     }
 
     /**
@@ -846,16 +1511,30 @@ public final class Target_com_oracle_truffle_espresso_polyglot_Interop {
      * @since 20.1
      */
     @Substitution
-    @Throws(UnsupportedMessageException.class)
-    public static @Host(Object.class) StaticObject getMetaQualifiedName(@Host(Object.class) StaticObject metaObject, @InjectMeta Meta meta) {
-        try {
-            Object qualifiedName = UNCACHED.getMetaQualifiedName(unwrap(metaObject));
-            if (qualifiedName instanceof StaticObject) {
-                return (StaticObject) qualifiedName;
+    @GenerateInline(false) // not available for Substitutions
+    @Throws(others = @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/UnsupportedMessageException;"))
+    abstract static class GetMetaQualifiedName extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract @JavaType(Object.class) StaticObject execute(@JavaType(Object.class) StaticObject receiver);
+
+        @Specialization
+        @JavaType(Object.class)
+        static StaticObject doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @Bind Node node,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary qualifiedNameInterop,
+                        @Cached ThrowInteropExceptionAsGuest throwInteropExceptionAsGuest,
+                        @Cached InlinedBranchProfile exceptionProfile) {
+            try {
+                Object qualifiedName = interop.getMetaQualifiedName(InteropUtils.unwrapForeign(EspressoLanguage.get(node), receiver));
+                assert InteropLibrary.getUncached().isString(qualifiedName);
+                return InteropUtils.maybeWrapAsObject(qualifiedName, qualifiedNameInterop, EspressoContext.get(node));
+            } catch (InteropException e) {
+                exceptionProfile.enter(node);
+                throw throwInteropExceptionAsGuest.execute(node, e);
             }
-            return StaticObject.createForeign(meta.java_lang_Object, qualifiedName, UNCACHED);
-        } catch (InteropException e) {
-            throw throwInteropException(e, meta);
         }
     }
 
@@ -870,16 +1549,30 @@ public final class Target_com_oracle_truffle_espresso_polyglot_Interop {
      * @since 20.1
      */
     @Substitution
-    @Throws(UnsupportedMessageException.class)
-    public static @Host(Object.class) StaticObject getMetaSimpleName(@Host(Object.class) StaticObject metaObject, @InjectMeta Meta meta) {
-        try {
-            Object simpleName = UNCACHED.getMetaSimpleName(unwrap(metaObject));
-            if (simpleName instanceof StaticObject) {
-                return (StaticObject) simpleName;
+    @GenerateInline(false) // not available for Substitutions
+    @Throws(others = @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/UnsupportedMessageException;"))
+    abstract static class GetMetaSimpleName extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract @JavaType(Object.class) StaticObject execute(@JavaType(Object.class) StaticObject receiver);
+
+        @Specialization
+        @JavaType(Object.class)
+        static StaticObject doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @Bind Node node,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary simpleNameInterop,
+                        @Cached ThrowInteropExceptionAsGuest throwInteropExceptionAsGuest,
+                        @Cached InlinedBranchProfile exceptionProfile) {
+            try {
+                Object simpleName = interop.getMetaSimpleName(InteropUtils.unwrapForeign(EspressoLanguage.get(node), receiver));
+                assert InteropLibrary.getUncached().isString(simpleName);
+                return InteropUtils.maybeWrapAsObject(simpleName, simpleNameInterop, EspressoContext.get(node));
+            } catch (InteropException e) {
+                exceptionProfile.enter(node);
+                throw throwInteropExceptionAsGuest.execute(node, e);
             }
-            return StaticObject.createForeign(meta.java_lang_Object, simpleName, UNCACHED);
-        } catch (InteropException e) {
-            throw throwInteropException(e, meta);
         }
     }
 
@@ -893,16 +1586,32 @@ public final class Target_com_oracle_truffle_espresso_polyglot_Interop {
      * This method must not cause any observable side-effects. If this method is implemented then
      * also {@link InteropLibrary#isMetaObject(Object)} must be implemented as well.
      *
-     * @param instance the instance object to check.
+     * @see InteropLibrary#isMetaInstance(Object, Object)
      * @since 20.1
      */
     @Substitution
-    @Throws(UnsupportedMessageException.class)
-    public static boolean isMetaInstance(@Host(Object.class) StaticObject receiver, @Host(Object.class) StaticObject instance, @InjectMeta Meta meta) {
-        try {
-            return UNCACHED.isMetaInstance(unwrap(receiver), unwrap(instance));
-        } catch (InteropException e) {
-            throw throwInteropException(e, meta);
+    @GenerateInline(false) // not available for Substitutions
+    @Throws(others = @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/UnsupportedMessageException;"))
+    abstract static class IsMetaInstance extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract boolean execute(@JavaType(Object.class) StaticObject receiver, @JavaType(Object.class) StaticObject instance);
+
+        @Specialization
+        static boolean doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @JavaType(Object.class) StaticObject instance,
+                        @Bind Node node,
+                        @Cached ThrowInteropExceptionAsGuest throwInteropExceptionAsGuest,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop,
+                        @Cached InlinedBranchProfile exceptionProfile) {
+            try {
+                EspressoLanguage language = EspressoLanguage.get(node);
+                return interop.isMetaInstance(InteropUtils.unwrapForeign(language, receiver), InteropUtils.unwrapForeign(language, instance));
+            } catch (InteropException e) {
+                exceptionProfile.enter(node);
+                throw throwInteropExceptionAsGuest.execute(node, e);
+            }
         }
     }
 
@@ -965,8 +1674,20 @@ public final class Target_com_oracle_truffle_espresso_polyglot_Interop {
      * @since 20.2
      */
     @Substitution
-    public static boolean isIdentical(@Host(Object.class) StaticObject receiver, @Host(Object.class) StaticObject other) {
-        return UNCACHED.isIdentical(unwrap(receiver), unwrap(other), UNCACHED);
+    @GenerateInline(false) // not available for Substitutions
+    abstract static class IsIdentical extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract boolean execute(@JavaType(Object.class) StaticObject receiver, @JavaType(Object.class) StaticObject other);
+
+        @Specialization
+        boolean doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @JavaType(Object.class) StaticObject other,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary otherInterop) {
+            return interop.isIdentical(InteropUtils.unwrapForeign(getLanguage(), receiver), InteropUtils.unwrapForeign(getLanguage(), other), otherInterop);
+        }
     }
 
     /**
@@ -992,12 +1713,26 @@ public final class Target_com_oracle_truffle_espresso_polyglot_Interop {
      * @since 20.2
      */
     @Substitution
-    @Throws(UnsupportedMessageException.class)
-    public static int identityHashCode(@Host(Object.class) StaticObject receiver, @InjectMeta Meta meta) {
-        try {
-            return UNCACHED.identityHashCode(unwrap(receiver));
-        } catch (InteropException e) {
-            throw throwInteropException(e, meta);
+    @GenerateInline(false) // not available for Substitutions
+    @Throws(others = @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/UnsupportedMessageException;"))
+    abstract static class IdentityHashCode extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract int execute(@JavaType(Object.class) StaticObject receiver);
+
+        @Specialization
+        static int doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @Bind Node node,
+                        @Cached ThrowInteropExceptionAsGuest throwInteropExceptionAsGuest,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop,
+                        @Cached InlinedBranchProfile exceptionProfile) {
+            try {
+                return interop.identityHashCode(InteropUtils.unwrapForeign(EspressoLanguage.get(node), receiver));
+            } catch (InteropException e) {
+                exceptionProfile.enter(node);
+                throw throwInteropExceptionAsGuest.execute(node, e);
+            }
         }
     }
 
@@ -1028,8 +1763,18 @@ public final class Target_com_oracle_truffle_espresso_polyglot_Interop {
      * @since 19.0
      */
     @Substitution
-    public static boolean hasMembers(@Host(Object.class) StaticObject receiver) {
-        return UNCACHED.hasMembers(unwrap(receiver));
+    @GenerateInline(false) // not available for Substitutions
+    abstract static class HasMembers extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract boolean execute(@JavaType(Object.class) StaticObject receiver);
+
+        @Specialization
+        boolean doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop) {
+            return interop.hasMembers(InteropUtils.unwrapForeign(getLanguage(), receiver));
+        }
     }
 
     /**
@@ -1043,16 +1788,30 @@ public final class Target_com_oracle_truffle_espresso_polyglot_Interop {
      * @since 19.0
      */
     @Substitution
-    @Throws(UnsupportedMessageException.class)
-    public static @Host(Object.class) StaticObject getMembers(@Host(Object.class) StaticObject receiver, @InjectMeta Meta meta) {
-        try {
-            Object value = UNCACHED.getMembers(unwrap(receiver));
-            if (value instanceof StaticObject) {
-                return (StaticObject) value;
+    @GenerateInline(false) // not available for Substitutions
+    @Throws(others = @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/UnsupportedMessageException;"))
+    abstract static class GetMembers extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract @JavaType(Object.class) StaticObject execute(@JavaType(Object.class) StaticObject receiver);
+
+        @Specialization
+        @JavaType(Object.class)
+        static StaticObject doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @Bind Node node,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary membersInterop,
+                        @Cached ThrowInteropExceptionAsGuest throwInteropExceptionAsGuest,
+                        @Cached InlinedBranchProfile exceptionProfile) {
+            try {
+                Object members = interop.getMembers(InteropUtils.unwrapForeign(EspressoLanguage.get(node), receiver));
+                assert InteropLibrary.getUncached().hasArrayElements(members);
+                return InteropUtils.maybeWrapAsObject(members, membersInterop, EspressoContext.get(node));
+            } catch (InteropException e) {
+                exceptionProfile.enter(node);
+                throw throwInteropExceptionAsGuest.execute(node, e);
             }
-            return StaticObject.createForeign(meta.java_lang_Object, value, UNCACHED);
-        } catch (InteropException e) {
-            throw throwInteropException(e, meta);
         }
     }
 
@@ -1068,9 +1827,22 @@ public final class Target_com_oracle_truffle_espresso_polyglot_Interop {
      * @since 19.0
      */
     @Substitution
-    public static boolean isMemberReadable(@Host(Object.class) StaticObject receiver, @Host(String.class) StaticObject member) {
-        String hostMember = Meta.toHostStringStatic(member);
-        return UNCACHED.isMemberReadable(unwrap(receiver), hostMember);
+    @GenerateInline(false) // not available for Substitutions
+    abstract static class IsMemberReadable extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract boolean execute(@JavaType(Object.class) StaticObject receiver, @JavaType(String.class) StaticObject member);
+
+        @Specialization
+        boolean doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @JavaType(String.class) StaticObject member,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary memberInterop) {
+            assert InteropLibrary.getUncached().isString(member);
+            String hostMember = InteropUtils.toHostString(member, memberInterop);
+            return interop.isMemberReadable(InteropUtils.unwrapForeign(getLanguage(), receiver), hostMember);
+        }
     }
 
     /**
@@ -1084,18 +1856,38 @@ public final class Target_com_oracle_truffle_espresso_polyglot_Interop {
      * @see InteropLibrary#readMember(Object, String)
      * @since 19.0
      */
+
     @Substitution
-    @Throws({UnsupportedMessageException.class, UnknownIdentifierException.class})
-    public static @Host(Object.class) StaticObject readMember(@Host(Object.class) StaticObject receiver, @Host(String.class) StaticObject member, @InjectMeta Meta meta) {
-        try {
-            String hostMember = Meta.toHostStringStatic(member);
-            Object value = UNCACHED.readMember(unwrap(receiver), hostMember);
-            if (value instanceof StaticObject) {
-                return (StaticObject) value;
+    @GenerateInline(false) // not available for Substitutions
+    @Throws(others = {
+                    @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/UnsupportedMessageException;"),
+                    @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/UnknownIdentifierException;")
+    })
+    abstract static class ReadMember extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract @JavaType(Object.class) StaticObject execute(@JavaType(Object.class) StaticObject receiver, @JavaType(String.class) StaticObject member);
+
+        @Specialization
+        @JavaType(Object.class)
+        static StaticObject doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @JavaType(String.class) StaticObject member,
+                        @Bind Node node,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary memberInterop,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary memberValueInterop,
+                        @Cached ThrowInteropExceptionAsGuest throwInteropExceptionAsGuest,
+                        @Cached InlinedBranchProfile exceptionProfile) {
+            assert InteropLibrary.getUncached().isString(member);
+            String hostMember = InteropUtils.toHostString(member, memberInterop);
+            try {
+                Object memberValue = interop.readMember(InteropUtils.unwrapForeign(EspressoLanguage.get(node), receiver), hostMember);
+                return InteropUtils.maybeWrapAsObject(memberValue, memberValueInterop, EspressoContext.get(node));
+            } catch (InteropException e) {
+                exceptionProfile.enter(node);
+                throw throwInteropExceptionAsGuest.execute(node, e);
             }
-            return StaticObject.createForeign(meta.java_lang_Object, value, UNCACHED);
-        } catch (InteropException e) {
-            throw throwInteropException(e, meta);
         }
     }
 
@@ -1111,9 +1903,22 @@ public final class Target_com_oracle_truffle_espresso_polyglot_Interop {
      * @since 19.0
      */
     @Substitution
-    public static boolean isMemberModifiable(@Host(Object.class) StaticObject receiver, @Host(String.class) StaticObject member) {
-        String hostMember = Meta.toHostStringStatic(member);
-        return UNCACHED.isMemberModifiable(unwrap(receiver), hostMember);
+    @GenerateInline(false) // not available for Substitutions
+    abstract static class IsMemberModifiable extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract boolean execute(@JavaType(Object.class) StaticObject receiver, @JavaType(String.class) StaticObject member);
+
+        @Specialization
+        boolean doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @JavaType(String.class) StaticObject member,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary memberInterop) {
+            assert InteropLibrary.getUncached().isString(member);
+            String hostMember = InteropUtils.toHostString(member, memberInterop);
+            return interop.isMemberModifiable(InteropUtils.unwrapForeign(getLanguage(), receiver), hostMember);
+        }
     }
 
     /**
@@ -1128,9 +1933,22 @@ public final class Target_com_oracle_truffle_espresso_polyglot_Interop {
      * @since 19.0
      */
     @Substitution
-    public static boolean isMemberInsertable(@Host(Object.class) StaticObject receiver, @Host(String.class) StaticObject member) {
-        String hostMember = Meta.toHostStringStatic(member);
-        return UNCACHED.isMemberInsertable(unwrap(receiver), hostMember);
+    @GenerateInline(false) // not available for Substitutions
+    abstract static class IsMemberInsertable extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract boolean execute(@JavaType(Object.class) StaticObject receiver, @JavaType(String.class) StaticObject member);
+
+        @Specialization
+        boolean doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @JavaType(String.class) StaticObject member,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary memberInterop) {
+            assert InteropLibrary.getUncached().isString(member);
+            String hostMember = InteropUtils.toHostString(member, memberInterop);
+            return interop.isMemberInsertable(InteropUtils.unwrapForeign(getLanguage(), receiver), hostMember);
+        }
     }
 
     /**
@@ -1145,19 +1963,43 @@ public final class Target_com_oracle_truffle_espresso_polyglot_Interop {
      * @since 19.0
      */
     @Substitution
-    @Throws({UnsupportedMessageException.class, UnknownIdentifierException.class, UnsupportedTypeException.class})
-    public static void writeMember(@Host(Object.class) StaticObject receiver, @Host(String.class) StaticObject member, @Host(Object.class) StaticObject value,
-                    @InjectMeta Meta meta) {
-        String hostMember = Meta.toHostStringStatic(member);
-        try {
-            if (receiver.isForeignObject()) {
-                UNCACHED.writeMember(unwrap(receiver), hostMember, unwrap(value));
-            } else {
-                // Preserve the value type.
-                UNCACHED.writeMember(receiver, hostMember, value);
+    @GenerateInline(false) // not available for Substitutions
+    @Throws(others = {
+                    @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/UnsupportedMessageException;"),
+                    @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/UnknownIdentifierException;"),
+                    @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/UnsupportedTypeException;")
+    })
+    abstract static class WriteMember extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract void execute(@JavaType(Object.class) StaticObject receiver, @JavaType(String.class) StaticObject member, @JavaType(Object.class) StaticObject value);
+
+        @Specialization
+        static void doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @JavaType(String.class) StaticObject member,
+                        @JavaType(Object.class) StaticObject value,
+                        @Bind Node node,
+                        @Cached ThrowInteropExceptionAsGuest throwInteropExceptionAsGuest,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary memberInterop,
+                        @Cached InlinedBranchProfile exceptionProfile,
+                        @Cached InlinedConditionProfile isForeignProfile) {
+            assert InteropLibrary.getUncached().isString(member);
+            String hostMember = InteropUtils.toHostString(member, memberInterop);
+            try {
+                if (isForeignProfile.profile(node, receiver.isForeignObject())) {
+                    EspressoLanguage language = EspressoLanguage.get(node);
+                    Meta meta = EspressoContext.get(node).getMeta();
+                    interop.writeMember(InteropUtils.unwrapForeign(language, receiver), hostMember, InteropUtils.unwrap(language, value, meta));
+                } else {
+                    // Preserve the value type.
+                    interop.writeMember(receiver, hostMember, value);
+                }
+            } catch (InteropException e) {
+                exceptionProfile.enter(node);
+                throw throwInteropExceptionAsGuest.execute(node, e);
             }
-        } catch (InteropException e) {
-            throw throwInteropException(e, meta);
         }
     }
 
@@ -1172,9 +2014,22 @@ public final class Target_com_oracle_truffle_espresso_polyglot_Interop {
      * @since 19.0
      */
     @Substitution
-    public static boolean isMemberRemovable(@Host(Object.class) StaticObject receiver, @Host(String.class) StaticObject member) {
-        String hostMember = Meta.toHostStringStatic(member);
-        return UNCACHED.isMemberRemovable(unwrap(receiver), hostMember);
+    @GenerateInline(false) // not available for Substitutions
+    abstract static class IsMemberRemovable extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract boolean execute(@JavaType(Object.class) StaticObject receiver, @JavaType(String.class) StaticObject member);
+
+        @Specialization
+        boolean doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @JavaType(String.class) StaticObject member,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary memberInterop) {
+            assert InteropLibrary.getUncached().isString(member);
+            String hostMember = InteropUtils.toHostString(member, memberInterop);
+            return interop.isMemberRemovable(InteropUtils.unwrapForeign(getLanguage(), receiver), hostMember);
+        }
     }
 
     /**
@@ -1187,13 +2042,33 @@ public final class Target_com_oracle_truffle_espresso_polyglot_Interop {
      * @since 19.0
      */
     @Substitution
-    @Throws({UnsupportedMessageException.class, UnknownIdentifierException.class})
-    public static void removeMember(@Host(Object.class) StaticObject receiver, @Host(String.class) StaticObject member, @InjectMeta Meta meta) {
-        String hostMember = Meta.toHostStringStatic(member);
-        try {
-            UNCACHED.removeMember(unwrap(receiver), hostMember);
-        } catch (InteropException e) {
-            throw throwInteropException(e, meta);
+    @GenerateInline(false) // not available for Substitutions
+    @Throws(others = {
+                    @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/UnsupportedMessageException;"),
+                    @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/UnknownIdentifierException;")
+    })
+    abstract static class RemoveMember extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract void execute(@JavaType(Object.class) StaticObject receiver, @JavaType(String.class) StaticObject member);
+
+        @Specialization
+        static void doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @JavaType(String.class) StaticObject member,
+                        @Bind Node node,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary memberInterop,
+                        @Cached ThrowInteropExceptionAsGuest throwInteropExceptionAsGuest,
+                        @Cached InlinedBranchProfile exceptionProfile) {
+            assert InteropLibrary.getUncached().isString(member);
+            String hostMember = InteropUtils.toHostString(member, memberInterop);
+            try {
+                interop.removeMember(InteropUtils.unwrapForeign(EspressoLanguage.get(node), receiver), hostMember);
+            } catch (InteropException e) {
+                exceptionProfile.enter(node);
+                throw throwInteropExceptionAsGuest.execute(node, e);
+            }
         }
     }
 
@@ -1209,9 +2084,22 @@ public final class Target_com_oracle_truffle_espresso_polyglot_Interop {
      * @since 19.0
      */
     @Substitution
-    public static boolean isMemberInvocable(@Host(Object.class) StaticObject receiver, @Host(String.class) StaticObject member) {
-        String hostMember = Meta.toHostStringStatic(member);
-        return UNCACHED.isMemberInvocable(unwrap(receiver), hostMember);
+    @GenerateInline(false) // not available for Substitutions
+    abstract static class IsMemberInvocable extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract boolean execute(@JavaType(Object.class) StaticObject receiver, @JavaType(String.class) StaticObject member);
+
+        @Specialization
+        boolean doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @JavaType(String.class) StaticObject member,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary memberInterop) {
+            assert InteropLibrary.getUncached().isString(member);
+            String hostMember = InteropUtils.toHostString(member, memberInterop);
+            return interop.isMemberInvocable(InteropUtils.unwrapForeign(getLanguage(), receiver), hostMember);
+        }
     }
 
     /**
@@ -1221,19 +2109,114 @@ public final class Target_com_oracle_truffle_espresso_polyglot_Interop {
      * @since 19.0
      */
     @Substitution
-    @Throws({UnsupportedMessageException.class, ArityException.class, UnknownIdentifierException.class, UnsupportedTypeException.class})
-    public static @Host(Object.class) StaticObject invokeMember(@Host(Object.class) StaticObject receiver, @Host(String.class) StaticObject member,
-                    @Host(Object[].class) StaticObject arguments,
-                    @InjectMeta Meta meta) {
-        String hostMember = Meta.toHostStringStatic(member);
-        try {
-            Object result = UNCACHED.invokeMember(unwrap(receiver), hostMember, getArguments(arguments, receiver.isForeignObject(), meta));
-            if (result instanceof StaticObject) {
-                return (StaticObject) result;
+    @GenerateInline(false) // not available for Substitutions
+    @Throws(others = {
+                    @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/UnsupportedMessageException;"),
+                    @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/UnknownIdentifierException;"),
+                    @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/ArityException;"),
+                    @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/UnsupportedTypeException;")
+    })
+    abstract static class InvokeMember extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract @JavaType(Object.class) StaticObject execute(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @JavaType(String.class) StaticObject member,
+                        @JavaType(Object[].class) StaticObject arguments);
+
+        @Specialization
+        @JavaType(Object.class)
+        static StaticObject doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @JavaType(String.class) StaticObject member,
+                        @JavaType(Object[].class) StaticObject arguments,
+                        @Bind Node node,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary valueInterop,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary exceptionInterop,
+                        @Bind("getMeta()") Meta meta,
+                        @Cached ThrowInteropExceptionAsGuest throwInteropExceptionAsGuest,
+                        @Cached ToHostArguments toHostArguments,
+                        @Cached LookupTypeConverterNode lookupTypeConverterNode,
+                        @Cached LookupInternalTypeConverterNode lookupInternalTypeConverterNode,
+                        @Cached(inline = false) BranchProfile exceptionProfile) {
+            assert InteropLibrary.getUncached().isString(member);
+
+            String hostMember = meta.toHostString(member);
+            try {
+                Object[] hostArguments = toHostArguments.execute(node, receiver.isForeignObject(), arguments);
+                Object result = interop.invokeMember(InteropUtils.unwrapForeign(EspressoLanguage.get(node), receiver), hostMember, hostArguments);
+                return InteropUtils.maybeWrapAsObject(result, valueInterop, EspressoContext.get(node));
+            } catch (InteropException e) {
+                exceptionProfile.enter();
+                throw throwInteropExceptionAsGuest.execute(node, e);
+            } catch (EspressoException e) {
+                // make sure we don't try to convert espresso exceptions
+                throw e;
+            } catch (AbstractTruffleException ex) {
+                throw handleAbstractTruffleException(exceptionInterop, EspressoContext.get(node), lookupTypeConverterNode, lookupInternalTypeConverterNode, exceptionProfile, ex);
             }
-            return StaticObject.createForeign(meta.java_lang_Object, result, UNCACHED);
-        } catch (InteropException e) {
-            throw throwInteropException(e, meta);
+        }
+    }
+
+    @Substitution
+    @GenerateInline(false) // not available for Substitutions
+    @Throws(others = {
+                    @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/UnsupportedMessageException;"),
+                    @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/UnknownIdentifierException;"),
+                    @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/ArityException;"),
+                    @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/UnsupportedTypeException;")
+    })
+    abstract static class InvokeMemberWithCast extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract @JavaType(Object.class) StaticObject execute(
+                        @JavaType(Class.class) StaticObject targetClass,
+                        @JavaType(Object.class) StaticObject receiver,
+                        @JavaType(String.class) StaticObject member,
+                        @JavaType(Object[].class) StaticObject arguments);
+
+        @Specialization
+        @JavaType(Object.class)
+        static StaticObject doCached(
+                        @SuppressWarnings("unused") @JavaType(Class.class) StaticObject targetClass,
+                        @JavaType(Object.class) StaticObject receiver,
+                        @JavaType(String.class) StaticObject member,
+                        @JavaType(Object[].class) StaticObject arguments,
+                        @Bind Node node,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary exceptionInterop,
+                        @Bind("getMeta()") Meta meta,
+                        @Cached ToReference.DynamicToReference toEspressoNode,
+                        @Cached ThrowInteropExceptionAsGuest throwInteropExceptionAsGuest,
+                        @Cached ToHostArguments toHostArguments,
+                        @Cached LookupTypeConverterNode lookupTypeConverterNode,
+                        @Cached LookupInternalTypeConverterNode lookupInternalTypeConverterNode,
+                        @Cached(inline = false) BranchProfile exceptionProfile) {
+            if (StaticObject.isNull(targetClass)) {
+                exceptionProfile.enter();
+                throw meta.throwNullPointerException();
+            }
+            assert InteropLibrary.getUncached().isString(member);
+            EspressoContext context = EspressoContext.get(node);
+            String hostMember = context.getMeta().toHostString(member);
+            try {
+                Object[] hostArguments = toHostArguments.execute(node, receiver.isForeignObject(), arguments);
+                Object result = interop.invokeMember(InteropUtils.unwrapForeign(EspressoLanguage.get(node), receiver), hostMember, hostArguments);
+                Klass targetKlass = targetClass.getMirrorKlass(meta);
+                if (targetKlass.isPrimitive()) {
+                    targetKlass = MethodArgsUtils.primitiveTypeToBoxedType((PrimitiveKlass) targetKlass);
+                }
+                return toEspressoNode.execute(result, targetKlass);
+            } catch (InteropException e) {
+                exceptionProfile.enter();
+                throw throwInteropExceptionAsGuest.execute(node, e);
+            } catch (EspressoException e) {
+                // make sure we don't try to convert espresso exceptions
+                throw e;
+            } catch (AbstractTruffleException ex) {
+                throw handleAbstractTruffleException(exceptionInterop, context, lookupTypeConverterNode, lookupInternalTypeConverterNode, exceptionProfile, ex);
+            }
         }
     }
 
@@ -1249,9 +2232,22 @@ public final class Target_com_oracle_truffle_espresso_polyglot_Interop {
      * @since 19.0
      */
     @Substitution
-    public static boolean hasMemberReadSideEffects(@Host(Object.class) StaticObject receiver, @Host(String.class) StaticObject member) {
-        String hostMember = Meta.toHostStringStatic(member);
-        return UNCACHED.hasMemberReadSideEffects(unwrap(receiver), hostMember);
+    @GenerateInline(false) // not available for Substitutions
+    abstract static class HasMemberReadSideEffects extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract boolean execute(@JavaType(Object.class) StaticObject receiver, @JavaType(String.class) StaticObject member);
+
+        @Specialization
+        boolean doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @JavaType(String.class) StaticObject member,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary memberInterop) {
+            assert InteropLibrary.getUncached().isString(member);
+            String hostMember = InteropUtils.toHostString(member, memberInterop);
+            return interop.hasMemberReadSideEffects(InteropUtils.unwrapForeign(getLanguage(), receiver), hostMember);
+        }
     }
 
     /**
@@ -1266,9 +2262,22 @@ public final class Target_com_oracle_truffle_espresso_polyglot_Interop {
      * @since 19.0
      */
     @Substitution
-    public static boolean hasMemberWriteSideEffects(@Host(Object.class) StaticObject receiver, @Host(String.class) StaticObject member) {
-        String hostMember = Meta.toHostStringStatic(member);
-        return UNCACHED.hasMemberWriteSideEffects(unwrap(receiver), hostMember);
+    @GenerateInline(false) // not available for Substitutions
+    abstract static class HasMemberWriteSideEffects extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract boolean execute(@JavaType(Object.class) StaticObject receiver, @JavaType(String.class) StaticObject member);
+
+        @Specialization
+        boolean doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @JavaType(String.class) StaticObject member,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary memberInterop) {
+            assert InteropLibrary.getUncached().isString(member);
+            String hostMember = InteropUtils.toHostString(member, memberInterop);
+            return interop.hasMemberWriteSideEffects(InteropUtils.unwrapForeign(getLanguage(), receiver), hostMember);
+        }
     }
 
     // endregion Member Messages
@@ -1291,8 +2300,18 @@ public final class Target_com_oracle_truffle_espresso_polyglot_Interop {
      * @since 19.0
      */
     @Substitution
-    public static boolean isPointer(@Host(Object.class) StaticObject receiver) {
-        return UNCACHED.isPointer(unwrap(receiver));
+    @GenerateInline(false) // not available for Substitutions
+    abstract static class IsPointer extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract boolean execute(@JavaType(Object.class) StaticObject receiver);
+
+        @Specialization
+        boolean doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop) {
+            return interop.isPointer(InteropUtils.unwrapForeign(getLanguage(), receiver));
+        }
     }
 
     /**
@@ -1302,12 +2321,25 @@ public final class Target_com_oracle_truffle_espresso_polyglot_Interop {
      * @since 19.0
      */
     @Substitution
-    @Throws(UnsupportedMessageException.class)
-    public static long asPointer(@Host(Object.class) StaticObject receiver, @InjectMeta Meta meta) {
-        try {
-            return UNCACHED.asPointer(unwrap(receiver));
-        } catch (InteropException e) {
-            throw throwInteropException(e, meta);
+    @GenerateInline(false) // not available for Substitutions
+    abstract static class AsPointer extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract long execute(@JavaType(Object.class) StaticObject receiver);
+
+        @Specialization
+        static long doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @Bind Node node,
+                        @Cached ThrowInteropExceptionAsGuest throwInteropExceptionAsGuest,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop,
+                        @Cached InlinedBranchProfile exceptionProfile) {
+            try {
+                return interop.asPointer(InteropUtils.unwrapForeign(EspressoLanguage.get(node), receiver));
+            } catch (InteropException e) {
+                exceptionProfile.enter(node);
+                throw throwInteropExceptionAsGuest.execute(node, e);
+            }
         }
     }
 
@@ -1322,8 +2354,18 @@ public final class Target_com_oracle_truffle_espresso_polyglot_Interop {
      * @since 19.0
      */
     @Substitution
-    public static void toNative(@Host(Object.class) StaticObject receiver) {
-        UNCACHED.toNative(unwrap(receiver));
+    @GenerateInline(false) // not available for Substitutions
+    abstract static class ToNative extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract void execute(@JavaType(Object.class) StaticObject receiver);
+
+        @Specialization
+        void doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop) {
+            interop.toNative(InteropUtils.unwrapForeign(getLanguage(), receiver));
+        }
     }
 
     // endregion Pointer Messages
@@ -1341,8 +2383,18 @@ public final class Target_com_oracle_truffle_espresso_polyglot_Interop {
      * @since 19.0
      */
     @Substitution
-    public static boolean isExecutable(@Host(Object.class) StaticObject receiver) {
-        return UNCACHED.isExecutable(unwrap(receiver));
+    @GenerateInline(false) // not available for Substitutions
+    abstract static class IsExecutable extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract boolean execute(@JavaType(Object.class) StaticObject receiver);
+
+        @Specialization
+        boolean doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop) {
+            return interop.isExecutable(InteropUtils.unwrapForeign(getLanguage(), receiver));
+        }
     }
 
     /**
@@ -1352,16 +2404,44 @@ public final class Target_com_oracle_truffle_espresso_polyglot_Interop {
      * @since 19.0
      */
     @Substitution
-    @Throws({UnsupportedTypeException.class, ArityException.class, UnsupportedMessageException.class})
-    public static @Host(Object.class) StaticObject execute(@Host(Object.class) StaticObject receiver, @Host(Object[].class) StaticObject arguments, @InjectMeta Meta meta) {
-        try {
-            Object result = UNCACHED.execute(unwrap(receiver), getArguments(arguments, receiver.isForeignObject(), meta));
-            if (result instanceof StaticObject) {
-                return (StaticObject) result;
+    @GenerateInline(false) // not available for Substitutions
+    @Throws(others = {
+                    @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/UnsupportedMessageException;"),
+                    @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/ArityException;"),
+                    @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/UnsupportedTypeException;")
+    })
+    abstract static class Execute extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract @JavaType(Object.class) StaticObject execute(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @JavaType(Object[].class) StaticObject arguments);
+
+        @Specialization
+        @JavaType(Object.class)
+        static StaticObject doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @JavaType(Object[].class) StaticObject arguments,
+                        @Bind Node node,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary resultInterop,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary exceptionInterop,
+                        @Cached ThrowInteropExceptionAsGuest throwInteropExceptionAsGuest,
+                        @Cached LookupTypeConverterNode lookupTypeConverterNode,
+                        @Cached LookupInternalTypeConverterNode lookupInternalTypeConverterNode,
+                        @Cached ToHostArguments toHostArguments,
+                        @Cached(inline = false) BranchProfile exceptionProfile) {
+            EspressoContext context = EspressoContext.get(node);
+            try {
+                Object[] hostArguments = toHostArguments.execute(node, receiver.isForeignObject(), arguments);
+                Object result = interop.execute(InteropUtils.unwrapForeign(EspressoLanguage.get(node), receiver), hostArguments);
+                return InteropUtils.maybeWrapAsObject(result, resultInterop, context);
+            } catch (InteropException e) {
+                exceptionProfile.enter();
+                throw throwInteropExceptionAsGuest.execute(node, e);
+            } catch (AbstractTruffleException ex) {
+                throw handleAbstractTruffleException(exceptionInterop, context, lookupTypeConverterNode, lookupInternalTypeConverterNode, exceptionProfile, ex);
             }
-            return StaticObject.createForeign(meta.java_lang_Object, result, UNCACHED);
-        } catch (InteropException e) {
-            throw throwInteropException(e, meta);
         }
     }
 
@@ -1381,8 +2461,18 @@ public final class Target_com_oracle_truffle_espresso_polyglot_Interop {
      * @since 19.0
      */
     @Substitution
-    public static boolean isInstantiable(@Host(Object.class) StaticObject receiver) {
-        return UNCACHED.isInstantiable(unwrap(receiver));
+    @GenerateInline(false) // not available for Substitutions
+    abstract static class IsInstantiable extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract boolean execute(@JavaType(Object.class) StaticObject receiver);
+
+        @Specialization
+        boolean doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop) {
+            return interop.isInstantiable(InteropUtils.unwrapForeign(getLanguage(), receiver));
+        }
     }
 
     /**
@@ -1394,16 +2484,38 @@ public final class Target_com_oracle_truffle_espresso_polyglot_Interop {
      * @since 19.0
      */
     @Substitution
-    @Throws({UnsupportedTypeException.class, ArityException.class, UnsupportedMessageException.class})
-    public static @Host(Object.class) StaticObject instantiate(@Host(Object.class) StaticObject receiver, @Host(Object[].class) StaticObject arguments, @InjectMeta Meta meta) {
-        try {
-            Object result = UNCACHED.instantiate(unwrap(receiver), getArguments(arguments, receiver.isForeignObject(), meta));
-            if (result instanceof StaticObject) {
-                return (StaticObject) result;
+    @GenerateInline(false) // not available for Substitutions
+    @Throws(others = {
+                    @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/UnsupportedMessageException;"),
+                    @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/ArityException;"),
+                    @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/UnsupportedTypeException;")
+    })
+    abstract static class Instantiate extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract @JavaType(Object.class) StaticObject execute(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @JavaType(Object[].class) StaticObject arguments);
+
+        @Specialization
+        @JavaType(Object.class)
+        static StaticObject doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @JavaType(Object[].class) StaticObject arguments,
+                        @Bind Node node,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary resultInterop,
+                        @Cached ThrowInteropExceptionAsGuest throwInteropExceptionAsGuest,
+                        @Cached ToHostArguments toHostArguments,
+                        @Cached InlinedBranchProfile exceptionProfile) {
+            try {
+                Object[] hostArguments = toHostArguments.execute(node, receiver.isForeignObject(), arguments);
+                Object result = interop.instantiate(InteropUtils.unwrapForeign(EspressoLanguage.get(node), receiver), hostArguments);
+                return InteropUtils.maybeWrapAsObject(result, resultInterop, EspressoContext.get(node));
+            } catch (InteropException e) {
+                exceptionProfile.enter(node);
+                throw throwInteropExceptionAsGuest.execute(node, e);
             }
-            return StaticObject.createForeign(meta.java_lang_Object, result, UNCACHED);
-        } catch (InteropException e) {
-            throw throwInteropException(e, meta);
         }
     }
 
@@ -1419,8 +2531,18 @@ public final class Target_com_oracle_truffle_espresso_polyglot_Interop {
      * @since 20.3
      */
     @Substitution
-    public static boolean hasExecutableName(@Host(Object.class) StaticObject receiver) {
-        return UNCACHED.hasExecutableName(unwrap(receiver));
+    @GenerateInline(false) // not available for Substitutions
+    abstract static class HasExecutableName extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract boolean execute(@JavaType(Object.class) StaticObject receiver);
+
+        @Specialization
+        boolean doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop) {
+            return interop.hasExecutableName(InteropUtils.unwrapForeign(getLanguage(), receiver));
+        }
     }
 
     /**
@@ -1433,16 +2555,30 @@ public final class Target_com_oracle_truffle_espresso_polyglot_Interop {
      * @since 20.3
      */
     @Substitution
-    @Throws(UnsupportedMessageException.class)
-    public static @Host(Object.class) StaticObject getExecutableName(@Host(Object.class) StaticObject receiver, @InjectMeta Meta meta) {
-        try {
-            Object result = UNCACHED.getExecutableName(unwrap(receiver));
-            if (result instanceof StaticObject) {
-                return (StaticObject) result;
+    @GenerateInline(false) // not available for Substitutions
+    @Throws(others = @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/UnsupportedMessageException;"))
+    abstract static class GetExecutableName extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract @JavaType(Object.class) StaticObject execute(@JavaType(Object.class) StaticObject receiver);
+
+        @Specialization
+        @JavaType(Object.class)
+        static StaticObject doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @Bind Node node,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary executableNameInterop,
+                        @Cached ThrowInteropExceptionAsGuest throwInteropExceptionAsGuest,
+                        @Cached InlinedBranchProfile exceptionProfile) {
+            try {
+                Object executableName = interop.getExecutableName(InteropUtils.unwrapForeign(EspressoLanguage.get(node), receiver));
+                assert InteropLibrary.getUncached().isString(executableName);
+                return InteropUtils.maybeWrapAsObject(executableName, executableNameInterop, EspressoContext.get(node));
+            } catch (InteropException e) {
+                exceptionProfile.enter(node);
+                throw throwInteropExceptionAsGuest.execute(node, e);
             }
-            return StaticObject.createForeign(meta.java_lang_Object, result, UNCACHED);
-        } catch (InteropException e) {
-            throw throwInteropException(e, meta);
         }
     }
 
@@ -1456,8 +2592,18 @@ public final class Target_com_oracle_truffle_espresso_polyglot_Interop {
      * @since 20.3
      */
     @Substitution
-    public static boolean hasDeclaringMetaObject(@Host(Object.class) StaticObject receiver) {
-        return UNCACHED.hasDeclaringMetaObject(unwrap(receiver));
+    @GenerateInline(false) // not available for Substitutions
+    abstract static class HasDeclaringMetaObject extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract boolean execute(@JavaType(Object.class) StaticObject receiver);
+
+        @Specialization
+        boolean doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop) {
+            return interop.hasDeclaringMetaObject(InteropUtils.unwrapForeign(getLanguage(), receiver));
+        }
     }
 
     /**
@@ -1472,108 +2618,1650 @@ public final class Target_com_oracle_truffle_espresso_polyglot_Interop {
      * @since 20.3
      */
     @Substitution
-    @Throws(UnsupportedMessageException.class)
-    public static @Host(Object.class) StaticObject getDeclaringMetaObject(@Host(Object.class) StaticObject receiver, @InjectMeta Meta meta) {
-        try {
-            Object result = UNCACHED.getDeclaringMetaObject(unwrap(receiver));
-            if (result instanceof StaticObject) {
-                return (StaticObject) result;
+    @GenerateInline(false) // not available for Substitutions
+    @Throws(others = @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/UnsupportedMessageException;"))
+    abstract static class GetDeclaringMetaObject extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract @JavaType(Object.class) StaticObject execute(@JavaType(Object.class) StaticObject receiver);
+
+        @Specialization
+        @JavaType(Object.class)
+        static StaticObject doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @Bind Node node,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary declaringMetaObjectInterop,
+                        @Cached ThrowInteropExceptionAsGuest throwInteropExceptionAsGuest,
+                        @Cached InlinedBranchProfile exceptionProfile) {
+            try {
+                Object declaringMetaObject = interop.getDeclaringMetaObject(InteropUtils.unwrapForeign(EspressoLanguage.get(node), receiver));
+                assert InteropLibrary.getUncached().isMetaObject(declaringMetaObject);
+                return InteropUtils.maybeWrapAsObject(declaringMetaObject, declaringMetaObjectInterop, EspressoContext.get(node));
+            } catch (InteropException e) {
+                exceptionProfile.enter(node);
+                throw throwInteropExceptionAsGuest.execute(node, e);
             }
-            return StaticObject.createForeign(meta.java_lang_Object, result, UNCACHED);
-        } catch (InteropException e) {
-            throw throwInteropException(e, meta);
         }
     }
 
     // endregion StackFrame Messages
 
-    private static Object unwrap(StaticObject receiver) {
-        return receiver.isForeignObject() ? receiver.rawForeignObject() : receiver;
+    // region Buffer Messages
+
+    /**
+     * Returns {@code true} if the receiver may have buffer elements.
+     *
+     * <p>
+     * If this message returns {@code true}, then {@link InteropLibrary#getBufferSize(Object)},
+     * {@link InteropLibrary#readBufferByte(Object, long)},
+     * {@link InteropLibrary#readBufferShort(Object, ByteOrder, long)},
+     * {@link InteropLibrary#readBufferInt(Object, ByteOrder, long)},
+     * {@link InteropLibrary#readBufferLong(Object, ByteOrder, long)},
+     * {@link InteropLibrary#readBufferFloat(Object, ByteOrder, long)} and
+     * {@link InteropLibrary#readBufferDouble(Object, ByteOrder, long)} must not throw
+     * {@link UnsupportedMessageException}.
+     *
+     * <p>
+     * Invoking this message does not cause any observable side-effects.
+     *
+     * @since 21.1
+     */
+    @Substitution
+    @GenerateInline(false) // not available for Substitutions
+    abstract static class HasBufferElements extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract boolean execute(@JavaType(Object.class) StaticObject receiver);
+
+        @Specialization
+        boolean doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop) {
+            return interop.hasBufferElements(InteropUtils.unwrapForeign(getLanguage(), receiver));
+        }
     }
 
-    private static StaticObject wrapForeignException(Throwable throwable, Meta meta) {
-        assert UNCACHED.isException(throwable);
-        assert throwable instanceof AbstractTruffleException;
-        return StaticObject.createForeignException(meta, throwable, UNCACHED);
-    }
+    /**
+     * Returns the buffer size of the receiver, in bytes.
+     *
+     * <p>
+     * Invoking this message does not cause any observable side-effects.
+     *
+     * @see InteropLibrary#getBufferSize(Object)
+     * @since 21.1
+     */
+    @Substitution
+    @GenerateInline(false) // not available for Substitutions
+    @Throws(others = @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/UnsupportedMessageException;"))
+    abstract static class GetBufferSize extends SubstitutionNode {
+        static final int LIMIT = 2;
 
-    @TruffleBoundary
-    private static RuntimeException throwInteropException(InteropException e, Meta meta) {
-        if (e instanceof UnsupportedMessageException) {
-            Throwable cause = e.getCause();
-            assert cause == null || cause instanceof AbstractTruffleException;
-            StaticObject exception = (cause == null)
-                            // UnsupportedMessageException.create()
-                            ? (StaticObject) meta.polyglot.UnsupportedMessageException_create.invokeDirect(null)
-                            // UnsupportedMessageException.create(Throwable cause)
-                            : (StaticObject) meta.polyglot.UnsupportedMessageException_create_Throwable.invokeDirect(null, wrapForeignException(cause, meta));
-            throw EspressoException.wrap(exception, meta);
-        }
+        abstract long execute(@JavaType(Object.class) StaticObject receiver);
 
-        if (e instanceof UnknownIdentifierException) {
-            StaticObject unknownIdentifier = meta.toGuestString(((UnknownIdentifierException) e).getUnknownIdentifier());
-            Throwable cause = e.getCause();
-            StaticObject exception = (cause == null || !(cause instanceof AbstractTruffleException))
-                            // UnknownIdentifierException.create(String unknownIdentifier)
-                            ? (StaticObject) meta.polyglot.UnknownIdentifierException_create_String.invokeDirect(null, unknownIdentifier)
-                            // UnknownIdentifierException.create(String unknownIdentifier, Throwable
-                            // cause)
-                            : (StaticObject) meta.polyglot.UnknownIdentifierException_create_String_Throwable.invokeDirect(null, unknownIdentifier, wrapForeignException(cause, meta));
-            throw EspressoException.wrap(exception, meta);
-        }
-
-        if (e instanceof ArityException) {
-            int expectedArity = ((ArityException) e).getExpectedArity();
-            int actualArity = ((ArityException) e).getActualArity();
-            Throwable cause = e.getCause();
-            StaticObject exception = (cause == null || !(cause instanceof AbstractTruffleException))
-                            // ArityException.create(int expectedArity, int actualArity)
-                            ? (StaticObject) meta.polyglot.ArityException_create_int_int.invokeDirect(null, expectedArity, actualArity)
-                            // ArityException.create(int expectedArity, int actualArity, Throwable
-                            // cause)
-                            : (StaticObject) meta.polyglot.ArityException_create_int_int_Throwable.invokeDirect(null, expectedArity, actualArity, wrapForeignException(cause, meta));
-            throw EspressoException.wrap(exception, meta);
-        }
-
-        if (e instanceof UnsupportedTypeException) {
-            Object[] hostValues = ((UnsupportedTypeException) e).getSuppliedValues();
-            // Transform suppliedValues[] into a guest Object[].
-            StaticObject[] backingArray = new StaticObject[hostValues.length];
-            for (int i = 0; i < backingArray.length; i++) {
-                Object value = hostValues[i];
-                if (value instanceof StaticObject) {
-                    backingArray[i] = (StaticObject) value; // no need to re-type
-                } else {
-                    // TODO(peterssen): Wrap with precise types.
-                    backingArray[i] = StaticObject.createForeign(meta.java_lang_Object, value, UNCACHED);
-                }
+        @Specialization
+        static long doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @Bind Node node,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop,
+                        @Cached ThrowInteropExceptionAsGuest throwInteropExceptionAsGuest,
+                        @Cached InlinedBranchProfile exceptionProfile) {
+            try {
+                return interop.getBufferSize(InteropUtils.unwrapForeign(EspressoLanguage.get(node), receiver));
+            } catch (InteropException e) {
+                exceptionProfile.enter(node);
+                throw throwInteropExceptionAsGuest.execute(node, e);
             }
-            StaticObject suppliedValues = StaticObject.wrap(backingArray, meta);
-            StaticObject hint = meta.toGuestString(e.getMessage());
-            Throwable cause = e.getCause();
-            StaticObject exception = (cause == null || !(cause instanceof AbstractTruffleException))
-                            // UnsupportedTypeException.create(Object[] suppliedValues, String hint)
-                            ? (StaticObject) meta.polyglot.UnsupportedTypeException_create_Object_array_String.invokeDirect(null, suppliedValues, hint)
-                            // UnsupportedTypeException.create(Object[] suppliedValues, String hint,
-                            // Throwable cause)
-                            : (StaticObject) meta.polyglot.UnsupportedTypeException_create_Object_array_String_Throwable.invokeDirect(null, suppliedValues, hint, wrapForeignException(cause, meta));
-            throw EspressoException.wrap(exception, meta);
         }
-
-        if (e instanceof InvalidArrayIndexException) {
-            long invalidIndex = ((InvalidArrayIndexException) e).getInvalidIndex();
-            Throwable cause = e.getCause();
-            StaticObject exception = (cause == null || !(cause instanceof AbstractTruffleException))
-                            // InvalidArrayIndexException.create(long invalidIndex)
-                            ? (StaticObject) meta.polyglot.InvalidArrayIndexException_create_long.invokeDirect(null, invalidIndex)
-                            // InvalidArrayIndexException.create(long invalidIndex, Throwable cause)
-                            : (StaticObject) meta.polyglot.InvalidArrayIndexException_create_long_Throwable.invokeDirect(null, invalidIndex, wrapForeignException(cause, meta));
-            throw EspressoException.wrap(exception, meta);
-        }
-
-        CompilerDirectives.transferToInterpreter();
-        throw EspressoError.unexpected("Unexpected interop exception: ", e);
     }
+
+    /**
+     * Returns {@code true} if the receiver is a modifiable buffer.
+     * <p>
+     * If this message returns {@code true}, then {@link InteropLibrary#getBufferSize(Object)},
+     * {@link InteropLibrary#writeBufferByte(Object, long, byte)},
+     * {@link InteropLibrary#writeBufferShort(Object, ByteOrder, long, short)},
+     * {@link InteropLibrary#writeBufferInt(Object, ByteOrder, long, int)},
+     * {@link InteropLibrary#writeBufferLong(Object, ByteOrder, long, long)},
+     * {@link InteropLibrary#writeBufferFloat(Object, ByteOrder, long, float)} and
+     * {@link InteropLibrary#writeBufferDouble(Object, ByteOrder, long, double)} must not throw
+     * {@link UnsupportedMessageException}.
+     * <p>
+     * Invoking this message does not cause any observable side-effects.
+     * <p>
+     * By default, it returns {@code false} if {@link InteropLibrary#hasBufferElements(Object)}
+     * return {@code true}, and throws {@link UnsupportedMessageException} otherwise.
+     *
+     * @see InteropLibrary#isBufferWritable(Object)
+     * @since 21.1
+     */
+    @Substitution
+    @GenerateInline(false) // not available for Substitutions
+    @Throws(others = @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/UnsupportedMessageException;"))
+    abstract static class IsBufferWritable extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract boolean execute(@JavaType(Object.class) StaticObject receiver);
+
+        @Specialization
+        static boolean doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @Bind Node node,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop,
+                        @Cached ThrowInteropExceptionAsGuest throwInteropExceptionAsGuest,
+                        @Cached InlinedBranchProfile exceptionProfile) {
+            try {
+                return interop.isBufferWritable(InteropUtils.unwrapForeign(EspressoLanguage.get(node), receiver));
+            } catch (InteropException e) {
+                exceptionProfile.enter(node);
+                throw throwInteropExceptionAsGuest.execute(node, e);
+            }
+        }
+    }
+
+    /**
+     * Reads bytes from the receiver object into the specified byte array.
+     * <p>
+     * The access is <em>not</em> guaranteed to be atomic. Therefore, this message is <em>not</em>
+     * thread-safe.
+     * <p>
+     * Invoking this message does not cause any observable side-effects.
+     * <p>
+     * Throws InvalidBufferOffsetException if and only if
+     * <code>byteOffset < 0 || length < 0 || byteOffset + length > </code>{@link InteropLibrary#getBufferSize(Object)}
+     * <p>
+     * Throws UnsupportedMessageException if and only if
+     * {@link InteropLibrary#hasBufferElements(Object)} returns {@code false}
+     *
+     * @since 24.0
+     */
+    @Substitution
+    @GenerateInline(false) // not available for Substitutions
+    @Throws(others = {
+                    @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/UnsupportedMessageException;"),
+                    @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/InvalidBufferOffsetException;")
+    })
+    abstract static class ReadBuffer extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract void execute(@JavaType(Object.class) StaticObject receiver, long byteOffset, @JavaType(byte[].class) StaticObject destination, int destinationOffset, int length);
+
+        @Specialization
+        static void doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        long byteOffset,
+                        @JavaType(byte[].class) StaticObject destination,
+                        int destinationOffset,
+                        int length,
+                        @Bind Node node,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop,
+                        @Cached ThrowInteropExceptionAsGuest throwInteropExceptionAsGuest,
+                        @Cached InlinedBranchProfile unexpectedExceptionProfile,
+                        @Cached InlinedBranchProfile exceptionProfile) {
+            // check destination array and throw guest exception in case it is too small
+            EspressoLanguage language = EspressoLanguage.get(node);
+            byte[] dest = destination.unwrap(language);
+            if (destinationOffset < 0 || destinationOffset + length > dest.length) {
+                unexpectedExceptionProfile.enter(node);
+                Meta meta = EspressoContext.get(node).getMeta();
+                throw meta.throwExceptionWithMessage(meta.java_lang_ArrayIndexOutOfBoundsException, "destination array is not able to hold the bytes");
+            }
+            try {
+                interop.readBuffer(InteropUtils.unwrapForeign(language, receiver), byteOffset, destination.unwrap(language), destinationOffset, length);
+            } catch (InteropException e) {
+                exceptionProfile.enter(node);
+                throw throwInteropExceptionAsGuest.execute(node, e);
+            }
+        }
+    }
+
+    /**
+     * Reads the byte from the receiver object at the given byte offset from the start of the
+     * buffer.
+     * <p>
+     * The access is <em>not</em> guaranteed to be atomic. Therefore, this message is <em>not</em>
+     * thread-safe.
+     * <p>
+     * Invoking this message does not cause any observable side-effects.
+     *
+     * <p>
+     * Throws InvalidBufferOffsetException if and only if
+     * <code>byteOffset < 0 || byteOffset >= </code>{@link InteropLibrary#getBufferSize(Object)}
+     * <p>
+     * Throws UnsupportedMessageException if and only if either
+     * {@link InteropLibrary#hasBufferElements(Object)} returns {@code false} returns {@code false}
+     *
+     * @since 21.1
+     */
+    @Substitution
+    @GenerateInline(false) // not available for Substitutions
+    @Throws(others = {
+                    @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/UnsupportedMessageException;"),
+                    @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/InvalidBufferOffsetException;")
+    })
+    abstract static class ReadBufferByte extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract byte execute(@JavaType(Object.class) StaticObject receiver, long byteOffset);
+
+        @Specialization
+        static byte doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        long byteOffset,
+                        @Bind Node node,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop,
+                        @Cached ThrowInteropExceptionAsGuest throwInteropExceptionAsGuest,
+                        @Cached InlinedBranchProfile exceptionProfile) {
+            try {
+                return interop.readBufferByte(InteropUtils.unwrapForeign(EspressoLanguage.get(node), receiver), byteOffset);
+            } catch (InteropException e) {
+                exceptionProfile.enter(node);
+                throw throwInteropExceptionAsGuest.execute(node, e);
+            }
+        }
+    }
+
+    /**
+     * Writes the given byte from the receiver object at the given byte offset from the start of the
+     * buffer.
+     * <p>
+     * The access is <em>not</em> guaranteed to be atomic. Therefore, this message is <em>not</em>
+     * thread-safe.
+     *
+     * <p>
+     * Throws InvalidBufferOffsetException if and only if
+     * <code>byteOffset < 0 || byteOffset >= </code>{@link InteropLibrary#getBufferSize(Object)}
+     * <p>
+     * Throws UnsupportedMessageException if and only if either
+     * {@link InteropLibrary#hasBufferElements(Object)} or {@link InteropLibrary#isBufferWritable}
+     * returns {@code false}
+     *
+     * @since 21.1
+     */
+    @Substitution
+    @GenerateInline(false) // not available for Substitutions
+    @Throws(others = {
+                    @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/UnsupportedMessageException;"),
+                    @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/InvalidBufferOffsetException;")
+    })
+    abstract static class WriteBufferByte extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract void execute(@JavaType(Object.class) StaticObject receiver, long byteOffset, byte value);
+
+        @Specialization
+        static void doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        long byteOffset,
+                        byte value,
+                        @Bind Node node,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop,
+                        @Cached ThrowInteropExceptionAsGuest throwInteropExceptionAsGuest,
+                        @Cached InlinedBranchProfile exceptionProfile) {
+            try {
+                interop.writeBufferByte(InteropUtils.unwrapForeign(EspressoLanguage.get(node), receiver), byteOffset, value);
+            } catch (InteropException e) {
+                exceptionProfile.enter(node);
+                throw throwInteropExceptionAsGuest.execute(node, e);
+            }
+        }
+    }
+
+    /**
+     * Reads the short from the receiver object in the given byte order at the given byte offset
+     * from the start of the buffer.
+     * <p>
+     * Unaligned accesses are supported.
+     * <p>
+     * The access is <em>not</em> guaranteed to be atomic. Therefore, this message is <em>not</em>
+     * thread-safe.
+     * <p>
+     * Invoking this message does not cause any observable side-effects.
+     *
+     * <p>
+     * Returns the short at the given byte offset from the start of the buffer.
+     *
+     * <p>
+     * Throws InvalidBufferOffsetException if and only if
+     * <code>byteOffset < 0 || byteOffset >= {@link InteropLibrary#getBufferSize(Object)} - 1</code>
+     * <p>
+     * Throws UnsupportedMessageException if and only if
+     * {@link InteropLibrary#hasBufferElements(Object)} returns {@code false}
+     *
+     * @since 21.1
+     */
+    @Substitution
+    @GenerateInline(false) // not available for Substitutions
+    @Throws(others = {
+                    @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/UnsupportedMessageException;"),
+                    @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/InvalidBufferOffsetException;")
+    })
+    @ImportStatic(InteropUtils.class)
+    abstract static class ReadBufferShort extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract short execute(@JavaType(Object.class) StaticObject receiver, @JavaType(ByteOrder.class) StaticObject order, long byteOffset);
+
+        @Specialization
+        static short doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @JavaType(ByteOrder.class) StaticObject order,
+                        long byteOffset,
+                        @Bind Node node,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop,
+                        @Cached ThrowInteropExceptionAsGuest throwInteropExceptionAsGuest,
+                        @Cached InlinedBranchProfile exceptionProfile,
+                        @Cached("getLittleEndian(getContext())") @JavaType(ByteOrder.class) StaticObject littleEndian) {
+            try {
+                return interop.readBufferShort(InteropUtils.unwrapForeign(EspressoLanguage.get(node), receiver),
+                                order == littleEndian
+                                                ? ByteOrder.LITTLE_ENDIAN
+                                                : ByteOrder.BIG_ENDIAN,
+                                byteOffset);
+            } catch (InteropException e) {
+                exceptionProfile.enter(node);
+                throw throwInteropExceptionAsGuest.execute(node, e);
+            }
+        }
+    }
+
+    /**
+     * Writes the given short from the receiver object in the given byte order at the given byte
+     * offset from the start of the buffer.
+     * <p>
+     * Unaligned accesses are supported.
+     * <p>
+     * The access is <em>not</em> guaranteed to be atomic. Therefore, this message is <em>not</em>
+     * thread-safe.
+     *
+     * <p>
+     * Throws InvalidBufferOffsetException if and only if
+     * <code>byteOffset < 0 || byteOffset >= {@link InteropLibrary#getBufferSize(Object)} - 1</code>
+     * <p>
+     * Throws UnsupportedMessageException if and only if either
+     * {@link InteropLibrary#hasBufferElements(Object)} or {@link InteropLibrary#isBufferWritable}
+     * returns {@code false}
+     *
+     * @since 21.1
+     */
+    @Substitution
+    @GenerateInline(false) // not available for Substitutions
+    @Throws(others = {
+                    @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/UnsupportedMessageException;"),
+                    @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/InvalidBufferOffsetException;")
+    })
+    @ImportStatic(InteropUtils.class)
+    abstract static class WriteBufferShort extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract void execute(@JavaType(Object.class) StaticObject receiver, @JavaType(ByteOrder.class) StaticObject order, long byteOffset, short value);
+
+        @Specialization
+        static void doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @JavaType(ByteOrder.class) StaticObject order,
+                        long byteOffset,
+                        short value,
+                        @Bind Node node,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop,
+                        @Cached ThrowInteropExceptionAsGuest throwInteropExceptionAsGuest,
+                        @Cached InlinedBranchProfile exceptionProfile,
+                        @Cached("getLittleEndian(getContext())") @JavaType(ByteOrder.class) StaticObject littleEndian) {
+            try {
+                interop.writeBufferShort(InteropUtils.unwrapForeign(EspressoLanguage.get(node), receiver),
+                                order == littleEndian
+                                                ? ByteOrder.LITTLE_ENDIAN
+                                                : ByteOrder.BIG_ENDIAN,
+                                byteOffset,
+                                value);
+            } catch (InteropException e) {
+                exceptionProfile.enter(node);
+                throw throwInteropExceptionAsGuest.execute(node, e);
+            }
+        }
+    }
+
+    /**
+     * Reads the int from the receiver object in the given byte order at the given byte offset from
+     * the start of the buffer.
+     * <p>
+     * Unaligned accesses are supported.
+     * <p>
+     * The access is <em>not</em> guaranteed to be atomic. Therefore, this message is <em>not</em>
+     * thread-safe.
+     * <p>
+     * Invoking this message does not cause any observable side-effects.
+     *
+     * <p>
+     * Returns the int at the given byte offset from the start of the buffer
+     * <p>
+     * Throws InvalidBufferOffsetException if and only if
+     * <code>byteOffset < 0 || byteOffset >= {@link InteropLibrary#getBufferSize(Object)} - 3</code>
+     * <p>
+     * Throws UnsupportedMessageException if and only if
+     * {@link InteropLibrary#hasBufferElements(Object)} returns {@code false}
+     *
+     * @since 21.1
+     */
+    @Substitution
+    @GenerateInline(false) // not available for Substitutions
+    @Throws(others = {
+                    @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/UnsupportedMessageException;"),
+                    @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/InvalidBufferOffsetException;")
+    })
+    @ImportStatic(InteropUtils.class)
+    abstract static class ReadBufferInt extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract int execute(@JavaType(Object.class) StaticObject receiver, @JavaType(ByteOrder.class) StaticObject order, long byteOffset);
+
+        @Specialization
+        static int doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @JavaType(ByteOrder.class) StaticObject order,
+                        long byteOffset,
+                        @Bind Node node,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop,
+                        @Cached ThrowInteropExceptionAsGuest throwInteropExceptionAsGuest,
+                        @Cached InlinedBranchProfile exceptionProfile,
+                        @Cached("getLittleEndian(getContext())") @JavaType(ByteOrder.class) StaticObject littleEndian) {
+            try {
+                return interop.readBufferInt(InteropUtils.unwrapForeign(EspressoLanguage.get(node), receiver),
+                                order == littleEndian
+                                                ? ByteOrder.LITTLE_ENDIAN
+                                                : ByteOrder.BIG_ENDIAN,
+                                byteOffset);
+            } catch (InteropException e) {
+                exceptionProfile.enter(node);
+                throw throwInteropExceptionAsGuest.execute(node, e);
+            }
+        }
+    }
+
+    /**
+     * Writes the given int from the receiver object in the given byte order at the given byte
+     * offset from the start of the buffer.
+     * <p>
+     * Unaligned accesses are supported.
+     * <p>
+     * The access is <em>not</em> guaranteed to be atomic. Therefore, this message is <em>not</em>
+     * thread-safe.
+     *
+     * <p>
+     * Throws InvalidBufferOffsetException if and only if
+     * <code>byteOffset < 0 || byteOffset >= {@link InteropLibrary#getBufferSize(Object)} - 3</code>
+     * <p>
+     * Throws UnsupportedMessageException if and only if either
+     * {@link InteropLibrary#hasBufferElements(Object)} or {@link InteropLibrary#isBufferWritable}
+     * returns {@code false}
+     *
+     * @since 21.1
+     */
+    @Substitution
+    @GenerateInline(false) // not available for Substitutions
+    @Throws(others = {
+                    @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/UnsupportedMessageException;"),
+                    @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/InvalidBufferOffsetException;")
+    })
+    @ImportStatic(InteropUtils.class)
+    abstract static class WriteBufferInt extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract void execute(@JavaType(Object.class) StaticObject receiver, @JavaType(ByteOrder.class) StaticObject order, long byteOffset, int value);
+
+        @Specialization
+        static void doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @JavaType(ByteOrder.class) StaticObject order,
+                        long byteOffset,
+                        int value,
+                        @Bind Node node,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop,
+                        @Cached ThrowInteropExceptionAsGuest throwInteropExceptionAsGuest,
+                        @Cached InlinedBranchProfile exceptionProfile,
+                        @Cached("getLittleEndian(getContext())") @JavaType(ByteOrder.class) StaticObject littleEndian) {
+            try {
+                interop.writeBufferInt(InteropUtils.unwrapForeign(EspressoLanguage.get(node), receiver),
+                                order == littleEndian
+                                                ? ByteOrder.LITTLE_ENDIAN
+                                                : ByteOrder.BIG_ENDIAN,
+                                byteOffset,
+                                value);
+            } catch (InteropException e) {
+                exceptionProfile.enter(node);
+                throw throwInteropExceptionAsGuest.execute(node, e);
+            }
+        }
+    }
+
+    /**
+     * Reads the long from the receiver object in the given byte order at the given byte offset from
+     * the start of the buffer.
+     * <p>
+     * Unaligned accesses are supported.
+     * <p>
+     * The access is <em>not</em> guaranteed to be atomic. Therefore, this message is <em>not</em>
+     * thread-safe.
+     * <p>
+     * Invoking this message does not cause any observable side-effects.
+     *
+     * Returns the int at the given byte offset from the start of the buffer
+     * <p>
+     * Throws InvalidBufferOffsetException if and only if
+     * <code>byteOffset < 0 || byteOffset >= {@link InteropLibrary#getBufferSize(Object)} - 7</code>
+     * <p>
+     * Throws UnsupportedMessageException if and only if
+     * {@link InteropLibrary#hasBufferElements(Object)} returns {@code false}
+     *
+     * @since 21.1
+     */
+    @Substitution
+    @GenerateInline(false) // not available for Substitutions
+    @Throws(others = {
+                    @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/UnsupportedMessageException;"),
+                    @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/InvalidBufferOffsetException;")
+    })
+    @ImportStatic(InteropUtils.class)
+    abstract static class ReadBufferLong extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract long execute(@JavaType(Object.class) StaticObject receiver, @JavaType(ByteOrder.class) StaticObject order, long byteOffset);
+
+        @Specialization
+        static long doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @JavaType(ByteOrder.class) StaticObject order,
+                        long byteOffset,
+                        @Bind Node node,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop,
+                        @Cached ThrowInteropExceptionAsGuest throwInteropExceptionAsGuest,
+                        @Cached InlinedBranchProfile exceptionProfile,
+                        @Cached("getLittleEndian(getContext())") @JavaType(ByteOrder.class) StaticObject littleEndian) {
+            try {
+                return interop.readBufferLong(InteropUtils.unwrapForeign(EspressoLanguage.get(node), receiver),
+                                order == littleEndian
+                                                ? ByteOrder.LITTLE_ENDIAN
+                                                : ByteOrder.BIG_ENDIAN,
+                                byteOffset);
+            } catch (InteropException e) {
+                exceptionProfile.enter(node);
+                throw throwInteropExceptionAsGuest.execute(node, e);
+            }
+        }
+    }
+
+    /**
+     * Writes the given long from the receiver object in the given byte order at the given byte
+     * offset from the start of the buffer.
+     * <p>
+     * Unaligned accesses are supported.
+     * <p>
+     * The access is <em>not</em> guaranteed to be atomic. Therefore, this message is <em>not</em>
+     * thread-safe.
+     *
+     * <p>
+     * Throws InvalidBufferOffsetException if and only if
+     * <code>byteOffset < 0 || byteOffset >= {@link InteropLibrary#getBufferSize(Object)} - 7</code>
+     * <p>
+     * Throws UnsupportedMessageException if and only if either
+     * {@link InteropLibrary#hasBufferElements(Object)} or {@link InteropLibrary#isBufferWritable}
+     * returns {@code false}
+     *
+     * @since 21.1
+     */
+    @Substitution
+    @GenerateInline(false) // not available for Substitutions
+    @Throws(others = {
+                    @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/UnsupportedMessageException;"),
+                    @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/InvalidBufferOffsetException;")
+    })
+    @ImportStatic(InteropUtils.class)
+    abstract static class WriteBufferLong extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract void execute(@JavaType(Object.class) StaticObject receiver, @JavaType(ByteOrder.class) StaticObject order, long byteOffset, long value);
+
+        @Specialization
+        static void doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @JavaType(ByteOrder.class) StaticObject order,
+                        long byteOffset,
+                        long value,
+                        @Bind Node node,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop,
+                        @Cached ThrowInteropExceptionAsGuest throwInteropExceptionAsGuest,
+                        @Cached InlinedBranchProfile exceptionProfile,
+                        @Cached("getLittleEndian(getContext())") @JavaType(ByteOrder.class) StaticObject littleEndian) {
+            try {
+                interop.writeBufferLong(InteropUtils.unwrapForeign(EspressoLanguage.get(node), receiver),
+                                order == littleEndian
+                                                ? ByteOrder.LITTLE_ENDIAN
+                                                : ByteOrder.BIG_ENDIAN,
+                                byteOffset,
+                                value);
+            } catch (InteropException e) {
+                exceptionProfile.enter(node);
+                throw throwInteropExceptionAsGuest.execute(node, e);
+            }
+        }
+    }
+
+    /**
+     * Reads the float from the receiver object in the given byte order at the given byte offset
+     * from the start of the buffer.
+     * <p>
+     * Unaligned accesses are supported.
+     * <p>
+     * The access is <em>not</em> guaranteed to be atomic. Therefore, this message is <em>not</em>
+     * thread-safe.
+     * <p>
+     * Invoking this message does not cause any observable side-effects.
+     *
+     * Returns the float at the given byte offset from the start of the buffer
+     * <p>
+     * Throws InvalidBufferOffsetException if and only if
+     * <code>byteOffset < 0 || byteOffset >= {@link InteropLibrary#getBufferSize(Object)} - 3</code>
+     * <p>
+     * Throws UnsupportedMessageException if and only if
+     * {@link InteropLibrary#hasBufferElements(Object)} returns {@code false}
+     *
+     * @since 21.1
+     */
+    @Substitution
+    @GenerateInline(false) // not available for Substitutions
+    @Throws(others = {
+                    @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/UnsupportedMessageException;"),
+                    @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/InvalidBufferOffsetException;")
+    })
+    @ImportStatic(InteropUtils.class)
+    abstract static class ReadBufferFloat extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract float execute(@JavaType(Object.class) StaticObject receiver, @JavaType(ByteOrder.class) StaticObject order, long byteOffset);
+
+        @Specialization
+        static float doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @JavaType(ByteOrder.class) StaticObject order,
+                        long byteOffset,
+                        @Bind Node node,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop,
+                        @Cached ThrowInteropExceptionAsGuest throwInteropExceptionAsGuest,
+                        @Cached InlinedBranchProfile exceptionProfile,
+                        @Cached("getLittleEndian(getContext())") @JavaType(ByteOrder.class) StaticObject littleEndian) {
+            try {
+                return interop.readBufferFloat(InteropUtils.unwrapForeign(EspressoLanguage.get(node), receiver),
+                                order == littleEndian
+                                                ? ByteOrder.LITTLE_ENDIAN
+                                                : ByteOrder.BIG_ENDIAN,
+                                byteOffset);
+            } catch (InteropException e) {
+                exceptionProfile.enter(node);
+                throw throwInteropExceptionAsGuest.execute(node, e);
+            }
+        }
+    }
+
+    /**
+     * Writes the given float from the receiver object in the given byte order at the given byte
+     * offset from the start of the buffer.
+     * <p>
+     * Unaligned accesses are supported.
+     * <p>
+     * The access is <em>not</em> guaranteed to be atomic. Therefore, this message is <em>not</em>
+     * thread-safe.
+     *
+     * <p>
+     * Throws InvalidBufferOffsetException if and only if
+     * <code>byteOffset < 0 || byteOffset >= {@link InteropLibrary#getBufferSize(Object)} - 3</code>
+     * <p>
+     * Throws UnsupportedMessageException if and only if either
+     * {@link InteropLibrary#hasBufferElements(Object)} or {@link InteropLibrary#isBufferWritable}
+     * returns {@code false}
+     *
+     * @since 21.1
+     */
+    @Substitution
+    @GenerateInline(false) // not available for Substitutions
+    @Throws(others = {
+                    @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/UnsupportedMessageException;"),
+                    @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/InvalidBufferOffsetException;")
+    })
+    @ImportStatic(InteropUtils.class)
+    abstract static class WriteBufferFloat extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract void execute(@JavaType(Object.class) StaticObject receiver, @JavaType(ByteOrder.class) StaticObject order, long byteOffset, float value);
+
+        @Specialization
+        static void doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @JavaType(ByteOrder.class) StaticObject order,
+                        long byteOffset,
+                        float value,
+                        @Bind Node node,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop,
+                        @Cached ThrowInteropExceptionAsGuest throwInteropExceptionAsGuest,
+                        @Cached InlinedBranchProfile exceptionProfile,
+                        @Cached("getLittleEndian(getContext())") @JavaType(ByteOrder.class) StaticObject littleEndian) {
+            try {
+                interop.writeBufferFloat(InteropUtils.unwrapForeign(EspressoLanguage.get(node), receiver),
+                                order == littleEndian
+                                                ? ByteOrder.LITTLE_ENDIAN
+                                                : ByteOrder.BIG_ENDIAN,
+                                byteOffset,
+                                value);
+            } catch (InteropException e) {
+                exceptionProfile.enter(node);
+                throw throwInteropExceptionAsGuest.execute(node, e);
+            }
+        }
+    }
+
+    /**
+     * Reads the double from the receiver object in the given byte order at the given byte offset
+     * from the start of the buffer.
+     * <p>
+     * Unaligned accesses are supported.
+     * <p>
+     * The access is <em>not</em> guaranteed to be atomic. Therefore, this message is <em>not</em>
+     * thread-safe.
+     * <p>
+     * Invoking this message does not cause any observable side-effects.
+     *
+     * Returns the double at the given byte offset from the start of the buffer
+     * <p>
+     * Throws InvalidBufferOffsetException if and only if
+     * <code>byteOffset < 0 || byteOffset >= {@link InteropLibrary#getBufferSize(Object)} - 7</code>
+     * <p>
+     * Throws UnsupportedMessageException if and only if
+     * {@link InteropLibrary#hasBufferElements(Object)} returns {@code false}
+     *
+     * @since 21.1
+     */
+    @Substitution
+    @GenerateInline(false) // not available for Substitutions
+    @Throws(others = {
+                    @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/UnsupportedMessageException;"),
+                    @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/InvalidBufferOffsetException;")
+    })
+    @ImportStatic(InteropUtils.class)
+    abstract static class ReadBufferDouble extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract double execute(@JavaType(Object.class) StaticObject receiver, @JavaType(ByteOrder.class) StaticObject order, long byteOffset);
+
+        @Specialization
+        static double doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @JavaType(ByteOrder.class) StaticObject order,
+                        long byteOffset,
+                        @Bind Node node,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop,
+                        @Cached ThrowInteropExceptionAsGuest throwInteropExceptionAsGuest,
+                        @Cached InlinedBranchProfile exceptionProfile,
+                        @Cached("getLittleEndian(getContext())") @JavaType(ByteOrder.class) StaticObject littleEndian) {
+            try {
+                return interop.readBufferDouble(InteropUtils.unwrapForeign(EspressoLanguage.get(node), receiver),
+                                order == littleEndian
+                                                ? ByteOrder.LITTLE_ENDIAN
+                                                : ByteOrder.BIG_ENDIAN,
+                                byteOffset);
+            } catch (InteropException e) {
+                exceptionProfile.enter(node);
+                throw throwInteropExceptionAsGuest.execute(node, e);
+            }
+        }
+    }
+
+    /**
+     * Writes the given double from the receiver object in the given byte order at the given byte
+     * offset from the start of the buffer.
+     * <p>
+     * Unaligned accesses are supported.
+     * <p>
+     * The access is <em>not</em> guaranteed to be atomic. Therefore, this message is <em>not</em>
+     * thread-safe.
+     *
+     * <p>
+     * Throws InvalidBufferOffsetException if and only if
+     * <code>byteOffset < 0 || byteOffset >= {@link InteropLibrary#getBufferSize(Object)} - 7</code>
+     * <p>
+     * Throws UnsupportedMessageException if and only if either
+     * {@link InteropLibrary#hasBufferElements(Object)} or {@link InteropLibrary#isBufferWritable}
+     * returns {@code false}
+     *
+     * @since 21.1
+     */
+    @Substitution
+    @GenerateInline(false) // not available for Substitutions
+    @Throws(others = {
+                    @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/UnsupportedMessageException;"),
+                    @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/InvalidBufferOffsetException;")
+    })
+    @ImportStatic(InteropUtils.class)
+    abstract static class WriteBufferDouble extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract void execute(@JavaType(Object.class) StaticObject receiver, @JavaType(ByteOrder.class) StaticObject order, long byteOffset, double value);
+
+        @Specialization
+        static void doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @JavaType(ByteOrder.class) StaticObject order,
+                        long byteOffset,
+                        double value,
+                        @Bind Node node,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop,
+                        @Cached ThrowInteropExceptionAsGuest throwInteropExceptionAsGuest,
+                        @Cached InlinedBranchProfile exceptionProfile,
+                        @Cached("getLittleEndian(getContext())") @JavaType(ByteOrder.class) StaticObject littleEndian) {
+            try {
+                interop.writeBufferDouble(InteropUtils.unwrapForeign(EspressoLanguage.get(node), receiver),
+                                order == littleEndian
+                                                ? ByteOrder.LITTLE_ENDIAN
+                                                : ByteOrder.BIG_ENDIAN,
+                                byteOffset,
+                                value);
+            } catch (InteropException e) {
+                exceptionProfile.enter(node);
+                throw throwInteropExceptionAsGuest.execute(node, e);
+            }
+        }
+    }
+
+    // endregion Buffer Messages
+
+    // region Iterator Messages
+
+    /**
+     * Returns {@code true} if the receiver provides an iterator. For example, an array or a list
+     * provide an iterator over their content. Invoking this message does not cause any observable
+     * side-effects. By default returns {@code true} for receivers that have
+     * {@link InteropLibrary#hasArrayElements(Object) array elements}.
+     *
+     * @see InteropLibrary#hasIterator(Object)
+     * @see GetIterator
+     * @since 21.1
+     */
+    @Substitution
+    @GenerateInline(false) // not available for Substitutions
+    abstract static class HasIterator extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract boolean execute(@JavaType(Object.class) StaticObject receiver);
+
+        @Specialization
+        boolean doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop) {
+            return interop.hasIterator(InteropUtils.unwrapForeign(getLanguage(), receiver));
+        }
+    }
+
+    /**
+     * Returns the iterator for the receiver. The return value is always an {@link IsIterator
+     * iterator}. Invoking this message does not cause any observable side-effects.
+     *
+     * Throws UnsupportedMessageException if and only if {@link HasIterator} returns {@code false}
+     * for the same receiver.
+     *
+     * @see InteropLibrary#getIterator(Object)
+     * @since 21.1
+     */
+    @Substitution
+    @GenerateInline(false) // not available for Substitutions
+    @Throws(others = @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/UnsupportedMessageException;"))
+    abstract static class GetIterator extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract @JavaType(Object.class) StaticObject execute(@JavaType(Object.class) StaticObject receiver);
+
+        @Specialization
+        @JavaType(Object.class)
+        static StaticObject doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @Bind Node node,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary iteratorInterop,
+                        @Cached ThrowInteropExceptionAsGuest throwInteropExceptionAsGuest,
+                        @Cached InlinedBranchProfile exceptionProfile) {
+            try {
+                Object iterator = interop.getIterator(InteropUtils.unwrapForeign(EspressoLanguage.get(node), receiver));
+                assert InteropLibrary.getUncached().isIterator(iterator);
+                return InteropUtils.maybeWrapAsObject(iterator, iteratorInterop, EspressoContext.get(node));
+            } catch (InteropException e) {
+                exceptionProfile.enter(node);
+                throw throwInteropExceptionAsGuest.execute(node, e);
+            }
+        }
+    }
+
+    /**
+     * Returns {@code true} if the receiver represents an iterator. Invoking this message does not
+     * cause any observable side-effects. Returns {@code false} by default.
+     *
+     * @see InteropLibrary#isIterator(Object)
+     * @see HasIterator
+     * @see GetIterator
+     * @since 21.1
+     */
+    @Substitution
+    @GenerateInline(false) // not available for Substitutions
+    abstract static class IsIterator extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract boolean execute(@JavaType(Object.class) StaticObject receiver);
+
+        @Specialization
+        boolean doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop) {
+            return interop.isIterator(InteropUtils.unwrapForeign(getLanguage(), receiver));
+        }
+    }
+
+    /**
+     * Returns {@code true} if the receiver is an iterator which has more elements, else
+     * {@code false}. Multiple calls to the {@link HasIteratorNextElement} might lead to different
+     * results if the underlying data structure is modified.
+     * <p>
+     * The following example shows how the {@link HasIteratorNextElement hasIteratorNextElement}
+     * message can be emulated in languages where iterators only have a next method and throw an
+     * exception if there are no further elements.
+     *
+     * <p>
+     * Throws UnsupportedMessageException if and only if {@link IsIterator} returns {@code false}
+     * for the same receiver.
+     *
+     * @see InteropLibrary#hasIteratorNextElement(Object)
+     * @see IsIterator
+     * @see GetIteratorNextElement
+     * @since 21.1
+     */
+    @Substitution
+    @GenerateInline(false) // not available for Substitutions
+    abstract static class HasIteratorNextElement extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract boolean execute(@JavaType(Object.class) StaticObject receiver);
+
+        @Specialization
+        static boolean doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @Bind Node node,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop,
+                        @Cached ThrowInteropExceptionAsGuest throwInteropExceptionAsGuest,
+                        @Cached InlinedBranchProfile exceptionProfile) {
+            try {
+                return interop.hasIteratorNextElement(InteropUtils.unwrapForeign(EspressoLanguage.get(node), receiver));
+            } catch (InteropException e) {
+                exceptionProfile.enter(node);
+                throw throwInteropExceptionAsGuest.execute(node, e);
+            }
+        }
+    }
+
+    /**
+     * Returns the next element in the iteration. When the underlying data structure is modified the
+     * {@link GetIteratorNextElement} may throw the {@link StopIterationException} despite the
+     * {@link HasIteratorNextElement} returned {@code true}.
+     *
+     * <p>
+     * Throws UnsupportedMessageException if {@link IsIterator} returns {@code false} for the same
+     * receiver or when the underlying iterator element exists but is not readable.
+     *
+     * <p>
+     * Throws StopIterationException if the iteration has no more elements. Even if the
+     * {@link StopIterationException} was thrown it might not be thrown again by a next
+     * {@link GetIteratorNextElement} invocation on the same receiver due to a modification of an
+     * underlying iterable.
+     *
+     * @see InteropLibrary#getIteratorNextElement(Object)
+     * @see IsIterator
+     * @see HasIteratorNextElement
+     * @since 21.1
+     */
+    @Substitution
+    @GenerateInline(false) // not available for Substitutions
+    @Throws(others = {
+                    @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/UnsupportedMessageException;"),
+                    @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/StopIterationException;")
+    })
+    abstract static class GetIteratorNextElement extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract @JavaType(Object.class) StaticObject execute(@JavaType(Object.class) StaticObject receiver);
+
+        @Specialization
+        @JavaType(Object.class)
+        static StaticObject doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @Bind Node node,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary valueInterop,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary exceptionInterop,
+                        @Cached LookupTypeConverterNode lookupTypeConverterNode,
+                        @Cached LookupInternalTypeConverterNode lookupInternalTypeConverterNode,
+                        @Cached ThrowInteropExceptionAsGuest throwInteropExceptionAsGuest,
+                        @Cached(inline = false) BranchProfile exceptionProfile) {
+            EspressoContext context = EspressoContext.get(node);
+            try {
+                Object element = interop.getIteratorNextElement(InteropUtils.unwrapForeign(EspressoLanguage.get(node), receiver));
+                return InteropUtils.maybeWrapAsObject(element, valueInterop, context);
+            } catch (InteropException e) {
+                exceptionProfile.enter();
+                throw throwInteropExceptionAsGuest.execute(node, e);
+            } catch (AbstractTruffleException ex) {
+                throw handleAbstractTruffleException(exceptionInterop, context, lookupTypeConverterNode, lookupInternalTypeConverterNode, exceptionProfile, ex);
+            }
+        }
+    }
+
+    // endregion Iterator Messages
+
+    // region Hash(Dictionary) Messages
+
+    /**
+     * Returns {@code true} if the receiver may have hash entries. Therefore, at least one of
+     * {@link ReadHashValue}, {@link WriteHashEntry}, {@link RemoveHashEntry} must not throw
+     * {@link UnsupportedMessageException}. For example, the contents of a map data structure could
+     * be interpreted as hash elements. Invoking this message does not cause any observable
+     * side-effects. Returns {@code false} by default.
+     *
+     * @see GetHashEntriesIterator
+     * @see GetHashSize
+     * @see IsHashEntryReadable
+     * @see IsHashEntryWritable
+     * @see IsHashEntryInsertable
+     * @see IsHashEntryRemovable
+     * @see ReadHashValue
+     * @see ReadHashValueOrDefault
+     * @see WriteHashEntry
+     * @see RemoveHashEntry
+     * @since 21.1
+     */
+    @Substitution
+    @GenerateInline(false) // not available for Substitutions
+    abstract static class HasHashEntries extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract boolean execute(@JavaType(Object.class) StaticObject receiver);
+
+        @Specialization
+        boolean doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop) {
+            return interop.hasHashEntries(InteropUtils.unwrapForeign(getLanguage(), receiver));
+        }
+    }
+
+    /**
+     * Returns the number of receiver entries.
+     *
+     * <p>
+     * Throws UnsupportedMessageException if and only if {@link HasHashEntries} returns
+     * {@code false}.
+     *
+     * @since 21.1
+     */
+    @Substitution
+    @GenerateInline(false) // not available for Substitutions
+    @Throws(others = @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/UnsupportedMessageException;"))
+    abstract static class GetHashSize extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract long execute(@JavaType(Object.class) StaticObject receiver);
+
+        @Specialization
+        static long doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @Bind Node node,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop,
+                        @Cached ThrowInteropExceptionAsGuest throwInteropExceptionAsGuest,
+                        @Cached InlinedBranchProfile exceptionProfile) {
+            try {
+                return interop.getHashSize(InteropUtils.unwrapForeign(EspressoLanguage.get(node), receiver));
+            } catch (InteropException e) {
+                exceptionProfile.enter(node);
+                throw throwInteropExceptionAsGuest.execute(node, e);
+            }
+        }
+    }
+
+    /**
+     * Returns {@code true} if mapping for the specified key exists and is {@link ReadHashValue
+     * readable}. This method may only return {@code true} if {@link HasHashEntries} returns
+     * {@code true} as well and {@link IsHashEntryInsertable} returns {@code false}. Invoking this
+     * message does not cause any observable side-effects. Returns {@code false} by default.
+     *
+     * @see ReadHashValue
+     * @since 21.1
+     */
+    @Substitution
+    @GenerateInline(false) // not available for Substitutions
+    abstract static class IsHashEntryReadable extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract boolean execute(@JavaType(Object.class) StaticObject receiver, @JavaType(Object.class) StaticObject key);
+
+        @Specialization
+        boolean doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @JavaType(Object.class) StaticObject key,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop,
+                        @Cached InlinedConditionProfile isForeignProfile) {
+            if (isForeignProfile.profile(this, receiver.isForeignObject())) {
+                EspressoLanguage language = getLanguage();
+                return interop.isHashEntryReadable(InteropUtils.unwrapForeign(language, receiver), InteropUtils.unwrap(language, key, getMeta()));
+            } else {
+                // Preserve Java types.
+                return interop.isHashEntryReadable(receiver, key);
+            }
+        }
+    }
+
+    /**
+     * Reads the value for the specified key.
+     *
+     * <p>
+     * Throws UnsupportedMessageException if the receiver does not support reading at all. An empty
+     * receiver with no readable hash entries supports the read operation (even though there is
+     * nothing to read), therefore it throws {@link UnknownKeyException} for all arguments instead.
+     * <p>
+     * Throws UnknownKeyException if mapping for the specified key is not {@link IsHashEntryReadable
+     * readable}, e.g. when the hash does not contain specified key.
+     *
+     * @see IsHashEntryReadable
+     * @see ReadHashValueOrDefault
+     * @since 21.1
+     */
+    @Substitution
+    @GenerateInline(false) // not available for Substitutions
+    @Throws(others = {
+                    @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/UnsupportedMessageException;"),
+                    @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/UnknownKeyException;")
+    })
+    abstract static class ReadHashValue extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract @JavaType(Object.class) StaticObject execute(@JavaType(Object.class) StaticObject receiver, @JavaType(Object.class) StaticObject key);
+
+        @Specialization
+        @JavaType(Object.class)
+        static StaticObject doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @JavaType(Object.class) StaticObject key,
+                        @Bind Node node,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary valueInterop,
+                        @Cached ThrowInteropExceptionAsGuest throwInteropExceptionAsGuest,
+                        @Cached InlinedBranchProfile exceptionProfile,
+                        @Cached InlinedConditionProfile isForeignProfile) {
+            try {
+                Object result;
+                EspressoContext context = EspressoContext.get(node);
+                if (isForeignProfile.profile(node, receiver.isForeignObject())) {
+                    EspressoLanguage language = EspressoLanguage.get(node);
+                    result = interop.readHashValue(InteropUtils.unwrapForeign(language, receiver), InteropUtils.unwrap(language, key, context.getMeta()));
+                } else {
+                    result = interop.readHashValue(receiver, key);
+                }
+                return InteropUtils.maybeWrapAsObject(result, valueInterop, context);
+            } catch (InteropException e) {
+                exceptionProfile.enter(node);
+                throw throwInteropExceptionAsGuest.execute(node, e);
+            }
+        }
+    }
+
+    /**
+     * Reads the value for the specified key or returns the {@code defaultValue} when the mapping
+     * for the specified key does not exist or is not readable.
+     *
+     * <p>
+     * Throws UnsupportedMessageException if the receiver does not support reading at all. An empty
+     * receiver with no readable hash entries supports the read operation (even though there is
+     * nothing to read), therefore it returns the {@code defaultValue} for all arguments instead.
+     *
+     * @see IsHashEntryReadable
+     * @see ReadHashValue
+     * @since 21.1
+     */
+    @Substitution
+    @GenerateInline(false) // not available for Substitutions
+    @Throws(others = @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/UnsupportedMessageException;"))
+    abstract static class ReadHashValueOrDefault extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract @JavaType(Object.class) StaticObject execute(@JavaType(Object.class) StaticObject receiver, @JavaType(Object.class) StaticObject key,
+                        @JavaType(Object.class) StaticObject defaultValue);
+
+        @Specialization
+        @JavaType(Object.class)
+        static StaticObject doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @JavaType(Object.class) StaticObject key,
+                        @JavaType(Object.class) StaticObject defaultValue,
+                        @Bind Node node,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary valueInterop,
+                        @Cached ThrowInteropExceptionAsGuest throwInteropExceptionAsGuest,
+                        @Cached InlinedBranchProfile exceptionProfile,
+                        @Cached InlinedConditionProfile isForeignProfile) {
+            try {
+                EspressoContext context = EspressoContext.get(node);
+                Meta meta = context.getMeta();
+                if (isForeignProfile.profile(node, receiver.isForeignObject())) {
+                    EspressoLanguage language = EspressoLanguage.get(node);
+                    Object unwrappedDefaultValue = InteropUtils.unwrap(language, defaultValue, meta);
+                    Object result = interop.readHashValueOrDefault(InteropUtils.unwrapForeign(language, receiver), InteropUtils.unwrap(language, key, meta), unwrappedDefaultValue);
+                    // If the unwrapped default value was returned, preserve the original type.
+                    if (result == unwrappedDefaultValue) {
+                        return defaultValue;
+                    }
+                    return InteropUtils.maybeWrapAsObject(result, valueInterop, context);
+                } else {
+                    Object result = interop.readHashValueOrDefault(receiver, key, defaultValue);
+                    return InteropUtils.maybeWrapAsObject(result, valueInterop, context);
+                }
+            } catch (InteropException e) {
+                exceptionProfile.enter(node);
+                throw throwInteropExceptionAsGuest.execute(node, e);
+            }
+        }
+    }
+
+    /**
+     * Returns {@code true} if mapping for the specified key exists and is {@link WriteHashEntry
+     * writable}. This method may only return {@code true} if {@link HasHashEntries} returns
+     * {@code true} as well and {@link IsHashEntryInsertable} returns {@code false}. Invoking this
+     * message does not cause any observable side-effects. Returns {@code false} by default.
+     *
+     * @see WriteHashEntry
+     * @since 21.1
+     */
+    @Substitution
+    @GenerateInline(false) // not available for Substitutions
+    abstract static class IsHashEntryModifiable extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract boolean execute(@JavaType(Object.class) StaticObject receiver, @JavaType(Object.class) StaticObject key);
+
+        @Specialization
+        boolean doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @JavaType(Object.class) StaticObject key,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop,
+                        @Cached InlinedConditionProfile isForeignProfile) {
+            if (isForeignProfile.profile(this, receiver.isForeignObject())) {
+                EspressoLanguage language = getLanguage();
+                return interop.isHashEntryModifiable(InteropUtils.unwrapForeign(language, receiver), InteropUtils.unwrap(language, key, getMeta()));
+            } else {
+                // Preserve Java types.
+                return interop.isHashEntryModifiable(receiver, key);
+            }
+        }
+    }
+
+    /**
+     * Returns {@code true} if mapping for the specified key does not exist and is
+     * {@link WriteHashEntry writable}. This method may only return {@code true} if
+     * {@link HasHashEntries} returns {@code true} as well and {@link IsHashEntryExisting} returns
+     * {@code false}. Invoking this message does not cause any observable side-effects. Returns
+     * {@code false} by default.
+     *
+     * @see WriteHashEntry
+     * @since 21.1
+     */
+    @Substitution
+    @GenerateInline(false) // not available for Substitutions
+    abstract static class IsHashEntryInsertable extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract boolean execute(@JavaType(Object.class) StaticObject receiver, @JavaType(Object.class) StaticObject key);
+
+        @Specialization
+        boolean doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @JavaType(Object.class) StaticObject key,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop,
+                        @Cached InlinedConditionProfile isForeignProfile) {
+            if (isForeignProfile.profile(this, receiver.isForeignObject())) {
+                EspressoLanguage language = getLanguage();
+                return interop.isHashEntryInsertable(InteropUtils.unwrapForeign(language, receiver), InteropUtils.unwrap(language, key, getMeta()));
+            } else {
+                // Preserve Java types.
+                return interop.isHashEntryInsertable(receiver, key);
+            }
+        }
+    }
+
+    /**
+     * Returns {@code true} if mapping for the specified key is {@link IsHashEntryModifiable
+     * modifiable} or {@link IsHashEntryInsertable insertable}.
+     *
+     * @since 21.1
+     */
+    @Substitution
+    @GenerateInline(false) // not available for Substitutions
+    abstract static class IsHashEntryWritable extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract boolean execute(@JavaType(Object.class) StaticObject receiver, @JavaType(Object.class) StaticObject key);
+
+        @Specialization
+        boolean doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @JavaType(Object.class) StaticObject key,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop,
+                        @Cached InlinedConditionProfile isForeignProfile) {
+            if (isForeignProfile.profile(this, receiver.isForeignObject())) {
+                EspressoLanguage language = getLanguage();
+                return interop.isHashEntryWritable(InteropUtils.unwrapForeign(language, receiver), InteropUtils.unwrap(language, key, getMeta()));
+            } else {
+                // Preserve Java types.
+                return interop.isHashEntryWritable(receiver, key);
+            }
+        }
+    }
+
+    /**
+     * Associates the specified value with the specified key in the receiver. Writing the entry is
+     * allowed if is existing and {@link IsHashEntryModifiable modifiable}, or not existing and
+     * {@link IsHashEntryInsertable insertable}.
+     *
+     * <p>
+     * Throws UnsupportedMessageException when the receiver does not support writing at all, e.g.
+     * when it is immutable.
+     * <p>
+     * Throws UnknownKeyException if mapping for the specified key is not
+     * {@link IsHashEntryModifiable modifiable} nor {@link IsHashEntryInsertable insertable}.
+     * <p>
+     * Throws UnsupportedTypeException if the provided key type or value type is not allowed to be
+     * written.
+     *
+     * @since 21.1
+     */
+    @Substitution
+    @GenerateInline(false) // not available for Substitutions
+    @Throws(others = {
+                    @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/UnsupportedMessageException;"),
+                    @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/UnknownKeyException;"),
+                    @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/UnsupportedTypeException;")
+    })
+    abstract static class WriteHashEntry extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract void execute(@JavaType(Object.class) StaticObject receiver, @JavaType(Object.class) StaticObject key, @JavaType(Object.class) StaticObject value);
+
+        @Specialization
+        static void doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @JavaType(Object.class) StaticObject key,
+                        @JavaType(Object.class) StaticObject value,
+                        @Bind Node node,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary exceptionInterop,
+                        @Cached ThrowInteropExceptionAsGuest throwInteropExceptionAsGuest,
+                        @Cached LookupTypeConverterNode lookupTypeConverterNode,
+                        @Cached LookupInternalTypeConverterNode lookupInternalTypeConverterNode,
+                        @Cached(inline = false) BranchProfile exceptionProfile,
+                        @Cached InlinedConditionProfile isForeignProfile) {
+            EspressoContext context = EspressoContext.get(node);
+            Meta meta = context.getMeta();
+            try {
+                if (isForeignProfile.profile(node, receiver.isForeignObject())) {
+                    EspressoLanguage language = EspressoLanguage.get(node);
+                    interop.writeHashEntry(InteropUtils.unwrapForeign(language, receiver), InteropUtils.unwrap(language, key, meta), InteropUtils.unwrap(language, value, meta));
+                } else {
+                    // Preserve Java types.
+                    interop.writeHashEntry(receiver, key, value);
+                }
+            } catch (InteropException e) {
+                exceptionProfile.enter();
+                throw throwInteropExceptionAsGuest.execute(node, e);
+            } catch (AbstractTruffleException ex) {
+                throw handleAbstractTruffleException(exceptionInterop, context, lookupTypeConverterNode, lookupInternalTypeConverterNode, exceptionProfile, ex);
+            }
+        }
+    }
+
+    /**
+     * Returns {@code true} if mapping for the specified key exists and is removable. This method
+     * may only return {@code true} if {@link HasHashEntries} returns {@code true} as well and
+     * {@link IsHashEntryInsertable} returns {@code false}. Invoking this message does not cause any
+     * observable side-effects. Returns {@code false} by default.
+     *
+     * @see RemoveHashEntry
+     * @since 21.1
+     */
+    @Substitution
+    @GenerateInline(false) // not available for Substitutions
+    abstract static class IsHashEntryRemovable extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract boolean execute(@JavaType(Object.class) StaticObject receiver, @JavaType(Object.class) StaticObject key);
+
+        @Specialization
+        boolean doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @JavaType(Object.class) StaticObject key,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop,
+                        @Cached InlinedConditionProfile isForeignProfile) {
+            if (isForeignProfile.profile(this, receiver.isForeignObject())) {
+                EspressoLanguage language = getLanguage();
+                return interop.isHashEntryRemovable(InteropUtils.unwrapForeign(language, receiver), InteropUtils.unwrap(language, key, getMeta()));
+            } else {
+                // Preserve Java types.
+                return interop.isHashEntryRemovable(receiver, key);
+            }
+        }
+    }
+
+    /**
+     * Removes the mapping for a given key from the receiver. Mapping removing is allowed if it is
+     * {@link IsHashEntryRemovable removable}.
+     *
+     * <p>
+     * Throws UnsupportedMessageException when the receiver does not support removing at all, e.g.
+     * when it is immutable.
+     * <p>
+     * Throws UnknownKeyException if the given mapping is not {@link IsHashEntryRemovable
+     * removable}, e.g. the receiver does not have a mapping for given key.
+     *
+     * @see IsHashEntryRemovable
+     * @since 21.1
+     */
+    @Substitution
+    @GenerateInline(false) // not available for Substitutions
+    @Throws(others = {
+                    @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/UnsupportedMessageException;"),
+                    @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/UnknownKeyException;")
+    })
+    abstract static class RemoveHashEntry extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract void execute(@JavaType(Object.class) StaticObject receiver, @JavaType(Object.class) StaticObject key);
+
+        @Specialization
+        static void doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @JavaType(Object.class) StaticObject key,
+                        @Bind Node node,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary exceptionInterop,
+                        @Cached LookupTypeConverterNode lookupTypeConverterNode,
+                        @Cached LookupInternalTypeConverterNode lookupInternalTypeConverterNode,
+                        @Cached ThrowInteropExceptionAsGuest throwInteropExceptionAsGuest,
+                        @Cached(inline = false) BranchProfile exceptionProfile,
+                        @Cached InlinedConditionProfile isForeignProfile) {
+            try {
+                if (isForeignProfile.profile(node, receiver.isForeignObject())) {
+                    EspressoLanguage language = EspressoLanguage.get(node);
+                    interop.removeHashEntry(InteropUtils.unwrapForeign(language, receiver), InteropUtils.unwrap(language, key, EspressoContext.get(node).getMeta()));
+                } else {
+                    // Preserve Java types.
+                    interop.removeHashEntry(receiver, key);
+                }
+            } catch (InteropException e) {
+                exceptionProfile.enter();
+                throw throwInteropExceptionAsGuest.execute(node, e);
+            } catch (AbstractTruffleException ex) {
+                throw handleAbstractTruffleException(exceptionInterop, EspressoContext.get(node), lookupTypeConverterNode, lookupInternalTypeConverterNode, exceptionProfile, ex);
+            }
+        }
+    }
+
+    /**
+     * Returns {@code true} if mapping for a given key is existing. The mapping is existing if it is
+     * {@link IsHashEntryModifiable modifiable}, {@link IsHashEntryReadable readable} or
+     * {@link IsHashEntryRemovable removable}.
+     *
+     * @since 21.1
+     */
+    @Substitution
+    @GenerateInline(false) // not available for Substitutions
+    abstract static class IsHashEntryExisting extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract boolean execute(@JavaType(Object.class) StaticObject receiver, @JavaType(Object.class) StaticObject key);
+
+        @Specialization
+        boolean doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @JavaType(Object.class) StaticObject key,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop,
+                        @Cached InlinedConditionProfile isForeignProfile) {
+            if (isForeignProfile.profile(this, receiver.isForeignObject())) {
+                EspressoLanguage language = getLanguage();
+                return interop.isHashEntryExisting(InteropUtils.unwrapForeign(language, receiver), InteropUtils.unwrap(language, key, getMeta()));
+            } else {
+                // Preserve Java types.
+                return interop.isHashEntryExisting(receiver, key);
+            }
+        }
+    }
+
+    /**
+     * Returns the hash entries iterator for the receiver. The return value is always an
+     * {@link IsIterator iterator} of {@link HasArrayElements array} elements. The first array
+     * element is a key, the second array element is an associated value. Array returned by the
+     * iterator may be modifiable but detached from the hash, updating the array elements may not
+     * update the hash. So even if array elements are {@link IsArrayElementModifiable modifiable}
+     * always use {@link WriteHashEntry} to update the hash mapping.
+     *
+     * <p>
+     * Throws UnsupportedMessageException if and only if {@link HasHashEntries} returns
+     * {@code false} for the same receiver.
+     *
+     * @since 21.1
+     */
+    @Substitution
+    @GenerateInline(false) // not available for Substitutions
+    @Throws(others = @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/UnsupportedMessageException;"))
+    abstract static class GetHashEntriesIterator extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract @JavaType(Object.class) StaticObject execute(@JavaType(Object.class) StaticObject receiver);
+
+        @Specialization
+        @JavaType(Object.class)
+        static StaticObject doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @Bind Node node,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary iteratorInterop,
+                        @Cached ThrowInteropExceptionAsGuest throwInteropExceptionAsGuest,
+                        @Cached InlinedBranchProfile exceptionProfile) {
+            try {
+                Object iterator = interop.getHashEntriesIterator(InteropUtils.unwrapForeign(EspressoLanguage.get(node), receiver));
+                assert InteropLibrary.getUncached().isIterator(iterator);
+                return InteropUtils.maybeWrapAsObject(iterator, iteratorInterop, EspressoContext.get(node));
+            } catch (InteropException e) {
+                exceptionProfile.enter(node);
+                throw throwInteropExceptionAsGuest.execute(node, e);
+            }
+        }
+    }
+
+    /**
+     * Returns the hash keys iterator for the receiver. The return value is always an
+     * {@link IsIterator iterator}.
+     *
+     * <p>
+     * Throws UnsupportedMessageException if and only if {@link HasHashEntries} returns
+     * {@code false} for the same receiver.
+     *
+     * @since 21.1
+     */
+    @Substitution
+    @GenerateInline(false) // not available for Substitutions
+    @Throws(others = @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/UnsupportedMessageException;"))
+    abstract static class GetHashKeysIterator extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract @JavaType(Object.class) StaticObject execute(@JavaType(Object.class) StaticObject receiver);
+
+        @Specialization
+        @JavaType(Object.class)
+        static StaticObject doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @Bind Node node,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary iteratorInterop,
+                        @Cached ThrowInteropExceptionAsGuest throwInteropExceptionAsGuest,
+                        @Cached InlinedBranchProfile exceptionProfile) {
+            try {
+                Object iterator = interop.getHashKeysIterator(InteropUtils.unwrapForeign(EspressoLanguage.get(node), receiver));
+                assert InteropLibrary.getUncached().isIterator(iterator);
+                return InteropUtils.maybeWrapAsObject(iterator, iteratorInterop, EspressoContext.get(node));
+            } catch (InteropException e) {
+                exceptionProfile.enter(node);
+                throw throwInteropExceptionAsGuest.execute(node, e);
+            }
+        }
+    }
+
+    /**
+     * Returns the hash values iterator for the receiver. The return value is always an
+     * {@link IsIterator iterator}.
+     *
+     * <p>
+     * Throws UnsupportedMessageException if and only if {@link HasHashEntries} returns
+     * {@code false} for the same receiver.
+     *
+     * @since 21.1
+     */
+    @Substitution
+    @GenerateInline(false) // not available for Substitutions
+    @Throws(others = @JavaType(internalName = "Lcom/oracle/truffle/espresso/polyglot/UnsupportedMessageException;"))
+    abstract static class GetHashValuesIterator extends SubstitutionNode {
+        static final int LIMIT = 2;
+
+        abstract @JavaType(Object.class) StaticObject execute(@JavaType(Object.class) StaticObject receiver);
+
+        @Specialization
+        @JavaType(Object.class)
+        static StaticObject doCached(
+                        @JavaType(Object.class) StaticObject receiver,
+                        @Bind Node node,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary interop,
+                        @CachedLibrary(limit = "LIMIT") InteropLibrary iteratorInterop,
+                        @Cached ThrowInteropExceptionAsGuest throwInteropExceptionAsGuest,
+                        @Cached InlinedBranchProfile exceptionProfile) {
+            try {
+                Object iterator = interop.getHashValuesIterator(InteropUtils.unwrapForeign(EspressoLanguage.get(node), receiver));
+                assert InteropLibrary.getUncached().isIterator(iterator);
+                return InteropUtils.maybeWrapAsObject(iterator, iteratorInterop, EspressoContext.get(node));
+            } catch (InteropException e) {
+                exceptionProfile.enter(node);
+                throw throwInteropExceptionAsGuest.execute(node, e);
+            }
+        }
+    }
+
+    // endregion Hash(Dictionary) Messages
 
     /**
      * Converts a guest arguments array to a host Object[].
@@ -1583,29 +4271,313 @@ public final class Target_com_oracle_truffle_espresso_polyglot_Interop {
      * with an Espresso object. As an optimization, this method may return the underlying array of
      * the guest arguments Object[].
      *
-     * @param unwrap if true, all arguments,
-     * @return a host Object[] with "converted" arguments
+     * Returns a host Object[] with the arguments unwrapped or not depending on the unwrapArguments
+     * argument.
      */
-    private static Object[] getArguments(@Host(Object[].class) StaticObject arguments, boolean unwrap, Meta meta) {
-        Object[] args = null;
-        if (unwrap) {
-            // Unwrap arguments.
-            args = new Object[arguments.length()];
-            for (int i = 0; i < args.length; i++) {
-                args[i] = unwrap(meta.getInterpreterToVM().getArrayObject(i, arguments));
-            }
-        } else {
-            // Preserve argument types.
-            if (arguments.isEspressoObject()) {
-                // Avoid copying, use the underlying array.
-                args = arguments.unwrap();
-            } else {
-                args = new Object[arguments.length()];
-                for (int i = 0; i < args.length; i++) {
-                    args[i] = meta.getInterpreterToVM().getArrayObject(i, arguments);
-                }
-            }
+    @GenerateInline
+    @GenerateCached(false)
+    abstract static class ToHostArguments extends EspressoInlineNode {
+        private static final Object[] EMPTY_ARRAY = new Object[0];
+
+        abstract Object[] execute(Node node, boolean unwrapArguments, @JavaType(Object[].class) StaticObject arguments);
+
+        @Specialization(guards = {
+                        "!unwrapArguments",
+                        "arguments.isEspressoObject()"
+        })
+        static Object[] doEspressoNoUnwrap(
+                        @SuppressWarnings("unused") boolean unwrapArguments,
+                        @JavaType(Object[].class) StaticObject arguments,
+                        @Bind Node node) {
+            return arguments.<StaticObject[]> unwrap(EspressoLanguage.get(node));
         }
-        return args;
+
+        @Specialization(guards = {
+                        "unwrapArguments",
+                        "arguments.isEspressoObject()",
+        })
+        static Object[] doEspressoUnwrap(
+                        @SuppressWarnings("unused") boolean unwrapArguments,
+                        @JavaType(Object[].class) StaticObject arguments,
+                        @Bind Node node) {
+            EspressoLanguage language = EspressoLanguage.get(node);
+            Object[] rawArgs = arguments.unwrap(language);
+            if (rawArgs.length == 0) {
+                return EMPTY_ARRAY;
+            }
+            Object[] hostArgs = new Object[rawArgs.length];
+            Meta meta = EspressoContext.get(node).getMeta();
+            for (int i = 0; i < rawArgs.length; ++i) {
+                hostArgs[i] = InteropUtils.unwrap(language, (StaticObject) rawArgs[i], meta);
+            }
+            return hostArgs;
+        }
+
+        @Specialization(guards = {
+                        "arguments.isForeignObject()",
+        })
+        static Object[] doForeign(
+                        boolean unwrapArguments,
+                        @JavaType(Object[].class) StaticObject arguments,
+                        @Cached(inline = false) GetArraySize getArraySize,
+                        @Cached(inline = false) ReadArrayElement readArrayElement,
+                        @Bind Node node) {
+            EspressoLanguage language = EspressoLanguage.get(node);
+            int argsLength = Math.toIntExact(getArraySize.execute(arguments));
+            if (argsLength == 0) {
+                return EMPTY_ARRAY;
+            }
+            Object[] hostArgs = new Object[argsLength];
+            Meta meta = EspressoContext.get(node).getMeta();
+            for (int i = 0; i < argsLength; ++i) {
+                StaticObject elem = readArrayElement.execute(arguments, i);
+                hostArgs[i] = unwrapArguments ? InteropUtils.unwrap(language, elem, meta) : elem;
+            }
+            return hostArgs;
+        }
+    }
+
+    /**
+     * Throws host interop exceptions as guest exceptions.
+     */
+    @GenerateInline
+    @GenerateCached(false)
+    abstract static class ThrowInteropExceptionAsGuest extends EspressoInlineNode {
+        static final int LIMIT = 2;
+
+        abstract RuntimeException execute(Node node, InteropException hostException);
+
+        @Specialization
+        static RuntimeException doUnsupportedMessageException(
+                        Node node,
+                        UnsupportedMessageException e,
+                        @CachedLibrary(limit = "LIMIT") @Shared InteropLibrary causeInterop,
+                        @Cached @Shared InlinedConditionProfile noCauseProfile,
+                        @Cached(value = "create(getMeta(node).polyglot.UnsupportedMessageException_create.getCallTargetForceInit())", inline = false) DirectCallNode create,
+                        @Cached(value = "create(getMeta(node).polyglot.UnsupportedMessageException_create_Throwable.getCallTargetForceInit())", inline = false) DirectCallNode createWithCause) {
+            Throwable cause = e.getCause();
+            assert cause == null || cause instanceof AbstractTruffleException;
+            EspressoContext context = EspressoContext.get(node);
+            Meta meta = context.getMeta();
+            StaticObject exception = noCauseProfile.profile(node, cause == null)
+                            /* UnsupportedMessageException.create() */
+                            ? (StaticObject) create.call()
+                            /* UnsupportedMessageException.create(Throwable cause) */
+                            : (StaticObject) createWithCause.call(InteropUtils.maybeWrapAsForeignException(cause, causeInterop, context));
+            throw EspressoException.wrap(exception, meta);
+        }
+
+        @Specialization
+        static RuntimeException doUnknownIdentifierException(
+                        Node node,
+                        UnknownIdentifierException e,
+                        @CachedLibrary(limit = "LIMIT") @Shared InteropLibrary causeInterop,
+                        @Cached @Shared InlinedConditionProfile noCauseProfile,
+                        @Cached(value = "create(getMeta(node).polyglot.UnknownIdentifierException_create_String.getCallTargetForceInit())", inline = false) DirectCallNode createWithIdentifier,
+                        @Cached(value = "create(getMeta(node).polyglot.UnknownIdentifierException_create_String_Throwable.getCallTargetForceInit())", inline = false) DirectCallNode createWithIdentifierAndCause) {
+            EspressoContext context = EspressoContext.get(node);
+            Meta meta = context.getMeta();
+            StaticObject unknownIdentifier = meta.toGuestString(e.getUnknownIdentifier());
+            Throwable cause = e.getCause();
+            StaticObject exception = noCauseProfile.profile(node, !(cause instanceof AbstractTruffleException))
+                            /* UnknownIdentifierException.create(String unknownIdentifier) */
+                            ? (StaticObject) createWithIdentifier.call(unknownIdentifier)
+                            /*
+                             * UnknownIdentifierException.create(String unknownIdentifier, Throwable
+                             * cause)
+                             */
+                            : (StaticObject) createWithIdentifierAndCause.call(unknownIdentifier, InteropUtils.maybeWrapAsForeignException(cause, causeInterop, context));
+            throw EspressoException.wrap(exception, meta);
+        }
+
+        @Specialization
+        static RuntimeException doArityException(
+                        Node node,
+                        ArityException e,
+                        @CachedLibrary(limit = "LIMIT") @Shared InteropLibrary causeInterop,
+                        @Cached @Shared InlinedConditionProfile noCauseProfile,
+                        @Cached(value = "create(getMeta(node).polyglot.ArityException_create_int_int_int.getCallTargetForceInit())", inline = false) DirectCallNode createWithArityRange,
+                        @Cached(value = "create(getMeta(node).polyglot.ArityException_create_int_int_int_Throwable.getCallTargetForceInit())", inline = false) DirectCallNode createWithArityRangeAndCause) {
+            int expectedMinArity = e.getExpectedMinArity();
+            int expectedMaxArity = e.getExpectedMaxArity();
+            int actualArity = e.getActualArity();
+            Throwable cause = e.getCause();
+            EspressoContext context = EspressoContext.get(node);
+            Meta meta = context.getMeta();
+            StaticObject exception = noCauseProfile.profile(node, !(cause instanceof AbstractTruffleException))
+                            /*
+                             * ArityException.create(int expectedMinArity, int expectedMaxArity, int
+                             * actualArity)
+                             */
+                            ? (StaticObject) createWithArityRange.call(expectedMinArity, expectedMaxArity, actualArity)
+                            /*
+                             * ArityException.create(int expectedMinArity, int expectedMaxArity, int
+                             * actualArity, Throwable cause)
+                             */
+                            : (StaticObject) createWithArityRangeAndCause.call(expectedMinArity, expectedMinArity, actualArity,
+                                            InteropUtils.maybeWrapAsForeignException(cause, causeInterop, context));
+            throw EspressoException.wrap(exception, meta);
+        }
+
+        @Specialization
+        static RuntimeException doUnsupportedTypeException(
+                        Node node,
+                        UnsupportedTypeException e,
+                        @CachedLibrary(limit = "LIMIT") @Shared InteropLibrary causeInterop,
+                        @Cached @Shared InlinedConditionProfile noCauseProfile,
+                        @Cached(value = "create(getMeta(node).polyglot.UnsupportedTypeException_create_Object_array_String.getCallTargetForceInit())", inline = false) DirectCallNode createWithValuesHint,
+                        @Cached(value = "create(getMeta(node).polyglot.UnsupportedTypeException_create_Object_array_String_Throwable.getCallTargetForceInit())", inline = false) DirectCallNode createWithValuesHintAndCause) {
+            Object[] hostValues = e.getSuppliedValues();
+            EspressoContext context = EspressoContext.get(node);
+            Meta meta = context.getMeta();
+            // Transform suppliedValues[] into a guest Object[].
+            StaticObject[] backingArray = new StaticObject[hostValues.length];
+            for (int i = 0; i < backingArray.length; i++) {
+                backingArray[i] = InteropUtils.maybeWrapAsObject(hostValues[i], InteropLibrary.getUncached(), context);
+            }
+            StaticObject suppliedValues = StaticObject.wrap(backingArray, meta);
+            StaticObject hint = meta.toGuestString(e.getMessage());
+            Throwable cause = e.getCause();
+            StaticObject exception = noCauseProfile.profile(node, !(cause instanceof AbstractTruffleException))
+                            /*
+                             * UnsupportedTypeException.create(Object[] suppliedValues, String hint)
+                             */
+                            ? (StaticObject) createWithValuesHint.call(suppliedValues, hint)
+                            /*
+                             * UnsupportedTypeException.create(Object[] suppliedValues, String hint,
+                             * Throwable cause)
+                             */
+                            : (StaticObject) createWithValuesHintAndCause.call(suppliedValues, hint, InteropUtils.maybeWrapAsForeignException(cause, causeInterop, context));
+            throw EspressoException.wrap(exception, meta);
+        }
+
+        @Specialization
+        static RuntimeException doInvalidArrayIndexException(
+                        Node node,
+                        InvalidArrayIndexException e,
+                        @CachedLibrary(limit = "LIMIT") @Shared InteropLibrary causeInterop,
+                        @Cached @Shared InlinedConditionProfile noCauseProfile,
+                        @Cached(value = "create(getMeta(node).polyglot.InvalidArrayIndexException_create_long.getCallTargetForceInit())", inline = false) DirectCallNode createWithIndex,
+                        @Cached(value = "create(getMeta(node).polyglot.InvalidArrayIndexException_create_long_Throwable.getCallTargetForceInit())", inline = false) DirectCallNode createWithIndexAndCause) {
+            long invalidIndex = e.getInvalidIndex();
+            Throwable cause = e.getCause();
+            EspressoContext context = EspressoContext.get(node);
+            Meta meta = context.getMeta();
+            StaticObject exception = noCauseProfile.profile(node, !(cause instanceof AbstractTruffleException))
+                            /* InvalidArrayIndexException.create(long invalidIndex) */
+                            ? (StaticObject) createWithIndex.call(invalidIndex)
+                            /*
+                             * InvalidArrayIndexException.create(long invalidIndex, Throwable cause)
+                             */
+                            : (StaticObject) createWithIndexAndCause.call(invalidIndex, InteropUtils.maybeWrapAsObject(cause, causeInterop, context));
+            throw EspressoException.wrap(exception, meta);
+        }
+
+        @Specialization
+        static RuntimeException doInvalidBufferOffsetException(
+                        Node node,
+                        InvalidBufferOffsetException e,
+                        @CachedLibrary(limit = "LIMIT") @Shared InteropLibrary causeInterop,
+                        @Cached @Shared InlinedConditionProfile noCauseProfile,
+                        @Cached(value = "create(getMeta(node).polyglot.InvalidBufferOffsetException_create_long_long.getCallTargetForceInit())", inline = false) DirectCallNode createWithOffsetLength,
+                        @Cached(value = "create(getMeta(node).polyglot.InvalidBufferOffsetException_create_long_long_Throwable.getCallTargetForceInit())", inline = false) DirectCallNode createWithOffsetLengthAndCause) {
+            long byteOffset = e.getByteOffset();
+            long length = e.getLength();
+            Throwable cause = e.getCause();
+            EspressoContext context = EspressoContext.get(node);
+            Meta meta = context.getMeta();
+            StaticObject exception = noCauseProfile.profile(node, !(cause instanceof AbstractTruffleException))
+                            /* InvalidBufferOffsetException.create(long byteOffset, long length) */
+                            ? (StaticObject) createWithOffsetLength.call(byteOffset, length)
+                            /*
+                             * InvalidBufferOffsetException.create(long byteOffset, long length,
+                             * Throwable cause)
+                             */
+                            : (StaticObject) createWithOffsetLengthAndCause.call(byteOffset, length, InteropUtils.maybeWrapAsForeignException(cause, causeInterop, context));
+            throw EspressoException.wrap(exception, meta);
+        }
+
+        @Specialization
+        static RuntimeException doStopIterationException(
+                        Node node,
+                        StopIterationException e,
+                        @CachedLibrary(limit = "LIMIT") @Shared InteropLibrary causeInterop,
+                        @Cached @Shared InlinedConditionProfile noCauseProfile,
+                        @Cached(value = "create(getMeta(node).polyglot.StopIterationException_create.getCallTargetForceInit())", inline = false) DirectCallNode create,
+                        @Cached(value = "create(getMeta(node).polyglot.StopIterationException_create_Throwable.getCallTargetForceInit())", inline = false) DirectCallNode createWithCause) {
+            Throwable cause = e.getCause();
+            EspressoContext context = EspressoContext.get(node);
+            Meta meta = context.getMeta();
+            StaticObject exception = noCauseProfile.profile(node, !(cause instanceof AbstractTruffleException))
+                            /* StopIterationException.create() */
+                            ? (StaticObject) create.call()
+                            /* StopIterationException.create(Throwable cause) */
+                            : (StaticObject) createWithCause.call(InteropUtils.maybeWrapAsForeignException(cause, causeInterop, context));
+            throw EspressoException.wrap(exception, meta);
+        }
+
+        @Specialization
+        static RuntimeException doUnknownKeyException(
+                        Node node,
+                        UnknownKeyException e,
+                        @CachedLibrary(limit = "LIMIT") @Exclusive InteropLibrary keyInterop,
+                        @CachedLibrary(limit = "LIMIT") @Shared InteropLibrary causeInterop,
+                        @Cached @Shared InlinedConditionProfile noCauseProfile,
+                        @Cached(value = "create(getMeta(node).polyglot.UnknownKeyException_create_Object.getCallTargetForceInit())", inline = false) DirectCallNode createWithKey,
+                        @Cached(value = "create(getMeta(node).polyglot.UnknownKeyException_create_Object_Throwable.getCallTargetForceInit())", inline = false) DirectCallNode createWithKeyAndCause) {
+            EspressoContext context = EspressoContext.get(node);
+            Meta meta = context.getMeta();
+            StaticObject unknownKey = InteropUtils.maybeWrapAsObject(e.getUnknownKey(), keyInterop, context);
+            Throwable cause = e.getCause();
+            StaticObject exception = noCauseProfile.profile(node, !(cause instanceof AbstractTruffleException))
+                            /* UnknownKeyException.create(Object unknownKey) */
+                            ? (StaticObject) createWithKey.call(unknownKey)
+                            /* UnknownKeyException.create(Object unknownKey, Throwable cause) */
+                            : (StaticObject) createWithKeyAndCause.call(unknownKey, InteropUtils.maybeWrapAsObject(cause, causeInterop, context));
+            throw EspressoException.wrap(exception, meta);
+        }
+
+        @Fallback
+        @TruffleBoundary
+        static RuntimeException shouldNotReachHere(InteropException e) {
+            throw EspressoError.shouldNotReachHere("Unexpected host interop exception", e);
+        }
+    }
+
+    private static EspressoException handleAbstractTruffleException(InteropLibrary exceptionInterop, EspressoContext context, LookupTypeConverterNode lookupTypeConverterNode,
+                    LookupInternalTypeConverterNode internalTypeConverterNode, BranchProfile exceptionProfile, AbstractTruffleException ex) {
+        exceptionProfile.enter();
+        Meta meta = context.getMeta();
+        StaticObject foreignException = context.getAllocator().createForeignException(context, ex, exceptionInterop);
+        try {
+            Object metaObject = exceptionInterop.getMetaObject(ex);
+            String metaName = ToEspressoNode.getMetaName(metaObject, exceptionInterop);
+            PolyglotTypeMappings.InternalTypeConverter internalTypeConverter = internalTypeConverterNode.execute(metaName);
+            if (internalTypeConverter != null) {
+                StaticObject convertedGuestException = internalTypeConverter.convertInternal(exceptionInterop, foreignException, meta, null, null);
+                return EspressoException.wrap(convertedGuestException, meta);
+            }
+            PolyglotTypeMappings.TypeConverter converter = lookupTypeConverterNode.execute(metaName);
+            if (converter != null) {
+                StaticObject converted = (StaticObject) converter.convert(foreignException);
+                /*
+                 * The back trace of the foreign exception wrapper must be set to the foreign
+                 * exception object, then the back trace is retained in the guest code and the
+                 * stackTrace field set to null to trigger backtrace lookups
+                 */
+                meta.java_lang_Throwable_backtrace.setObject(converted, meta.java_lang_Throwable_backtrace.getObject(foreignException));
+                if (meta.getJavaVersion().java9OrLater()) {
+                    meta.java_lang_Throwable_depth.setInt(converted, meta.java_lang_Throwable_depth.getInt(foreignException));
+                }
+                meta.java_lang_Throwable_stackTrace.setObject(converted, StaticObject.NULL);
+                meta.HIDDEN_FRAMES.setHiddenObject(converted, VM.StackTrace.FOREIGN_MARKER_STACK_TRACE);
+
+                throw EspressoException.wrap(converted, meta);
+            }
+        } catch (UnsupportedMessageException | UnsupportedTypeException e) {
+            // throw the original exception then
+            throw ex;
+        }
+        throw EspressoException.wrap(foreignException, meta);
     }
 }

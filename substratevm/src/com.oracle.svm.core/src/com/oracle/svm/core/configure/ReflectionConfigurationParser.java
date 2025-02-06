@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017, 2017, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2017, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,210 +24,130 @@
  */
 package com.oracle.svm.core.configure;
 
-import java.io.IOException;
-import java.io.Reader;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
-import java.util.Map;
 import java.util.stream.Collectors;
 
-import com.oracle.svm.core.TypeResult;
-import com.oracle.svm.core.util.json.JSONParser;
-import com.oracle.svm.core.util.json.JSONParserException;
+import org.graalvm.collections.EconomicMap;
 
-// Checkstyle: allow reflection
+import com.oracle.svm.core.TypeResult;
+import com.oracle.svm.util.LogUtils;
+
+import jdk.graal.compiler.util.json.JsonParserException;
 
 /**
  * Parses JSON describing classes, methods and fields and delegates their registration to a
  * {@link ReflectionConfigurationParserDelegate}.
  */
-public final class ReflectionConfigurationParser<T> extends ConfigurationParser {
+public abstract class ReflectionConfigurationParser<C, T> extends ConfigurationParser {
     private static final String CONSTRUCTOR_NAME = "<init>";
 
-    private final ReflectionConfigurationParserDelegate<T> delegate;
-    private final boolean allowIncompleteClasspath;
+    protected final ConfigurationConditionResolver<C> conditionResolver;
+    protected final ReflectionConfigurationParserDelegate<C, T> delegate;
+    private final boolean printMissingElements;
 
-    public ReflectionConfigurationParser(ReflectionConfigurationParserDelegate<T> delegate) {
-        this(delegate, false);
-    }
-
-    public ReflectionConfigurationParser(ReflectionConfigurationParserDelegate<T> delegate, boolean allowIncompleteClasspath) {
+    public ReflectionConfigurationParser(ConfigurationConditionResolver<C> conditionResolver, ReflectionConfigurationParserDelegate<C, T> delegate, boolean strictConfiguration,
+                    boolean printMissingElements) {
+        super(strictConfiguration);
+        this.conditionResolver = conditionResolver;
+        this.printMissingElements = printMissingElements;
         this.delegate = delegate;
-        this.allowIncompleteClasspath = allowIncompleteClasspath;
     }
 
-    @Override
-    public void parseAndRegister(Reader reader) throws IOException {
-        JSONParser parser = new JSONParser(reader);
-        Object json = parser.parse();
-        parseClassArray(asList(json, "first level of document must be an array of class descriptors"));
+    public static <C, T> ReflectionConfigurationParser<C, T> create(String combinedFileKey, boolean strictMetadata,
+                    ConfigurationConditionResolver<C> conditionResolver, ReflectionConfigurationParserDelegate<C, T> delegate,
+                    boolean strictConfiguration, boolean printMissingElements, boolean treatAllEntriesAsType) {
+        if (strictMetadata) {
+            return new ReflectionMetadataParser<>(combinedFileKey, conditionResolver, delegate, strictConfiguration, printMissingElements);
+        } else {
+            return new LegacyReflectionConfigurationParser<>(conditionResolver, delegate, strictConfiguration, printMissingElements, treatAllEntriesAsType);
+        }
     }
 
-    private void parseClassArray(List<Object> classes) {
+    protected void parseClassArray(List<Object> classes) {
         for (Object clazz : classes) {
             parseClass(asMap(clazz, "second level of document must be class descriptor objects"));
         }
     }
 
-    private void parseClass(Map<String, Object> data) {
-        Object classObject = data.get("name");
-        if (classObject == null) {
-            throw new JSONParserException("Missing attribute 'name' in class descriptor object");
-        }
-        String className = asString(classObject, "name");
+    protected abstract void parseClass(EconomicMap<String, Object> data);
 
-        TypeResult<T> result = delegate.resolveTypeResult(className);
-        if (!result.isPresent()) {
-            handleError("Could not resolve " + className + " for reflection configuration.", result.getException());
-            return;
-        }
-        T clazz = result.get();
-        delegate.registerType(clazz);
-
-        for (Map.Entry<String, Object> entry : data.entrySet()) {
-            String name = entry.getKey();
-            Object value = entry.getValue();
+    protected void registerIfNotDefault(EconomicMap<String, Object> data, boolean defaultValue, T clazz, String propertyName, Runnable register) {
+        if (data.containsKey(propertyName) ? asBoolean(data.get(propertyName), propertyName) : defaultValue) {
             try {
-                if (name.equals("name")) {
-                    /* Already handled. */
-                } else if (name.equals("allDeclaredConstructors")) {
-                    if (asBoolean(value, "allDeclaredConstructors")) {
-                        delegate.registerDeclaredConstructors(clazz);
-                    }
-                } else if (name.equals("allPublicConstructors")) {
-                    if (asBoolean(value, "allPublicConstructors")) {
-                        delegate.registerPublicConstructors(clazz);
-                    }
-                } else if (name.equals("allDeclaredMethods")) {
-                    if (asBoolean(value, "allDeclaredMethods")) {
-                        delegate.registerDeclaredMethods(clazz);
-                    }
-                } else if (name.equals("allPublicMethods")) {
-                    if (asBoolean(value, "allPublicMethods")) {
-                        delegate.registerPublicMethods(clazz);
-                    }
-                } else if (name.equals("allDeclaredFields")) {
-                    if (asBoolean(value, "allDeclaredFields")) {
-                        delegate.registerDeclaredFields(clazz);
-                    }
-                } else if (name.equals("allPublicFields")) {
-                    if (asBoolean(value, "allPublicFields")) {
-                        delegate.registerPublicFields(clazz);
-                    }
-                } else if (name.equals("allDeclaredClasses")) {
-                    if (asBoolean(value, "allDeclaredClasses")) {
-                        delegate.registerDeclaredClasses(clazz);
-                    }
-                } else if (name.equals("allPublicClasses")) {
-                    if (asBoolean(value, "allPublicClasses")) {
-                        delegate.registerPublicClasses(clazz);
-                    }
-                } else if (name.equals("methods")) {
-                    parseMethods(asList(value, "Attribute 'methods' must be an array of method descriptors"), clazz);
-                } else if (name.equals("fields")) {
-                    parseFields(asList(value, "Attribute 'fields' must be an array of field descriptors"), clazz);
-                } else {
-                    throw new JSONParserException("Unknown attribute '" + name +
-                                    "' (supported attributes: allDeclaredConstructors, allPublicConstructors, allDeclaredMethods, allPublicMethods, allDeclaredFields, allPublicFields, methods, fields) in defintion of class " +
-                                    delegate.getTypeName(clazz));
-                }
+                register.run();
             } catch (LinkageError e) {
-                handleError("Could not register " + delegate.getTypeName(clazz) + ": " + name + " for reflection.", e);
+                handleMissingElement("Could not register " + delegate.getTypeName(clazz) + ": " + propertyName + " for reflection.", e);
             }
         }
     }
 
-    private void parseFields(List<Object> fields, T clazz) {
+    protected void parseFields(C condition, List<Object> fields, T clazz) {
         for (Object field : fields) {
-            parseField(asMap(field, "Elements of 'fields' array must be field descriptor objects"), clazz);
+            parseField(condition, asMap(field, "Elements of 'fields' array must be field descriptor objects"), clazz);
         }
     }
 
-    private void parseField(Map<String, Object> data, T clazz) {
-        String fieldName = null;
-        boolean allowWrite = false;
-        for (Map.Entry<String, Object> entry : data.entrySet()) {
-            String propertyName = entry.getKey();
-            if (propertyName.equals("name")) {
-                fieldName = asString(entry.getValue(), "name");
-            } else if (propertyName.equals("allowWrite")) {
-                allowWrite = asBoolean(entry.getValue(), "allowWrite");
-            } else if (propertyName.equals("allowUnsafeAccess")) {
-                // ignored (no longer required)
-            } else {
-                throw new JSONParserException("Unknown attribute '" + propertyName + "' (supported attributes: 'name') in definition of field for class '" + delegate.getTypeName(clazz) + "'");
-            }
-        }
-
-        if (fieldName == null) {
-            throw new JSONParserException("Missing attribute 'name' in definition of field for class " + delegate.getTypeName(clazz));
-        }
+    private void parseField(C condition, EconomicMap<String, Object> data, T clazz) {
+        checkAttributes(data, "reflection field descriptor object", Collections.singleton("name"), Arrays.asList("allowWrite", "allowUnsafeAccess"));
+        String fieldName = asString(data.get("name"), "name");
+        boolean allowWrite = data.containsKey("allowWrite") && asBoolean(data.get("allowWrite"), "allowWrite");
 
         try {
-            delegate.registerField(clazz, fieldName, allowWrite);
+            delegate.registerField(condition, clazz, fieldName, allowWrite);
         } catch (NoSuchFieldException e) {
-            handleError("Field " + formatField(clazz, fieldName) + " not found.");
+            handleMissingElement("Field " + formatField(clazz, fieldName) + " not found.");
         } catch (LinkageError e) {
-            handleError("Could not register field " + formatField(clazz, fieldName) + " for reflection.", e);
+            handleMissingElement("Could not register field " + formatField(clazz, fieldName) + " for reflection.", e);
         }
     }
 
-    private void parseMethods(List<Object> methods, T clazz) {
+    protected void parseMethods(C condition, boolean queriedOnly, List<Object> methods, T clazz) {
         for (Object method : methods) {
-            parseMethod(asMap(method, "Elements of 'methods' array must be method descriptor objects"), clazz);
+            parseMethod(condition, queriedOnly, asMap(method, "Elements of 'methods' array must be method descriptor objects"), clazz);
         }
     }
 
-    private void parseMethod(Map<String, Object> data, T clazz) {
-        String methodName = null;
+    private void parseMethod(C condition, boolean queriedOnly, EconomicMap<String, Object> data, T clazz) {
+        checkAttributes(data, "reflection method descriptor object", Collections.singleton("name"), Collections.singleton("parameterTypes"));
+        String methodName = asString(data.get("name"), "name");
         List<T> methodParameterTypes = null;
-        for (Map.Entry<String, Object> entry : data.entrySet()) {
-            String propertyName = entry.getKey();
-            if (propertyName.equals("name")) {
-                methodName = asString(entry.getValue(), "name");
-            } else if (propertyName.equals("parameterTypes")) {
-                methodParameterTypes = parseMethodParameters(clazz, methodName, asList(entry.getValue(),
-                                "Attribute 'parameterTypes' must be a list of type names"));
-                if (methodParameterTypes == null) {
-                    return;
-                }
-            } else {
-                throw new JSONParserException(
-                                "Unknown attribute '" + propertyName + "' (supported attributes: 'name', 'parameterTypes') in definition of method for class '" + delegate.getTypeName(clazz) + "'");
+        Object parameterTypes = data.get("parameterTypes");
+        if (parameterTypes != null) {
+            methodParameterTypes = parseMethodParameters(clazz, methodName, asList(parameterTypes, "Attribute 'parameterTypes' must be a list of type names"));
+            if (methodParameterTypes == null) {
+                return;
             }
-        }
-
-        if (methodName == null) {
-            throw new JSONParserException("Missing attribute 'name' in definition of method for class '" + delegate.getTypeName(clazz) + "'");
         }
 
         boolean isConstructor = CONSTRUCTOR_NAME.equals(methodName);
         if (methodParameterTypes != null) {
             try {
                 if (isConstructor) {
-                    delegate.registerConstructor(clazz, methodParameterTypes);
+                    delegate.registerConstructor(condition, queriedOnly, clazz, methodParameterTypes);
                 } else {
-                    delegate.registerMethod(clazz, methodName, methodParameterTypes);
+                    delegate.registerMethod(condition, queriedOnly, clazz, methodName, methodParameterTypes);
                 }
             } catch (NoSuchMethodException e) {
-                handleError("Method " + formatMethod(clazz, methodName, methodParameterTypes) + " not found.");
+                handleMissingElement("Method " + formatMethod(clazz, methodName, methodParameterTypes) + " not found.");
             } catch (LinkageError e) {
-                handleError("Could not register method " + formatMethod(clazz, methodName, methodParameterTypes) + " for reflection.", e);
+                handleMissingElement("Could not register method " + formatMethod(clazz, methodName, methodParameterTypes) + " for reflection.", e);
             }
         } else {
             try {
                 boolean found;
                 if (isConstructor) {
-                    found = delegate.registerAllConstructors(clazz);
+                    found = delegate.registerAllConstructors(condition, queriedOnly, clazz);
                 } else {
-                    found = delegate.registerAllMethodsWithName(clazz, methodName);
+                    found = delegate.registerAllMethodsWithName(condition, queriedOnly, clazz, methodName);
                 }
                 if (!found) {
-                    throw new JSONParserException("Method " + formatMethod(clazz, methodName) + " not found");
+                    throw new JsonParserException("Method " + formatMethod(clazz, methodName) + " not found");
                 }
             } catch (LinkageError e) {
-                handleError("Could not register method " + formatMethod(clazz, methodName) + " for reflection.", e);
+                handleMissingElement("Could not register method " + formatMethod(clazz, methodName) + " for reflection.", e);
             }
         }
     }
@@ -236,9 +156,9 @@ public final class ReflectionConfigurationParser<T> extends ConfigurationParser 
         List<T> result = new ArrayList<>();
         for (Object type : types) {
             String typeName = asString(type, "types");
-            TypeResult<T> typeResult = delegate.resolveTypeResult(typeName);
+            TypeResult<T> typeResult = delegate.resolveType(conditionResolver.alwaysTrue(), new NamedConfigurationTypeDescriptor(typeName), true);
             if (!typeResult.isPresent()) {
-                handleError("Could not register method " + formatMethod(clazz, methodName) + " for reflection.", typeResult.getException());
+                handleMissingElement("Could not register method " + formatMethod(clazz, methodName) + " for reflection.", typeResult.getException());
                 return null;
             }
             result.add(typeResult.get());
@@ -263,21 +183,17 @@ public final class ReflectionConfigurationParser<T> extends ConfigurationParser 
         return delegate.getTypeName(clazz) + '.' + methodName + '(' + parameterTypeNames + ')';
     }
 
-    private void handleError(String message) {
-        handleError(message, null);
+    private void handleMissingElement(String message) {
+        handleMissingElement(message, null);
     }
 
-    private void handleError(String msg, Throwable cause) {
-        // Checkstyle: stop
-        String message = msg;
-        if (cause != null) {
-            message += " Reason: " + formatError(cause) + '.';
+    protected void handleMissingElement(String msg, Throwable cause) {
+        if (printMissingElements) {
+            String message = msg;
+            if (cause != null) {
+                message += " Reason: " + formatError(cause) + '.';
+            }
+            LogUtils.warning(message);
         }
-        if (this.allowIncompleteClasspath) {
-            System.out.println("WARNING: " + message);
-        } else {
-            throw new JSONParserException(message + " To allow unresolvable reflection configuration, use option -H:+AllowIncompleteClasspath");
-        }
-        // Checkstyle: resume
     }
 }

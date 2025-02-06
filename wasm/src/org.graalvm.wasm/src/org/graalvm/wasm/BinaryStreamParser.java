@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2019, 2025, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -40,15 +40,30 @@
  */
 package org.graalvm.wasm;
 
-import com.oracle.truffle.api.CompilerDirectives.CompilationFinal;
-import com.oracle.truffle.api.nodes.ExplodeLoop;
+import static com.oracle.truffle.api.nodes.ExplodeLoop.LoopExplosionKind.FULL_EXPLODE_UNTIL_RETURN;
+
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.VarHandle;
+import java.nio.ByteOrder;
+import java.util.Arrays;
+
 import org.graalvm.wasm.constants.GlobalModifier;
 import org.graalvm.wasm.exception.Failure;
 import org.graalvm.wasm.exception.WasmException;
 
-import static com.oracle.truffle.api.nodes.ExplodeLoop.LoopExplosionKind.FULL_EXPLODE_UNTIL_RETURN;
+import com.oracle.truffle.api.CompilerDirectives;
+import com.oracle.truffle.api.CompilerDirectives.CompilationFinal;
+import com.oracle.truffle.api.memory.ByteArraySupport;
+import com.oracle.truffle.api.nodes.ExplodeLoop;
 
 public abstract class BinaryStreamParser {
+    protected static final int SINGLE_RESULT_VALUE = 0;
+    protected static final int MULTI_RESULT_VALUE = 1;
+
+    private static final VarHandle I16LE = MethodHandles.byteArrayViewVarHandle(short[].class, ByteOrder.LITTLE_ENDIAN);
+    private static final VarHandle I32LE = MethodHandles.byteArrayViewVarHandle(int[].class, ByteOrder.LITTLE_ENDIAN);
+    private static final VarHandle I64LE = MethodHandles.byteArrayViewVarHandle(long[].class, ByteOrder.LITTLE_ENDIAN);
+
     @CompilationFinal(dimensions = 1) protected byte[] data;
     protected int offset;
 
@@ -73,26 +88,7 @@ public abstract class BinaryStreamParser {
         if (shift == 42) {
             throw WasmException.create(Failure.INTEGER_REPRESENTATION_TOO_LONG);
         } else if (shift == 35 && (0b0111_0000 & b) != 0) {
-            throw WasmException.create(Failure.INTEGER_TOO_LONG);
-        }
-
-        return packValueAndLength(result, currentOffset - initialOffset);
-    }
-
-    /**
-     * Unchecked version of {@link #peekUnsignedInt32AndLength}.
-     */
-    @ExplodeLoop(kind = FULL_EXPLODE_UNTIL_RETURN)
-    public static long rawPeekUnsignedInt32AndLength(byte[] data, int initialOffset) {
-        int result = 0;
-        int shift = 0;
-        int currentOffset = initialOffset;
-        byte b = (byte) 0x80;
-        while (shift < 42 && (b & 0x80) != 0) {
-            b = rawPeek1(data, currentOffset);
-            currentOffset++;
-            result |= (b & 0x7F) << shift;
-            shift += 7;
+            throw WasmException.create(Failure.INTEGER_TOO_LARGE);
         }
 
         return packValueAndLength(result, currentOffset - initialOffset);
@@ -114,7 +110,7 @@ public abstract class BinaryStreamParser {
         if (shift == 42) {
             throw WasmException.create(Failure.INTEGER_REPRESENTATION_TOO_LONG);
         } else if (shift == 35 && (b & 0b0111_0000) != ((b & 0b1000) == 0 ? 0 : 0b0111_0000)) {
-            throw WasmException.create(Failure.INTEGER_TOO_LONG);
+            throw WasmException.create(Failure.INTEGER_TOO_LARGE);
         }
 
         if (shift != 35 && (b & 0x40) != 0) {
@@ -124,27 +120,28 @@ public abstract class BinaryStreamParser {
         return packValueAndLength(result, currentOffset - initialOffset);
     }
 
-    /**
-     * Unchecked version of {@link #peekSignedInt32AndLength}.
-     */
     @ExplodeLoop(kind = FULL_EXPLODE_UNTIL_RETURN)
-    public static long rawPeekSignedInt32AndLength(byte[] data, int initialOffset) {
-        int result = 0;
+    public static long peekUnsignedInt64(byte[] data, int initialOffset, boolean checkValid) {
+        long result = 0;
         int shift = 0;
         int currentOffset = initialOffset;
         byte b = (byte) 0x80;
-        while (shift < 42 && (b & 0x80) != 0) {
-            b = rawPeek1(data, currentOffset);
-            currentOffset++;
-            result |= (b & 0x7F) << shift;
+        while ((b & 0x80) != 0 && shift != 77) {
+            b = peek1(data, currentOffset);
+            result |= ((b & 0x7FL) << shift);
             shift += 7;
+            currentOffset++;
         }
 
-        if (shift < 35 && (b & 0x40) != 0) {
-            result |= (~0 << shift);
+        if (checkValid) {
+            if (shift == 77) {
+                throw WasmException.create(Failure.INTEGER_REPRESENTATION_TOO_LONG);
+            } else if (shift == 70 && (b & 0b0111_1110) != 0) {
+                throw WasmException.create(Failure.INTEGER_TOO_LARGE);
+            }
         }
 
-        return packValueAndLength(result, currentOffset - initialOffset);
+        return result;
     }
 
     @ExplodeLoop(kind = FULL_EXPLODE_UNTIL_RETURN)
@@ -164,7 +161,7 @@ public abstract class BinaryStreamParser {
             if (shift == 77) {
                 throw WasmException.create(Failure.INTEGER_REPRESENTATION_TOO_LONG);
             } else if (shift == 70 && (b & 0b0111_1110) != ((b & 1) == 0 ? 0 : 0b0111_1110)) {
-                throw WasmException.create(Failure.INTEGER_TOO_LONG);
+                throw WasmException.create(Failure.INTEGER_TOO_LARGE);
             }
         }
 
@@ -186,16 +183,8 @@ public abstract class BinaryStreamParser {
         return (int) ((bits >>> 32) & 0xffff_ffffL);
     }
 
-    protected static int peekFloatAsInt32(byte[] data, int offset) {
-        return peek4(data, offset);
-    }
-
     protected int readFloatAsInt32() {
         return read4();
-    }
-
-    protected static long peekFloatAsInt64(byte[] data, int offset) {
-        return peek8(data, offset);
     }
 
     protected long readFloatAsInt64() {
@@ -229,10 +218,6 @@ public abstract class BinaryStreamParser {
         return peek1(data, offset);
     }
 
-    protected byte peek1(int ahead) {
-        return peek1(data, offset + ahead);
-    }
-
     public static byte peek1(byte[] data, int initialOffset) {
         // Inlined version of Assert.assertUnsignedIntLess(offset, data.length,
         // Failure.UNEXPECTED_END);
@@ -242,34 +227,28 @@ public abstract class BinaryStreamParser {
         return data[initialOffset];
     }
 
-    public static byte rawPeek1(byte[] data, int initialOffset) {
-        return data[initialOffset];
-    }
-
-    @ExplodeLoop(kind = FULL_EXPLODE_UNTIL_RETURN)
-    public static int peek4(byte[] data, int initialOffset) {
+    public static short peek2(byte[] data, int initialOffset) {
         int result = 0;
-        for (int i = 0; i != 4; ++i) {
-            int x = peek1(data, initialOffset + i) & 0xFF;
+        for (int i = 0; i != 2; ++i) {
+            int x = Byte.toUnsignedInt(peek1(data, initialOffset + i));
             result |= x << 8 * i;
         }
-        return result;
-    }
-
-    @ExplodeLoop(kind = FULL_EXPLODE_UNTIL_RETURN)
-    public static long peek8(byte[] data, int initialOffset) {
-        long result = 0;
-        for (int i = 0; i != 8; ++i) {
-            long x = peek1(data, initialOffset + i) & 0xFF;
-            result |= x << 8 * i;
-        }
-        return result;
+        return (short) result;
     }
 
     protected int read4() {
         int result = 0;
         for (int i = 0; i != 4; ++i) {
             int x = Byte.toUnsignedInt(read1());
+            result |= x << 8 * i;
+        }
+        return result;
+    }
+
+    public static int peek4(byte[] data, int initialOffset) {
+        int result = 0;
+        for (int i = 0; i != 4; ++i) {
+            int x = Byte.toUnsignedInt(peek1(data, initialOffset + i));
             result |= x << 8 * i;
         }
         return result;
@@ -284,28 +263,62 @@ public abstract class BinaryStreamParser {
         return result;
     }
 
+    public static long peek8(byte[] data, int initialOffset) {
+        long result = 0;
+        for (int i = 0; i != 8; ++i) {
+            long x = Byte.toUnsignedLong(peek1(data, initialOffset + i));
+            result |= x << 8 * i;
+        }
+        return result;
+    }
+
     protected int offset() {
         return offset;
     }
 
-    protected static byte peekBlockType(byte[] data, int offset) {
+    /**
+     * Reads the block type at the current location. The result is provided as two values. The first
+     * is the actual value of the block type. The second is an indicator if it is a single result
+     * type or a multi-value result.
+     *
+     * @param result The array used for returning the result.
+     *
+     */
+    protected void readBlockType(int[] result, boolean allowRefTypes, boolean allowVecType) {
         byte type = peek1(data, offset);
         switch (type) {
-            case 0x00:
             case WasmType.VOID_TYPE:
-                return WasmType.VOID_TYPE;
+            case WasmType.I32_TYPE:
+            case WasmType.I64_TYPE:
+            case WasmType.F32_TYPE:
+            case WasmType.F64_TYPE:
+                offset++;
+                result[0] = type;
+                result[1] = SINGLE_RESULT_VALUE;
+                break;
+            case WasmType.V128_TYPE:
+                Assert.assertTrue(allowVecType, Failure.MALFORMED_VALUE_TYPE);
+                offset++;
+                result[0] = type;
+                result[1] = SINGLE_RESULT_VALUE;
+                break;
+            case WasmType.FUNCREF_TYPE:
+            case WasmType.EXTERNREF_TYPE:
+                Assert.assertTrue(allowRefTypes, Failure.MALFORMED_VALUE_TYPE);
+                offset++;
+                result[0] = type;
+                result[1] = SINGLE_RESULT_VALUE;
+                break;
             default:
-                return peekValueType(data, offset);
+                long valueAndLength = peekSignedInt32AndLength(data, offset);
+                result[0] = value(valueAndLength);
+                Assert.assertIntGreaterOrEqual(result[0], 0, Failure.UNSPECIFIED_MALFORMED);
+                result[1] = MULTI_RESULT_VALUE;
+                offset += length(valueAndLength);
         }
     }
 
-    protected byte readBlockType() {
-        byte type = peekBlockType(data, offset);
-        offset++;
-        return type;
-    }
-
-    protected static byte peekValueType(byte[] data, int offset) {
+    protected static byte peekValueType(byte[] data, int offset, boolean allowRefTypes, boolean allowVecType) {
         byte b = peek1(data, offset);
         switch (b) {
             case WasmType.I32_TYPE:
@@ -313,14 +326,21 @@ public abstract class BinaryStreamParser {
             case WasmType.F32_TYPE:
             case WasmType.F64_TYPE:
                 break;
+            case WasmType.V128_TYPE:
+                Assert.assertTrue(allowVecType, Failure.MALFORMED_VALUE_TYPE);
+                break;
+            case WasmType.FUNCREF_TYPE:
+            case WasmType.EXTERNREF_TYPE:
+                Assert.assertTrue(allowRefTypes, Failure.MALFORMED_VALUE_TYPE);
+                break;
             default:
                 Assert.fail(Failure.MALFORMED_VALUE_TYPE, String.format("Invalid value type: 0x%02X", b));
         }
         return b;
     }
 
-    protected byte readValueType() {
-        byte b = peekValueType(data, offset);
+    protected byte readValueType(boolean allowRefTypes, boolean allowVecType) {
+        byte b = peekValueType(data, offset, allowRefTypes, allowVecType);
         offset++;
         return b;
     }
@@ -337,4 +357,127 @@ public abstract class BinaryStreamParser {
         }
         return length;
     }
+
+    // region bytecode
+
+    /**
+     * Reads the unsigned byte value at the given bytecode offset.
+     *
+     * @param bytecode The bytecode
+     * @param offset The offset in the bytecode
+     * @return the unsigned byte value at the given bytecode offset.
+     */
+    public static int rawPeekU8(byte[] bytecode, int offset) {
+        return bytecode[offset] & 0xFF;
+    }
+
+    /**
+     * Reads the signed byte value at the given bytecode offset.
+     *
+     * @param bytecode The bytecode
+     * @param offset The offset in the bytecode
+     * @return The signed byte value at the given bytecode offset.
+     */
+    public static byte rawPeekI8(byte[] bytecode, int offset) {
+        return bytecode[offset];
+    }
+
+    /**
+     * Reads the unsigned short value at the given bytecode offset.
+     *
+     * @param bytecode The bytecode
+     * @param offset The offset in the bytecode
+     * @return The unsigned short value at the given bytecode offset.
+     */
+    public static int rawPeekU16(byte[] bytecode, int offset) {
+        return Short.toUnsignedInt(rawPeekI16(bytecode, offset));
+    }
+
+    /**
+     * Reads the signed short value at the given bytecode offset.
+     *
+     * @param bytecode The bytecode
+     * @param offset The offset in the bytecode
+     * @return The signed short value at the given bytecode offset.
+     */
+    public static short rawPeekI16(byte[] bytecode, int offset) {
+        if (CompilerDirectives.inCompiledCode()) {
+            return ByteArraySupport.littleEndian().getShortUnaligned(bytecode, offset);
+        }
+        return (short) I16LE.get(bytecode, offset);
+    }
+
+    /**
+     * Writes the unsigned short value to the given bytecode offset.
+     *
+     * @param bytecode The bytecode
+     * @param offset The offset in the bytecode
+     * @param value The value that should be written
+     */
+    public static void writeU16(byte[] bytecode, int offset, int value) {
+        I16LE.set(bytecode, offset, (short) value);
+    }
+
+    /**
+     * Reads the unsigned integer value at the given bytecode offset.
+     *
+     * @param bytecode The bytecode
+     * @param offset The offset in the bytecode
+     * @return The unsigned integer value at the given bytecode offset.
+     */
+    public static long rawPeekU32(byte[] bytecode, int offset) {
+        return Integer.toUnsignedLong(rawPeekI32(bytecode, offset));
+    }
+
+    /**
+     * Reads the signed integer value at the given bytecode offset.
+     *
+     * @param bytecode The bytecode
+     * @param offset The offset in the bytecode.
+     * @return The signed integer value at the given bytecode offset.
+     */
+    public static int rawPeekI32(byte[] bytecode, int offset) {
+        if (CompilerDirectives.inCompiledCode()) {
+            return ByteArraySupport.littleEndian().getIntUnaligned(bytecode, offset);
+        }
+        return (int) I32LE.get(bytecode, offset);
+    }
+
+    /**
+     * Reads the signed long value at the given bytecode offset.
+     *
+     * @param bytecode The bytecode
+     * @param offset The offset in the bytecode.
+     * @return The signed long value at the given bytecode offset.
+     */
+    public static long rawPeekI64(byte[] bytecode, int offset) {
+        if (CompilerDirectives.inCompiledCode()) {
+            return ByteArraySupport.littleEndian().getLongUnaligned(bytecode, offset);
+        }
+        return (long) I64LE.get(bytecode, offset);
+    }
+
+    /**
+     * Writes the signed long value to the given bytecode offset.
+     *
+     * @param bytecode The bytecode
+     * @param offset The offset in the bytecode
+     * @param value The value that should be written
+     */
+    public static void writeI64(byte[] bytecode, int offset, long value) {
+        I64LE.set(bytecode, offset, value);
+    }
+
+    /**
+     * Reads the 16 bytes of an {@code i128}/{@code v128} value at the given bytecode offset.
+     *
+     * @param bytecode The bytecode
+     * @param offset The offset in the bytecode.
+     * @return The 16-byte {@code byte[]} read at the given bytecode offset.
+     */
+    public static byte[] rawPeekI128(byte[] bytecode, int offset) {
+        return Arrays.copyOfRange(bytecode, offset, offset + 16);
+    }
+
+    // endregion
 }

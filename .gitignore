@@ -15,12 +15,14 @@
 *.obj
 *.orig
 *.pdf
+*.phaseplan
 *.pyc
 *.rej
 *.swn
 *.swo
 *.swp
 *.zip
+*.bgv
 .DS_Store
 .checkstyle
 .classpath
@@ -53,3 +55,8 @@ jmh_result.json
 /vm/src/installer/dist/
 /tools/generators/node_modules/
 /tools/generators/out/
+visualizer/IdealGraphVisualizer/*/target/
+/.src-rev
+*.interp
+*.tokens
+/vm/tests/gh_workflows/CDTInspectorTest/target/

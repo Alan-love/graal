@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2017, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -40,22 +40,29 @@
  */
 package com.oracle.truffle.nfi.backend.libffi;
 
+import java.io.IOException;
 import java.util.HashMap;
 import java.util.function.Supplier;
 
 import com.oracle.truffle.api.CallTarget;
+import com.oracle.truffle.api.CompilerDirectives;
 import com.oracle.truffle.api.CompilerDirectives.CompilationFinal;
 import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
+import com.oracle.truffle.api.TruffleFile;
+import com.oracle.truffle.api.TruffleLanguage.ContextReference;
 import com.oracle.truffle.api.TruffleLanguage.Env;
 import com.oracle.truffle.api.TruffleLogger;
+import com.oracle.truffle.api.nodes.Node;
 import com.oracle.truffle.nfi.backend.libffi.LibFFIType.EnvType;
+import com.oracle.truffle.nfi.backend.libffi.NativeAllocation.Destructor;
 import com.oracle.truffle.nfi.backend.libffi.NativeAllocation.FreeDestructor;
+import com.oracle.truffle.nfi.backend.spi.NFIState;
 import com.oracle.truffle.nfi.backend.spi.types.NativeSimpleType;
 
 class LibFFIContext {
 
     final LibFFILanguage language;
-    Env env;
+    @CompilationFinal Env env;
 
     final TruffleLogger attachThreadLogger;
 
@@ -64,9 +71,12 @@ class LibFFIContext {
 
     @CompilationFinal(dimensions = 1) final LibFFIType[] simpleTypeMap = new LibFFIType[NativeSimpleType.values().length];
     @CompilationFinal(dimensions = 1) final LibFFIType[] arrayTypeMap = new LibFFIType[NativeSimpleType.values().length];
+    @CompilationFinal(dimensions = 1) final LibFFIType[] varargsTypeMap = new LibFFIType[NativeSimpleType.values().length];
     @CompilationFinal LibFFIType cachedEnvType;
 
     private final HashMap<Long, ClosureNativePointer> nativePointerMap = new HashMap<>();
+
+    final LoadFlags platformLoadFlags = LoadFlags.initLoadFlags(this);
 
     // initialized by native code
     // Checkstyle: stop field name check
@@ -89,12 +99,37 @@ class LibFFIContext {
         }
     }
 
-    private class NativeEnvSupplier implements Supplier<NativeEnv> {
+    private static class NativeEnvDestructor extends Destructor {
+
+        private final long pointer;
+
+        NativeEnvDestructor(long pointer) {
+            this.pointer = pointer;
+        }
+
+        @Override
+        public void destroy() {
+            LibFFIContext.disposeNativeEnvV2(pointer);
+        }
+    }
+
+    private final class NativeEnvSupplier implements Supplier<NativeEnv> {
 
         @Override
         public NativeEnv get() {
-            NativeEnv ret = new NativeEnv(initializeNativeEnv(nativeContext));
-            NativeAllocation.getGlobalQueue().registerNativeAllocation(ret, new FreeDestructor(ret.pointer));
+            long envPtr;
+            Destructor destructor;
+
+            if (NativeLibVersion.get() < 2) {
+                envPtr = initializeNativeEnv(nativeContext);
+                destructor = new FreeDestructor(envPtr);
+            } else {
+                envPtr = initializeNativeEnvV2(nativeContext, language.getNFIState());
+                destructor = new NativeEnvDestructor(envPtr);
+            }
+
+            NativeEnv ret = new NativeEnv(envPtr);
+            NativeAllocation.getGlobalQueue().registerNativeAllocation(ret, destructor);
             return ret;
         }
     }
@@ -135,7 +170,14 @@ class LibFFIContext {
     void initialize() {
         loadNFILib();
         NativeAllocation.ensureGCThreadRunning();
+
         nativeContext = initializeNativeContext();
+        initializeVarargsPromotedType(NativeSimpleType.UINT8, NativeSimpleType.UINT32);
+        initializeVarargsPromotedType(NativeSimpleType.UINT16, NativeSimpleType.UINT32);
+        initializeVarargsPromotedType(NativeSimpleType.SINT8, NativeSimpleType.SINT32);
+        initializeVarargsPromotedType(NativeSimpleType.SINT16, NativeSimpleType.SINT32);
+        initializeVarargsPromotedType(NativeSimpleType.FLOAT, NativeSimpleType.DOUBLE);
+
         nativeEnv.remove();
     }
 
@@ -188,11 +230,11 @@ class LibFFIContext {
 
     @TruffleBoundary
     LibFFILibrary loadLibrary(String name, int flags) {
-        return LibFFILibrary.create(loadLibrary(nativeContext, name, flags));
+        return LibFFILibrary.create(loadLibrary(nativeContext, name, flags), name);
     }
 
     Object lookupSymbol(LibFFILibrary library, String name) {
-        return LibFFISymbol.create(language, library, name, lookup(nativeContext, library.handle, name));
+        return LibFFISymbol.create(library, name, lookup(nativeContext, library.handle, name));
     }
 
     LibFFIType lookupSimpleType(NativeSimpleType type) {
@@ -201,6 +243,10 @@ class LibFFIContext {
 
     LibFFIType lookupArrayType(NativeSimpleType type) {
         return arrayTypeMap[type.ordinal()];
+    }
+
+    LibFFIType lookupVarargsType(NativeSimpleType type) {
+        return varargsTypeMap[type.ordinal()];
     }
 
     @TruffleBoundary
@@ -216,7 +262,7 @@ class LibFFIContext {
         synchronized (language) {
             if (language.simpleTypeMap[idx] == null) {
                 assert language.arrayTypeMap[idx] == null;
-                language.simpleTypeMap[idx] = LibFFIType.createSimpleTypeInfo(language, simpleType, size, alignment);
+                language.simpleTypeMap[idx] = LibFFIType.createSimpleTypeInfo(simpleType, size, alignment);
                 language.arrayTypeMap[idx] = LibFFIType.createArrayTypeInfo(language.simpleTypeMap[pointerIdx], simpleType);
                 if (idx == pointerIdx) {
                     language.cachedEnvType = new EnvType(language.simpleTypeMap[pointerIdx]);
@@ -224,25 +270,60 @@ class LibFFIContext {
             }
         }
         simpleTypeMap[idx] = new LibFFIType(language.simpleTypeMap[idx], ffiType);
-        arrayTypeMap[idx] = new LibFFIType(language.arrayTypeMap[idx], simpleTypeMap[pointerIdx].type);
+        if (language.arrayTypeMap[idx] != null) {
+            arrayTypeMap[idx] = new LibFFIType(language.arrayTypeMap[idx], simpleTypeMap[pointerIdx].type);
+        }
         if (idx == pointerIdx) {
             cachedEnvType = new LibFFIType(language.cachedEnvType, simpleTypeMap[pointerIdx].type);
         }
+    }
+
+    private void initializeVarargsPromotedType(NativeSimpleType simpleType, NativeSimpleType promotedType) {
+        int idx = simpleType.ordinal();
+        LibFFIType promoted = simpleTypeMap[promotedType.ordinal()];
+
+        assert varargsTypeMap[idx] == null : "initializeVarargsType called twice for " + simpleType;
+        synchronized (language) {
+            if (language.varargsTypeMap[idx] == null) {
+                language.varargsTypeMap[idx] = LibFFIType.createVarargsPromotedTypeInfo(simpleType, promoted.typeInfo);
+            }
+        }
+
+        varargsTypeMap[idx] = new LibFFIType(language.varargsTypeMap[idx], promoted.type);
     }
 
     private native long initializeNativeContext();
 
     private static native void disposeNativeContext(long context);
 
+    /**
+     * Native lib versions >= 2. Result must be freed with disposeNativeEnv.
+     */
+    private static native long initializeNativeEnvV2(long context, NFIState state);
+
+    /**
+     * Native lib versions >= 2.
+     */
+    private static native void disposeNativeEnvV2(long env);
+
+    /**
+     * Native lib versions <= 1. Result is freed with free().
+     */
     private static native long initializeNativeEnv(long context);
 
-    private static void loadNFILib() {
+    @SuppressWarnings("restricted")
+    private void loadNFILib() {
         String nfiLib = System.getProperty("truffle.nfi.library");
         if (nfiLib == null) {
-            System.loadLibrary("trufflenfi");
-        } else {
-            System.load(nfiLib);
+            try {
+                TruffleFile libNFIResources = env.getInternalResource(LibNFIResource.class);
+                TruffleFile libNFI = libNFIResources.resolve("bin").resolve(System.mapLibraryName("trufflenfi"));
+                nfiLib = libNFI.getAbsoluteFile().getPath();
+            } catch (IOException ioe) {
+                throw CompilerDirectives.shouldNotReachHere(ioe);
+            }
         }
+        System.load(nfiLib);
     }
 
     ClosureNativePointer allocateClosureObjectRet(LibFFISignature signature, CallTarget callTarget, Object receiver) {
@@ -287,26 +368,29 @@ class LibFFIContext {
 
     private static native long prepareSignatureVarargs(long nativeContext, LibFFIType retType, int argCount, int nFixedArgs, LibFFIType... args);
 
+    // substituted by SVM
     void executeNative(long cif, long functionPointer, byte[] primArgs, int patchCount, int[] patchOffsets, Object[] objArgs, byte[] ret) {
-        executeNative(nativeContext, cif, functionPointer, primArgs, patchCount, patchOffsets, objArgs, ret);
+        executeNative(nativeContext, language.getNFIState(), cif, functionPointer, primArgs, patchCount, patchOffsets, objArgs, ret);
     }
 
+    // substituted by SVM
     long executePrimitive(long cif, long functionPointer, byte[] primArgs, int patchCount, int[] patchOffsets, Object[] objArgs) {
-        return executePrimitive(nativeContext, cif, functionPointer, primArgs, patchCount, patchOffsets, objArgs);
+        return executePrimitive(nativeContext, language.getNFIState(), cif, functionPointer, primArgs, patchCount, patchOffsets, objArgs);
     }
 
+    // substituted by SVM
     Object executeObject(long cif, long functionPointer, byte[] primArgs, int patchCount, int[] patchOffsets, Object[] objArgs) {
-        return executeObject(nativeContext, cif, functionPointer, primArgs, patchCount, patchOffsets, objArgs);
+        return executeObject(nativeContext, language.getNFIState(), cif, functionPointer, primArgs, patchCount, patchOffsets, objArgs);
     }
 
     @TruffleBoundary
-    private static native void executeNative(long nativeContext, long cif, long functionPointer, byte[] primArgs, int patchCount, int[] patchOffsets, Object[] objArgs, byte[] ret);
+    private static native void executeNative(long nativeContext, NFIState state, long cif, long functionPointer, byte[] primArgs, int patchCount, int[] patchOffsets, Object[] objArgs, byte[] ret);
 
     @TruffleBoundary
-    private static native long executePrimitive(long nativeContext, long cif, long functionPointer, byte[] primArgs, int patchCount, int[] patchOffsets, Object[] objArgs);
+    private static native long executePrimitive(long nativeContext, NFIState state, long cif, long functionPointer, byte[] primArgs, int patchCount, int[] patchOffsets, Object[] objArgs);
 
     @TruffleBoundary
-    private static native Object executeObject(long nativeContext, long cif, long functionPointer, byte[] primArgs, int patchCount, int[] patchOffsets, Object[] objArgs);
+    private static native Object executeObject(long nativeContext, NFIState state, long cif, long functionPointer, byte[] primArgs, int patchCount, int[] patchOffsets, Object[] objArgs);
 
     private static native long loadLibrary(long nativeContext, String name, int flags);
 
@@ -314,4 +398,10 @@ class LibFFIContext {
     private static native long lookup(long nativeContext, long library, String name);
 
     static native void freeLibrary(long library);
+
+    private static final ContextReference<LibFFIContext> REFERENCE = ContextReference.create(LibFFILanguage.class);
+
+    static LibFFIContext get(Node node) {
+        return REFERENCE.get(node);
+    }
 }

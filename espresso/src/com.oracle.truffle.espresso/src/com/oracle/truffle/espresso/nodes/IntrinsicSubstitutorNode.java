@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2019, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -25,28 +25,34 @@ package com.oracle.truffle.espresso.nodes;
 
 import java.util.Arrays;
 
-import com.oracle.truffle.api.CompilerDirectives;
 import com.oracle.truffle.api.frame.Frame;
 import com.oracle.truffle.api.frame.VirtualFrame;
+import com.oracle.truffle.api.interop.NodeLibrary;
+import com.oracle.truffle.api.library.ExportLibrary;
+import com.oracle.truffle.api.library.ExportMessage;
 import com.oracle.truffle.api.nodes.Node;
-import com.oracle.truffle.espresso.EspressoLanguage;
+import com.oracle.truffle.espresso.classfile.perf.DebugCounter;
 import com.oracle.truffle.espresso.impl.Method;
-import com.oracle.truffle.espresso.substitutions.Substitutor;
-import com.oracle.truffle.espresso.perf.DebugCounter;
+import com.oracle.truffle.espresso.meta.EspressoError;
+import com.oracle.truffle.espresso.runtime.EspressoThreadLocalState;
+import com.oracle.truffle.espresso.substitutions.JavaSubstitution;
+import com.oracle.truffle.espresso.vm.VM;
 
-public final class IntrinsicSubstitutorNode extends EspressoMethodNode {
-    @Child private Substitutor substitution;
-
-    @CompilerDirectives.CompilationFinal //
-    int callState = 0;
+@ExportLibrary(NodeLibrary.class)
+public final class IntrinsicSubstitutorNode extends EspressoInstrumentableRootNodeImpl {
+    @Child private JavaSubstitution substitution;
 
     // Truffle does not want to report split on first call. Delay until the second.
     private final DebugCounter nbSplits;
 
-    public IntrinsicSubstitutorNode(Substitutor.Factory factory, Method method) {
-        super(method.getMethodVersion());
-        this.substitution = factory.create(EspressoLanguage.getCurrentContext().getMeta());
-        if (substitution.shouldSplit()) {
+    IntrinsicSubstitutorNode(Method.MethodVersion methodVersion, JavaSubstitution.Factory factory) {
+        super(methodVersion);
+        this.substitution = factory.create();
+
+        EspressoError.guarantee(!substitution.isTrivial() || !methodVersion.isSynchronized(),
+                        "Substitution for synchronized method cannot be marked as trivial", methodVersion);
+
+        if (substitution.canSplit()) {
             this.nbSplits = DebugCounter.create("Splits for: " + Arrays.toString(factory.getMethodNames()));
         } else {
             this.nbSplits = null;
@@ -55,33 +61,25 @@ public final class IntrinsicSubstitutorNode extends EspressoMethodNode {
 
     private IntrinsicSubstitutorNode(IntrinsicSubstitutorNode toSplit) {
         super(toSplit.getMethodVersion());
-        assert toSplit.substitution.shouldSplit();
+        assert toSplit.substitution.canSplit();
         this.substitution = toSplit.substitution.split();
         this.nbSplits = toSplit.nbSplits;
-        this.callState = 3;
     }
 
     @Override
-    void initializeBody(VirtualFrame frame) {
-        // nop
-    }
-
-    @Override
-    public Object executeBody(VirtualFrame frame) {
-        if (CompilerDirectives.inInterpreter() && callState <= 1) {
-            callState++;
+    Object execute(VirtualFrame frame) {
+        EspressoThreadLocalState tls = getContext().getLanguage().getThreadLocalState();
+        tls.blockContinuationSuspension();
+        try {
+            return substitution.invoke(frame.getArguments());
+        } finally {
+            tls.unblockContinuationSuspension();
         }
-        if (CompilerDirectives.inInterpreter() && callState == 2 && !substitution.uninitialized()) {
-            // Hints to the truffle runtime that it should split this node on every new call site
-            reportPolymorphicSpecialize();
-            callState = 3;
-        }
-        return substitution.invoke(frame.getArguments());
     }
 
     @Override
-    public boolean shouldSplit() {
-        return substitution.shouldSplit();
+    public boolean canSplit() {
+        return substitution.canSplit();
     }
 
     @Override
@@ -96,7 +94,28 @@ public final class IntrinsicSubstitutorNode extends EspressoMethodNode {
     }
 
     @Override
-    public int getCurrentBCI(@SuppressWarnings("unused") Frame frame) {
-        return -1;
+    boolean isTrivial() {
+        return substitution.isTrivial();
+    }
+
+    @Override
+    public int getBci(Frame frame) {
+        if (getMethodVersion().isMethodNative()) {
+            return VM.EspressoStackElement.NATIVE_BCI;
+        } else {
+            return 0;
+        }
+    }
+
+    @ExportMessage
+    @SuppressWarnings("static-method")
+    public boolean hasScope(@SuppressWarnings("unused") Frame frame) {
+        return true;
+    }
+
+    @ExportMessage
+    @SuppressWarnings("static-method")
+    public Object getScope(Frame frame, @SuppressWarnings("unused") boolean nodeEnter) {
+        return new SubstitutionScope(frame.getArguments(), getMethodVersion());
     }
 }

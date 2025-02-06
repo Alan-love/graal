@@ -24,24 +24,24 @@
  */
 package com.oracle.svm.core.graal.nodes;
 
-import static org.graalvm.compiler.nodeinfo.InputType.State;
-import static org.graalvm.compiler.nodeinfo.NodeCycles.CYCLES_8;
-import static org.graalvm.compiler.nodeinfo.NodeSize.SIZE_8;
+import static jdk.graal.compiler.nodeinfo.InputType.State;
+import static jdk.graal.compiler.nodeinfo.NodeCycles.CYCLES_2;
+import static jdk.graal.compiler.nodeinfo.NodeSize.SIZE_2;
 
 import java.util.List;
 
-import org.graalvm.compiler.core.common.type.StampFactory;
-import org.graalvm.compiler.graph.NodeClass;
-import org.graalvm.compiler.graph.NodeInputList;
-import org.graalvm.compiler.nodeinfo.NodeInfo;
-import org.graalvm.compiler.nodes.ControlSinkNode;
-import org.graalvm.compiler.nodes.FrameState;
-import org.graalvm.compiler.nodes.UnwindNode;
-import org.graalvm.compiler.nodes.ValueNode;
-import org.graalvm.compiler.nodes.extended.BytecodeExceptionNode;
-import org.graalvm.compiler.nodes.extended.BytecodeExceptionNode.BytecodeExceptionKind;
-import org.graalvm.compiler.nodes.spi.Lowerable;
-import org.graalvm.compiler.nodes.spi.NodeWithState;
+import jdk.graal.compiler.core.common.type.StampFactory;
+import jdk.graal.compiler.graph.NodeClass;
+import jdk.graal.compiler.graph.NodeInputList;
+import jdk.graal.compiler.nodeinfo.NodeInfo;
+import jdk.graal.compiler.nodes.ControlSinkNode;
+import jdk.graal.compiler.nodes.FrameState;
+import jdk.graal.compiler.nodes.UnwindNode;
+import jdk.graal.compiler.nodes.ValueNode;
+import jdk.graal.compiler.nodes.extended.BytecodeExceptionNode;
+import jdk.graal.compiler.nodes.extended.BytecodeExceptionNode.BytecodeExceptionKind;
+import jdk.graal.compiler.nodes.spi.Lowerable;
+import jdk.graal.compiler.nodes.spi.NodeWithState;
 
 /**
  * Throw an implicit exception. In contrast to {@link BytecodeExceptionNode}, this node does not
@@ -49,7 +49,7 @@ import org.graalvm.compiler.nodes.spi.NodeWithState;
  * It is used to simplify the graph structure when the result of a {@link BytecodeExceptionNode}
  * would directly feed into a {@link UnwindNode} anyway.
  */
-@NodeInfo(cycles = CYCLES_8, cyclesRationale = "Node will be lowered to a foreign call.", size = SIZE_8)
+@NodeInfo(cycles = CYCLES_2, cyclesRationale = "Node will be lowered to a foreign call.", size = SIZE_2)
 public final class ThrowBytecodeExceptionNode extends ControlSinkNode implements NodeWithState, Lowerable {
     public static final NodeClass<ThrowBytecodeExceptionNode> TYPE = NodeClass.create(ThrowBytecodeExceptionNode.class);
 

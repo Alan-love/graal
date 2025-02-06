@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -45,6 +45,7 @@ import java.util.stream.Collectors;
 
 import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
 import com.oracle.truffle.regex.tregex.buffer.CompilationBuffer;
+import com.oracle.truffle.regex.tregex.buffer.ObjectArrayBuffer;
 import com.oracle.truffle.regex.tregex.parser.ast.visitors.RegexASTVisitorIterable;
 import com.oracle.truffle.regex.tregex.util.json.Json;
 import com.oracle.truffle.regex.tregex.util.json.JsonValue;
@@ -147,6 +148,22 @@ public final class Sequence extends RegexASTNode implements RegexASTVisitorItera
         terms.set(index, term);
     }
 
+    public void removeTerm(int i, CompilationBuffer compilationBuffer) {
+        ObjectArrayBuffer<Term> buf = compilationBuffer.getObjectBuffer1();
+        // stash successors of term to buffer
+        int size = size();
+        for (int j = i + 1; j < size; j++) {
+            buf.add(getLastTerm());
+            removeLastTerm();
+        }
+        // drop term
+        removeLastTerm();
+        // restore the stashed successors
+        for (int j = buf.length() - 1; j >= 0; j--) {
+            add(buf.get(j));
+        }
+    }
+
     /**
      * Removes the last {@link Term} from this {@link Sequence}.
      */
@@ -183,13 +200,23 @@ public final class Sequence extends RegexASTNode implements RegexASTVisitorItera
         return size() == 1 && isLiteral();
     }
 
+    public QuantifiableTerm quantifierPassThroughGetQuantifiedTerm() {
+        assert isQuantifierPassThroughSequence();
+        assert getParent().isGroup();
+        assert getParent().size() == 2;
+        Sequence otherSeq = isFirstInGroup() ? getParent().getLastAlternative() : getParent().getFirstAlternative();
+        Term quantifiedTerm = isInLookBehindAssertion() ? otherSeq.getLastTerm() : otherSeq.getFirstTerm();
+        assert otherSeq.size() <= 2 || quantifiedTerm.isExpandedQuantifier();
+        return quantifiedTerm.asQuantifiableTerm();
+    }
+
     public int getEnclosedCaptureGroupsLow() {
         int lo = Integer.MAX_VALUE;
         for (Term t : terms) {
             if (t instanceof Group) {
                 Group g = (Group) t;
-                if (g.getEnclosedCaptureGroupsLow() != g.getEnclosedCaptureGroupsHigh()) {
-                    lo = Math.min(lo, g.getEnclosedCaptureGroupsLow());
+                if (g.getEnclosedCaptureGroupsLo() != g.getEnclosedCaptureGroupsHi()) {
+                    lo = Math.min(lo, g.getEnclosedCaptureGroupsLo());
                 }
                 if (g.isCapturing()) {
                     lo = Math.min(lo, g.getGroupNumber());
@@ -204,8 +231,8 @@ public final class Sequence extends RegexASTNode implements RegexASTVisitorItera
         for (Term t : terms) {
             if (t instanceof Group) {
                 Group g = (Group) t;
-                if (g.getEnclosedCaptureGroupsLow() != g.getEnclosedCaptureGroupsHigh()) {
-                    hi = Math.max(hi, g.getEnclosedCaptureGroupsHigh());
+                if (g.getEnclosedCaptureGroupsLo() != g.getEnclosedCaptureGroupsHi()) {
+                    hi = Math.max(hi, g.getEnclosedCaptureGroupsHi());
                 }
                 if (g.isCapturing()) {
                     hi = Math.max(hi, g.getGroupNumber() + 1);

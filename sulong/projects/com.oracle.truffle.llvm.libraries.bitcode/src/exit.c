@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017, 2020, Oracle and/or its affiliates.
+ * Copyright (c) 2017, 2023, Oracle and/or its affiliates.
  *
  * All rights reserved.
  *
@@ -27,9 +27,16 @@
  * NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED
  * OF THE POSSIBILITY OF SUCH DAMAGE.
  */
+
+#if defined(_WIN32)
+#include <io.h>
+#elif defined(__unix__) || defined(__APPLE__)
 #include <unistd.h>
+#endif
+
 #include <stdint.h>
 #include <stdlib.h>
+#include <graalvm/llvm/intrinsics.h>
 #include "exit.h"
 
 struct entry {
@@ -62,9 +69,6 @@ void __clear_exit_handlers() {
     head.next = NULL;
 }
 
-// for now, treat everything running under Sulong as a single dynamic shared object
-void *__dso_handle = NULL;
-
 int __cxa_atexit(void (*func)(void *), void *arg, void *dso) {
     struct entry *entry = entry = (struct entry *) malloc(sizeof(struct entry));
     entry->func = func;
@@ -79,13 +83,17 @@ static void caller(void *arg) {
     func();
 }
 
-int atexit(void (*func)(void)) {
+int __sulong_atexit(void (*func)(void)) {
     return __cxa_atexit(caller, func, NULL);
 }
 
-void __sulong_destructor_functions();
+#if !defined(_WIN32)
+int atexit(void (*func)(void)) {
+    return __sulong_atexit(func);
+}
+#endif
 
-void exit(int status) {
+void __sulong_exit(int status) {
     __sulong_funcs_on_exit();
     __sulong_destructor_functions();
     _EXIT(status);
@@ -93,6 +101,12 @@ void exit(int status) {
         _EXIT(status);
     }
 }
+
+#if !defined(_WIN32)
+void exit(int status) {
+    __sulong_exit(status);
+}
+#endif
 
 void _exit(int status) {
     _EXIT(status);

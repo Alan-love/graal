@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2021, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -45,7 +45,6 @@ import java.util.Map;
 
 import com.oracle.truffle.api.CallTarget;
 import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
-import com.oracle.truffle.api.Truffle;
 import com.oracle.truffle.api.TruffleLanguage;
 import com.oracle.truffle.api.frame.Frame;
 import com.oracle.truffle.api.frame.VirtualFrame;
@@ -81,12 +80,7 @@ public final class TestReceiverLanguage extends ProxyLanguage {
     @Override
     protected CallTarget parse(ParsingRequest request) throws Exception {
         Source source = request.getSource();
-        return Truffle.getRuntime().createCallTarget(new TestReceiverRootNode(languageInstance, source));
-    }
-
-    @Override
-    protected Object findMetaObject(LanguageContext context, Object value) {
-        return "String";
+        return new TestReceiverRootNode(languageInstance, source).getCallTarget();
     }
 
     private static class TestReceiverRootNode extends RootNode {
@@ -146,8 +140,12 @@ public final class TestReceiverLanguage extends ProxyLanguage {
         }
 
         @ExportMessage
-        @TruffleBoundary
         final Object getScope(@SuppressWarnings("unused") Frame frame, @SuppressWarnings("unused") boolean nodeEnter) {
+            return getScopeSlowPath();
+        }
+
+        @TruffleBoundary
+        private Object getScopeSlowPath() {
             String members = sourceSection.getCharacters().toString();
             int end = members.indexOf('\n');
             return new TestReceiverScope(members.substring(end + 1).trim(), 0);
@@ -159,8 +157,12 @@ public final class TestReceiverLanguage extends ProxyLanguage {
         }
 
         @ExportMessage
-        @TruffleBoundary
         final Object getReceiverMember(@SuppressWarnings("unused") Frame frame) {
+            return getReceiverMemberSlowPath();
+        }
+
+        @TruffleBoundary
+        private Object getReceiverMemberSlowPath() {
             String receivers = sourceSection.getCharacters().toString();
             int end = receivers.indexOf('\n');
             return receivers.substring(0, end);

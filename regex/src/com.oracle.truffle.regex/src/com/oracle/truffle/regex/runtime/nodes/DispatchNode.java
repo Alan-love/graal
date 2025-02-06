@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2022, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -42,28 +42,33 @@ package com.oracle.truffle.regex.runtime.nodes;
 
 import com.oracle.truffle.api.CallTarget;
 import com.oracle.truffle.api.dsl.Cached;
+import com.oracle.truffle.api.dsl.GenerateCached;
+import com.oracle.truffle.api.dsl.GenerateInline;
 import com.oracle.truffle.api.dsl.GenerateUncached;
 import com.oracle.truffle.api.dsl.Specialization;
 import com.oracle.truffle.api.nodes.DirectCallNode;
 import com.oracle.truffle.api.nodes.IndirectCallNode;
 import com.oracle.truffle.api.nodes.Node;
+import com.oracle.truffle.regex.result.RegexResult;
 
+@GenerateInline
+@GenerateCached(false)
 @GenerateUncached
 public abstract class DispatchNode extends Node {
 
-    public abstract Object execute(CallTarget receiver, Object[] args);
+    public abstract Object execute(Node node, CallTarget receiver, RegexResult result);
 
     @SuppressWarnings("unused")
-    @Specialization(guards = {"target == cachedTarget"})
-    static Object executeDirect(CallTarget target, Object[] args,
+    @Specialization(guards = {"target == cachedTarget"}, limit = "4")
+    static Object doDirect(CallTarget target, RegexResult result,
                     @Cached("target") CallTarget cachedTarget,
                     @Cached("create(cachedTarget)") DirectCallNode callNode) {
-        return callNode.call(args);
+        return callNode.call(result);
     }
 
-    @Specialization(replaces = "executeDirect")
-    static Object executeIndirect(CallTarget target, Object[] args,
-                    @Cached IndirectCallNode callNode) {
-        return callNode.call(target, args);
+    @Specialization(replaces = "doDirect")
+    static Object doIndirect(CallTarget target, RegexResult result,
+                    @Cached(inline = false) IndirectCallNode callNode) {
+        return callNode.call(target, result);
     }
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2020, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -25,6 +25,7 @@
 package com.oracle.truffle.tools.dap.server;
 
 import com.oracle.truffle.api.CompilerDirectives;
+import com.oracle.truffle.api.InstrumentInfo;
 import com.oracle.truffle.api.TruffleContext;
 import com.oracle.truffle.api.debug.DebugException;
 import com.oracle.truffle.api.debug.DebugValue;
@@ -38,9 +39,12 @@ import com.oracle.truffle.api.debug.SuspendedEvent;
 import com.oracle.truffle.api.debug.SuspensionFilter;
 import com.oracle.truffle.api.instrumentation.ContextsListener;
 import com.oracle.truffle.api.instrumentation.EventBinding;
+import com.oracle.truffle.api.instrumentation.TruffleInstrument;
 import com.oracle.truffle.api.nodes.LanguageInfo;
 import com.oracle.truffle.api.source.Source;
 import com.oracle.truffle.api.source.SourceSection;
+import com.oracle.truffle.tools.dap.instrument.Enabler;
+import com.oracle.truffle.tools.dap.instrument.OutputConsumerInstrument;
 import com.oracle.truffle.tools.dap.types.AttachRequestArguments;
 import com.oracle.truffle.tools.dap.types.BreakpointLocationsArguments;
 import com.oracle.truffle.tools.dap.types.BreakpointLocationsResponse;
@@ -80,27 +84,33 @@ import com.oracle.truffle.tools.dap.types.StackTraceArguments;
 import com.oracle.truffle.tools.dap.types.StackTraceResponse;
 import com.oracle.truffle.tools.dap.types.StepInArguments;
 import com.oracle.truffle.tools.dap.types.StepOutArguments;
+import com.oracle.truffle.tools.dap.types.TerminatedEvent;
 import com.oracle.truffle.tools.dap.types.ThreadsResponse;
 import com.oracle.truffle.tools.dap.types.Variable;
 import com.oracle.truffle.tools.dap.types.VariablesArguments;
 import com.oracle.truffle.tools.dap.types.VariablesResponse;
-import com.oracle.truffle.tools.utils.json.JSONArray;
-import com.oracle.truffle.tools.utils.json.JSONObject;
+import org.graalvm.shadowed.org.json.JSONArray;
+import org.graalvm.shadowed.org.json.JSONObject;
 
 import java.io.IOException;
+import java.lang.ref.Reference;
+import java.lang.ref.WeakReference;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.net.SocketException;
+import java.net.URI;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutionException;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.util.concurrent.Executor;
 import java.util.concurrent.Future;
-import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.Phaser;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Consumer;
 import java.util.logging.Level;
 
 /**
@@ -113,13 +123,20 @@ public final class DebugProtocolServerImpl extends DebugProtocolServer {
 
     private final ExecutionContext context;
     private volatile DebugProtocolClient client;
-    private volatile ExecutorService clientConnectionExecutor;
     private volatile DebuggerSession debuggerSession;
+    private final Enabler ioEnabler;
+    private volatile boolean launched;  // true when launched, false when attached
+    private volatile boolean disposed = false;
+    private final List<Runnable> runOnDispose = new CopyOnWriteArrayList<>();
+    private final List<URI> sourcePath;
+    private volatile OneTimeExecutor clientConnectionExecutor;
 
-    private DebugProtocolServerImpl(ExecutionContext context, final boolean debugBreak, final boolean waitAttached, @SuppressWarnings("unused") final boolean inspectInitialization) {
+    private DebugProtocolServerImpl(ExecutionContext context, final boolean debugBreak, final boolean waitAttached, @SuppressWarnings("unused") final boolean inspectInitialization,
+                    final List<URI> sourcePath) {
         this.context = context;
+        this.sourcePath = sourcePath;
         if (debugBreak) {
-            startDebuggerSession();
+            debuggerSession = startDebuggerSession();
             context.initSession(debuggerSession);
             debuggerSession.suspendNextExecution();
         }
@@ -175,10 +192,18 @@ public final class DebugProtocolServerImpl extends DebugProtocolServer {
                 execEnter.get().dispose();
             }
         }
+        InstrumentInfo instrumentInfo = context.getEnv().getInstruments().get(OutputConsumerInstrument.ID);
+        ioEnabler = context.getEnv().lookup(instrumentInfo, Enabler.class);
+        ioEnabler.enable();
+        OutputHandler oh = context.getEnv().lookup(instrumentInfo, OutputHandler.Provider.class).getOutputHandler();
+        ConsoleOutputListener outL = new ConsoleOutputListener("stdout");
+        ConsoleOutputListener errL = new ConsoleOutputListener("stderr");
+        oh.setOutListener(outL);
+        oh.setErrListener(errL);
     }
 
-    public static DebugProtocolServerImpl create(ExecutionContext context, final boolean debugBreak, final boolean waitAttached, final boolean inspectInitialization) {
-        return new DebugProtocolServerImpl(context, debugBreak, waitAttached, inspectInitialization);
+    public static DebugProtocolServerImpl create(ExecutionContext context, final boolean debugBreak, final boolean waitAttached, final boolean inspectInitialization, final List<URI> sourcePath) {
+        return new DebugProtocolServerImpl(context, debugBreak, waitAttached, inspectInitialization, sourcePath);
     }
 
     @Override
@@ -224,6 +249,7 @@ public final class DebugProtocolServerImpl extends DebugProtocolServer {
                 client.output(OutputEvent.EventBody.create(sb.toString()));
             }
             client.output(OutputEvent.EventBody.create("Debugger attached.").setCategory("stderr"));
+            launched = true;
         });
     }
 
@@ -235,8 +261,47 @@ public final class DebugProtocolServerImpl extends DebugProtocolServer {
     }
 
     @Override
-    public CompletableFuture<Void> disconnect(DisconnectArguments args) {
-        return CompletableFuture.completedFuture(null);
+    public CompletableFuture<Void> disconnect(DisconnectArguments args, Consumer<? super Void> responseConsumer) {
+        return CompletableFuture.runAsync(() -> {
+            DebuggerSession session;
+            synchronized (DebugProtocolServerImpl.this) {
+                disposed = true;
+                session = debuggerSession;
+                debuggerSession = null;
+            }
+            ioEnabler.disable();
+            if (session != null) {
+                session.close();
+            }
+            context.dispose();
+            responseConsumer.accept(null);
+            if (launched) {
+                // Cancel all contexts to terminate the execution
+                AllContextsCancel cancel = new AllContextsCancel();
+                EventBinding<ContextsListener> binding = context.getEnv().getInstrumenter().attachContextsListener(cancel, true);
+                cancel.waitForAllCanceled();
+                binding.dispose();
+            }
+        });
+    }
+
+    public void dispose() {
+        if (disposed) {
+            return;
+        }
+        disposed = true;
+        DebugProtocolClient theClient = client;
+        if (theClient != null) {
+            theClient.terminated(TerminatedEvent.EventBody.create());
+        }
+        for (Runnable r : runOnDispose) {
+            r.run();
+        }
+        clientConnectionExecutor.shutDownAndJoin();
+    }
+
+    private void onDispose(Runnable r) {
+        runOnDispose.add(r);
     }
 
     @Override
@@ -246,7 +311,11 @@ public final class DebugProtocolServerImpl extends DebugProtocolServer {
 
     @Override
     public CompletableFuture<SetBreakpointsResponse.ResponseBody> setBreakpoints(SetBreakpointsArguments args) {
-        return CompletableFuture.completedFuture(SetBreakpointsResponse.ResponseBody.create(context.getBreakpointsHandler().setBreakpoints(args)));
+        try {
+            return CompletableFuture.completedFuture(SetBreakpointsResponse.ResponseBody.create(context.getBreakpointsHandler().setBreakpoints(args)));
+        } catch (ExceptionWithMessage ex) {
+            return CompletableFuture.failedFuture(ex);
+        }
     }
 
     @Override
@@ -267,21 +336,24 @@ public final class DebugProtocolServerImpl extends DebugProtocolServer {
     }
 
     @Override
-    public CompletableFuture<ContinueResponse.ResponseBody> doContinue(ContinueArguments args) {
+    public CompletableFuture<ContinueResponse.ResponseBody> doContinue(ContinueArguments args, Consumer<? super ContinueResponse.ResponseBody> responseConsumer) {
         CompletableFuture<ContinueResponse.ResponseBody> future = new CompletableFuture<>();
         context.getThreadsHandler().executeInSuspendedThread(args.getThreadId(), (info) -> {
             if (info == null) {
                 future.completeExceptionally(Errors.invalidThread(args.getThreadId()));
                 return false;
             }
-            future.complete(ContinueResponse.ResponseBody.create().setAllThreadsContinued(false));
+            info.getSuspendedEvent().prepareContinue();
+            ContinueResponse.ResponseBody response = ContinueResponse.ResponseBody.create().setAllThreadsContinued(false);
+            responseConsumer.accept(response);
+            future.complete(response);
             return true;
         });
         return future;
     }
 
     @Override
-    public CompletableFuture<Void> next(NextArguments args) {
+    public CompletableFuture<Void> next(NextArguments args, Consumer<? super Void> responseConsumer) {
         CompletableFuture<Void> future = new CompletableFuture<>();
         context.getThreadsHandler().executeInSuspendedThread(args.getThreadId(), (info) -> {
             if (info == null) {
@@ -289,6 +361,7 @@ public final class DebugProtocolServerImpl extends DebugProtocolServer {
                 return false;
             }
             info.getSuspendedEvent().prepareStepOver(STEP_CONFIG);
+            responseConsumer.accept(null);
             future.complete(null);
             return true;
         });
@@ -296,7 +369,7 @@ public final class DebugProtocolServerImpl extends DebugProtocolServer {
     }
 
     @Override
-    public CompletableFuture<Void> stepIn(StepInArguments args) {
+    public CompletableFuture<Void> stepIn(StepInArguments args, Consumer<? super Void> responseConsumer) {
         CompletableFuture<Void> future = new CompletableFuture<>();
         context.getThreadsHandler().executeInSuspendedThread(args.getThreadId(), (info) -> {
             if (info == null) {
@@ -304,6 +377,7 @@ public final class DebugProtocolServerImpl extends DebugProtocolServer {
                 return false;
             }
             info.getSuspendedEvent().prepareStepInto(STEP_CONFIG);
+            responseConsumer.accept(null);
             future.complete(null);
             return true;
         });
@@ -311,7 +385,7 @@ public final class DebugProtocolServerImpl extends DebugProtocolServer {
     }
 
     @Override
-    public CompletableFuture<Void> stepOut(StepOutArguments args) {
+    public CompletableFuture<Void> stepOut(StepOutArguments args, Consumer<? super Void> responseConsumer) {
         CompletableFuture<Void> future = new CompletableFuture<>();
         context.getThreadsHandler().executeInSuspendedThread(args.getThreadId(), (info) -> {
             if (info == null) {
@@ -319,6 +393,7 @@ public final class DebugProtocolServerImpl extends DebugProtocolServer {
                 return false;
             }
             info.getSuspendedEvent().prepareStepOut(STEP_CONFIG);
+            responseConsumer.accept(null);
             future.complete(null);
             return true;
         });
@@ -487,8 +562,19 @@ public final class DebugProtocolServerImpl extends DebugProtocolServer {
     protected void connect(DebugProtocolClient clnt) {
         this.client = clnt;
         if (debuggerSession == null) {
-            startDebuggerSession();
-            context.initSession(debuggerSession);
+            DebuggerSession session = startDebuggerSession();
+            boolean isDisposed;
+            synchronized (this) {
+                isDisposed = disposed;
+                if (!isDisposed) {
+                    debuggerSession = session;
+                }
+            }
+            if (isDisposed) {
+                session.close();
+            } else {
+                context.initSession(session);
+            }
         }
         context.initClient(client);
     }
@@ -513,65 +599,114 @@ public final class DebugProtocolServerImpl extends DebugProtocolServer {
         };
     }
 
-    public CompletableFuture<?> start(final ServerSocket serverSocket, final Runnable onConnectCallback) {
-        clientConnectionExecutor = Executors.newSingleThreadExecutor(new ThreadFactory() {
+    /**
+     * The executors created by Executors do not allow to join the threads in the pool. System
+     * threads must be joined before Engine close and ExecutorService.awaitTermination() does not
+     * guarantee threads termination.
+     */
+    private static class OneTimeExecutor implements Executor {
 
-            @Override
-            public Thread newThread(Runnable r) {
-                Thread thread = Executors.defaultThreadFactory().newThread(r);
-                thread.setName("DAP client connection thread");
-                return thread;
+        private final TruffleInstrument.Env env;
+        private final String threadName;
+        private Reference<Thread> thread;
+        private boolean shutDown;
+
+        OneTimeExecutor(TruffleInstrument.Env env, String threadName) {
+            this.env = env;
+            this.threadName = threadName;
+        }
+
+        public synchronized void execute(Runnable command) {
+            if (shutDown) {
+                return;
             }
-        });
+            if (thread != null) {
+                throw new IllegalStateException("This is a one-time executor.");
+            }
+            Thread t = env.createSystemThread(command);
+            t.setName(threadName);
+            t.start();
+            thread = new WeakReference<>(t);
+        }
+
+        synchronized void shutDownAndJoin() {
+            Thread t = (thread != null) ? thread.get() : null;
+            if (t != null) {
+                t.interrupt();
+                try {
+                    t.join();
+                } catch (InterruptedException ex) {
+                    // Interrupted
+                }
+            }
+            shutDown = true;
+        }
+    }
+
+    public CompletableFuture<?> start(final ServerSocket serverSocket) {
+        clientConnectionExecutor = new OneTimeExecutor(context.getEnv(), "DAP client connection thread");
+        context.getInfo().println("[Graal DAP] Starting server and listening on " + serverSocket.getLocalSocketAddress());
         return CompletableFuture.runAsync(new Runnable() {
 
             @Override
             public void run() {
+                AtomicBoolean terminated = new AtomicBoolean(false);
                 try {
                     if (serverSocket.isClosed()) {
                         context.getErr().println("[Graal DAP] Server socket is closed.");
                         return;
                     }
 
-                    context.getInfo().println("[Graal DAP] Starting server and listening on " + serverSocket.getLocalSocketAddress());
+                    onDispose(() -> {
+                        terminated.set(true);
+                        try {
+                            serverSocket.close();
+                        } catch (IOException e) {
+                            context.getErr().println("[Graal DAP] Error while closing the server socket: " + e.getLocalizedMessage());
+                        }
+                    });
+                    if (disposed) {
+                        // Disposed in the mean time.
+                        return;
+                    }
                     try (Socket clientSocket = serverSocket.accept()) {
-                        onConnectCallback.run();
                         context.getInfo().println("[Graal DAP] Client connected on " + clientSocket.getRemoteSocketAddress());
 
-                        ExecutorService dapRequestExecutor = Executors.newCachedThreadPool(new ThreadFactory() {
-                            private final ThreadFactory factory = Executors.defaultThreadFactory();
-
-                            @Override
-                            public Thread newThread(Runnable r) {
-                                Thread thread = factory.newThread(r);
-                                thread.setName("DAP request handler " + thread.getName());
-                                return thread;
-                            }
-                        });
-
+                        OneTimeExecutor dapRequestExecutor = new OneTimeExecutor(context.getEnv(), "DAP request handler");
                         Future<?> listenFuture = Session.connect(DebugProtocolServerImpl.this, clientSocket.getInputStream(), clientSocket.getOutputStream(), dapRequestExecutor);
                         try {
                             listenFuture.get();
                         } catch (InterruptedException | ExecutionException e) {
                             context.getErr().println("[Graal DAP] Error: " + e.getLocalizedMessage());
                         } finally {
-                            dapRequestExecutor.shutdown();
+                            dapRequestExecutor.shutDownAndJoin();
                         }
                     }
                 } catch (IOException e) {
-                    context.getErr().println("[Graal DAP] Error while connecting to client: " + e.getLocalizedMessage());
+                    if (terminated.get() && (e instanceof SocketException)) {
+                        // We've terminated the socket, thus we ignore any exceptions from it.
+                        // serverSocket.accept() will always throw "Socket closed" exception
+                        // when serverSocket.close() is called.
+                    } else {
+                        context.getErr().println("[Graal DAP] Error while connecting to client: " + e.getLocalizedMessage());
+                    }
                 }
             }
         }, clientConnectionExecutor);
     }
 
-    private void startDebuggerSession() {
+    private DebuggerSession startDebuggerSession() {
         Debugger tdbg = context.getEnv().lookup(context.getEnv().getInstruments().get("debugger"), Debugger.class);
-        debuggerSession = tdbg.startSession(new SuspendedCallbackImpl(), SourceElement.ROOT, SourceElement.STATEMENT);
-        debuggerSession.setSteppingFilter(SuspensionFilter.newBuilder().ignoreLanguageContextInitialization(!context.isInspectInitialization()).includeInternal(context.isInspectInternal()).build());
+        DebuggerSession session = tdbg.startSession(new SuspendedCallbackImpl(), SourceElement.ROOT, SourceElement.STATEMENT);
+        session.setSourcePath(sourcePath);
+        session.setSteppingFilter(SuspensionFilter.newBuilder() //
+                        .ignoreLanguageContextInitialization(!context.isInspectInitialization()) //
+                        .includeInternal(context.isInspectInternal()) //
+                        .sourceSectionAvailableOnly(true).build());
+        return session;
     }
 
-    private class SuspendedCallbackImpl implements SuspendedCallback {
+    private final class SuspendedCallbackImpl implements SuspendedCallback {
 
         @Override
         public void onSuspend(SuspendedEvent event) {
@@ -584,14 +719,76 @@ public final class DebugProtocolServerImpl extends DebugProtocolServer {
                 // Debugger has been disabled while waiting
                 return;
             }
-            if (event.hasSourceElement(SourceElement.ROOT) && !event.hasSourceElement(SourceElement.STATEMENT) && event.getSuspendAnchor() == SuspendAnchor.BEFORE &&
-                            event.getBreakpoints().isEmpty()) {
-                // Suspend requested and we're at the begining of a ROOT.
-                debuggerSession.suspendNextExecution();
-                return;
+            DebugValue returnValue = event.getReturnValue();
+            if (event.hasSourceElement(SourceElement.ROOT) && event.getBreakpoints().isEmpty()) {
+                if ((!event.hasSourceElement(SourceElement.STATEMENT) && event.getSuspendAnchor() == SuspendAnchor.BEFORE) ||
+                                (event.getSuspendAnchor() == SuspendAnchor.AFTER && returnValue == null)) {
+                    // We're at the begining of a `RootTag` node, or
+                    // we're at the end of `RootTag` node and have no return value.
+                    // We use `RootTag` to intercept return values of functions during stepping.
+                    // But if there's no return value, there's no point in suspending at the end of
+                    // a function. That would cause an unnecessary distraction.
+                    event.prepareStepInto(STEP_CONFIG);
+                    return;
+                }
             }
             context.getLoadedSourcesHandler().assureLoaded(ss.getSource());
             context.getThreadsHandler().threadSuspended(Thread.currentThread(), event);
+        }
+    }
+
+    private class ConsoleOutputListener implements OutputHandler.Listener {
+
+        private final String category;
+
+        ConsoleOutputListener(String category) {
+            this.category = category;
+        }
+
+        @Override
+        public void outputText(String text) {
+            DebugProtocolClient debugClient = context.getClient();
+            if (client != null) {
+                OutputEvent.EventBody event = OutputEvent.EventBody.create(text);
+                event.setCategory(category);
+                debugClient.output(event);
+            }
+        }
+    }
+
+    private static final class AllContextsCancel implements ContextsListener {
+
+        private final Phaser allClosed = new Phaser(1);
+
+        @Override
+        public void onContextCreated(TruffleContext context) {
+            allClosed.register();
+            context.closeCancelled(null, "Cancel on debugger disconnect.");
+        }
+
+        @Override
+        public void onLanguageContextCreated(TruffleContext context, LanguageInfo language) {
+        }
+
+        @Override
+        public void onLanguageContextInitialized(TruffleContext context, LanguageInfo language) {
+        }
+
+        @Override
+        public void onLanguageContextFinalized(TruffleContext context, LanguageInfo language) {
+        }
+
+        @Override
+        public void onLanguageContextDisposed(TruffleContext context, LanguageInfo language) {
+        }
+
+        @Override
+        public void onContextClosed(TruffleContext context) {
+            allClosed.arriveAndDeregister();
+        }
+
+        void waitForAllCanceled() {
+            allClosed.arriveAndAwaitAdvance();
         }
     }
 }

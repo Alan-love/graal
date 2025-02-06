@@ -40,10 +40,12 @@ final class Target_java_util_concurrent_ThreadLocalRandom {
      */
     @Alias @InjectAccessors(ThreadLocalRandomAccessors.class)//
     private static AtomicLong seeder;
+}
 
+@TargetClass(className = "jdk.internal.util.random.RandomSupport")
+final class Target_jdk_internal_util_random_RandomSupport {
     @Alias
-    static native long mix64(long z);
-
+    static native long mixMurmur64(long z);
 }
 
 public class ThreadLocalRandomAccessors extends RandomAccessors {
@@ -62,6 +64,6 @@ public class ThreadLocalRandomAccessors extends RandomAccessors {
 
     @Override
     long mix64(long l) {
-        return Target_java_util_concurrent_ThreadLocalRandom.mix64(l);
+        return Target_jdk_internal_util_random_RandomSupport.mixMurmur64(l);
     }
 }

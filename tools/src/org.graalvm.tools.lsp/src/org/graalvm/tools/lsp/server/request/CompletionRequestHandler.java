@@ -30,6 +30,7 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Set;
 import java.util.concurrent.Future;
 import java.util.logging.Level;
@@ -61,10 +62,10 @@ import com.oracle.truffle.api.CallTarget;
 import com.oracle.truffle.api.CompilerDirectives;
 import com.oracle.truffle.api.frame.MaterializedFrame;
 import com.oracle.truffle.api.instrumentation.TruffleInstrument;
-import com.oracle.truffle.api.interop.InteropException;
 import com.oracle.truffle.api.interop.InteropLibrary;
 import com.oracle.truffle.api.interop.NodeLibrary;
 import com.oracle.truffle.api.interop.TruffleObject;
+import com.oracle.truffle.api.interop.UnknownIdentifierException;
 import com.oracle.truffle.api.interop.UnsupportedMessageException;
 import com.oracle.truffle.api.nodes.LanguageInfo;
 import com.oracle.truffle.api.nodes.Node;
@@ -351,7 +352,7 @@ public final class CompletionRequestHandler extends AbstractRequestHandler {
                 CompletionItem completion = CompletionItem.create(key);
                 // Inner scopes should be displayed first, so sort by priority and scopeCounter
                 // (the innermost scope has the lowest counter)
-                completion.setSortText(String.format("%s%d.%04d.%s", "+", displayPriority, scopeCounter, key));
+                completion.setSortText(format("%s%d.%04d.%s", "+", displayPriority, scopeCounter, key));
                 if (completionItemKindDefault != null) {
                     completion.setKind(completionItemKindDefault);
                 } else {
@@ -384,11 +385,6 @@ public final class CompletionRequestHandler extends AbstractRequestHandler {
         if (object == null) {
             return false;
         }
-        Object metaObject = getMetaObject(langInfo, object);
-        if (metaObject == null) {
-            return false;
-        }
-
         Object languageView = env.getLanguageView(langInfo, object);
         Object members = null;
         if (INTEROP.hasMembers(languageView)) {
@@ -430,15 +426,19 @@ public final class CompletionRequestHandler extends AbstractRequestHandler {
             CompletionItem completion = CompletionItem.create(key);
             ++counter;
             // Keep the order in which the keys were provided
-            completion.setSortText(String.format("%s%06d.%s", "+", counter, key));
+            completion.setSortText(format("%s%06d.%s", "+", counter, key));
             completion.setKind(CompletionItemKind.Property);
             completion.setDetail(createCompletionDetail(value, langInfo));
-            try {
-                completion.setDocumentation(createDocumentation(value, langInfo, "of " + INTEROP.getMetaQualifiedName(metaObject)));
-            } catch (UnsupportedMessageException e) {
-                throw new AssertionError(e);
+            String scopeInformation = "";
+            Object metaObject = getMetaObject(langInfo, object);
+            if (metaObject != null) {
+                try {
+                    scopeInformation = "of " + INTEROP.getMetaQualifiedName(metaObject);
+                } catch (UnsupportedMessageException e) {
+                    throw CompilerDirectives.shouldNotReachHere(e);
+                }
             }
-
+            completion.setDocumentation(createDocumentation(value, langInfo, scopeInformation));
             completions.add(completion);
         }
 
@@ -515,6 +515,15 @@ public final class CompletionRequestHandler extends AbstractRequestHandler {
         }
         try {
             Object docu = LSP_INTEROP.getDocumentation(value);
+            return documentationContent(docu, langInfo);
+        } catch (UnsupportedMessageException e) {
+            // GET_DOCUMENTATION message is not supported
+        }
+        return null;
+    }
+
+    Object documentationContent(Object docu, LanguageInfo langInfo) {
+        try {
             if (docu instanceof String && !((String) docu).isEmpty()) {
                 return docu;
             } else {
@@ -545,10 +554,8 @@ public final class CompletionRequestHandler extends AbstractRequestHandler {
                     }
                 }
             }
-        } catch (UnsupportedMessageException e) {
-            // GET_DOCUMENTATION message is not supported
-        } catch (InteropException e) {
-            e.printStackTrace(err);
+        } catch (UnsupportedMessageException | UnknownIdentifierException e) {
+            // Not supported or not existing
         }
         return null;
     }
@@ -598,6 +605,10 @@ public final class CompletionRequestHandler extends AbstractRequestHandler {
             }
         }
         return null;
+    }
+
+    private static String format(String format, Object... args) {
+        return String.format(Locale.ENGLISH, format, args);
     }
 
 }

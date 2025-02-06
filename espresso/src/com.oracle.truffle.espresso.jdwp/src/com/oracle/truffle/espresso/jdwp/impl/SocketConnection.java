@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2019, 2022, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -25,70 +25,59 @@ package com.oracle.truffle.espresso.jdwp.impl;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
-import java.net.ServerSocket;
 import java.net.Socket;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
 
-public final class SocketConnection implements Runnable {
+public final class SocketConnection {
+    private static final PacketStream DISPOSE_PACKET = new PacketStream();
     private final Socket socket;
-    private final ServerSocket serverSocket;
-    private boolean closed = false;
     private final OutputStream socketOutput;
     private final InputStream socketInput;
-    private final Object receiveLock = new Object();
-    private final Object sendLock = new Object();
-    private final Object closeLock = new Object();
+    private final BlockingQueue<PacketStream> queue = new ArrayBlockingQueue<>(4096);
 
-    private final BlockingQueue<PacketStream> queue = new ArrayBlockingQueue<>(512);
-
-    SocketConnection(Socket socket, ServerSocket serverSocket) throws IOException {
+    SocketConnection(Socket socket) throws IOException {
         this.socket = socket;
-        this.serverSocket = serverSocket;
         socket.setTcpNoDelay(true);
         socketInput = socket.getInputStream();
         socketOutput = socket.getOutputStream();
     }
 
-    public void close() throws IOException {
-        synchronized (closeLock) {
-            if (closed) {
-                return;
-            }
-            if (serverSocket != null) {
-                serverSocket.close();
-            }
-            socketOutput.close();
-            socketInput.close();
+    public void dispose() {
+        // queue the dispose packet
+        queue.add(DISPOSE_PACKET);
+    }
+
+    public void closeSocket() {
+        try {
             socket.close();
-            queue.clear();
-            closed = true;
+        } catch (IOException e) {
+            // nothing more we can do at this point really
         }
     }
 
     public boolean isOpen() {
-        synchronized (closeLock) {
-            return !closed;
-        }
+        return !socket.isClosed();
     }
 
-    @Override
-    public void run() {
+    public void sendPackets() {
         while (!Thread.currentThread().isInterrupted()) {
             try {
-                PacketStream take = queue.take();
-                byte[] shipment = take.prepareForShipment();
-                writePacket(shipment);
+                PacketStream stream = queue.take();
+                if (stream == DISPOSE_PACKET) {
+                    break;
+                } else {
+                    byte[] shipment = stream.prepareForShipment();
+                    writePacket(shipment);
+                }
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             } catch (IOException ex) {
                 if (isOpen()) {
                     throw new RuntimeException("Failed sending packet to debugger instance", ex);
                 } else {
-                    Thread.currentThread().interrupt();
+                    break;
                 }
-            } catch (ConnectionClosedException e) {
-                Thread.currentThread().interrupt();
             }
         }
     }
@@ -99,81 +88,56 @@ public final class SocketConnection implements Runnable {
         }
     }
 
-    public byte[] readPacket() throws IOException, ConnectionClosedException {
-        if (!isOpen() || Thread.currentThread().isInterrupted()) {
-            throw new ConnectionClosedException();
+    public byte[] readPacket() throws IOException {
+        int b1;
+        int b2;
+        int b3;
+        int b4;
+
+        // length
+        b1 = socketInput.read();
+        b2 = socketInput.read();
+        b3 = socketInput.read();
+        b4 = socketInput.read();
+
+        // EOF
+        if (b1 < 0) {
+            return new byte[0];
         }
-        synchronized (receiveLock) {
-            int b1;
-            int b2;
-            int b3;
-            int b4;
 
-            // length
-            try {
-                b1 = socketInput.read();
-                b2 = socketInput.read();
-                b3 = socketInput.read();
-                b4 = socketInput.read();
-            } catch (IOException ioe) {
-                if (!isOpen() || Thread.currentThread().isInterrupted()) {
-                    throw new ConnectionClosedException();
-                } else {
-                    throw ioe;
-                }
-            }
+        if (b2 < 0 || b3 < 0 || b4 < 0) {
+            throw new IOException("protocol error - premature EOF");
+        }
 
-            // EOF
-            if (b1 < 0) {
-                return new byte[0];
-            }
+        int len = ((b1 << 24) | (b2 << 16) | (b3 << 8) | (b4 << 0));
 
-            if (b2 < 0 || b3 < 0 || b4 < 0) {
+        if (len < 0) {
+            throw new IOException("protocol error - invalid length");
+        }
+
+        byte[] b = new byte[len];
+        b[0] = (byte) b1;
+        b[1] = (byte) b2;
+        b[2] = (byte) b3;
+        b[3] = (byte) b4;
+
+        int off = 4;
+        len -= off;
+
+        while (len > 0) {
+            int count;
+            count = socketInput.read(b, off, len);
+
+            if (count < 0) {
                 throw new IOException("protocol error - premature EOF");
             }
-
-            int len = ((b1 << 24) | (b2 << 16) | (b3 << 8) | (b4 << 0));
-
-            if (len < 0) {
-                throw new IOException("protocol error - invalid length");
-            }
-
-            byte[] b = new byte[len];
-            b[0] = (byte) b1;
-            b[1] = (byte) b2;
-            b[2] = (byte) b3;
-            b[3] = (byte) b4;
-
-            int off = 4;
-            len -= off;
-
-            while (len > 0) {
-                int count;
-                try {
-                    count = socketInput.read(b, off, len);
-                } catch (IOException ioe) {
-                    if (!isOpen() || Thread.currentThread().isInterrupted()) {
-                        throw new ConnectionClosedException();
-                    } else {
-                        throw ioe;
-                    }
-                }
-                if (count < 0) {
-                    throw new IOException("protocol error - premature EOF");
-                }
-                len -= count;
-                off += count;
-            }
-
-            return b;
+            len -= count;
+            off += count;
         }
+        return b;
     }
 
-    public void writePacket(byte[] b) throws IOException, ConnectionClosedException {
-        if (!isOpen() || Thread.currentThread().isInterrupted()) {
-            throw new ConnectionClosedException();
-        }
-
+    public void writePacket(byte[] b) throws IOException {
         /*
          * Check the packet size
          */
@@ -195,28 +159,9 @@ public final class SocketConnection implements Runnable {
         if (len > b.length) {
             throw new IllegalArgumentException("length mis-match");
         }
-
-        synchronized (sendLock) {
-            try {
-                /*
-                 * Send the packet (ignoring any bytes that follow the packet in the byte array).
-                 */
-                socketOutput.write(b, 0, len);
-            } catch (IOException ioe) {
-                if (!isOpen() || Thread.currentThread().isInterrupted()) {
-                    throw new ConnectionClosedException();
-                } else {
-                    throw ioe;
-                }
-            }
-        }
-    }
-
-    public boolean isAvailable() {
-        try {
-            return socketInput.available() > 0;
-        } catch (IOException e) {
-            return false;
-        }
+        /*
+         * Send the packet (ignoring any bytes that follow the packet in the byte array).
+         */
+        socketOutput.write(b, 0, len);
     }
 }

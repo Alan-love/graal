@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2016, 2017, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2016, 2023, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -26,87 +26,109 @@ package com.oracle.svm.hosted;
 
 import java.io.File;
 import java.io.IOException;
+import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
 import java.nio.file.Files;
+import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.ServiceLoader;
+import java.util.Set;
 import java.util.TimerTask;
-import java.util.concurrent.ForkJoinPool;
-import java.util.function.Consumer;
 import java.util.stream.Collectors;
 
 import org.graalvm.collections.Pair;
-import org.graalvm.compiler.debug.DebugContext;
-import org.graalvm.compiler.debug.DebugContext.Builder;
-import org.graalvm.compiler.options.OptionValues;
-import org.graalvm.compiler.printer.GraalDebugHandlersFactory;
-import org.graalvm.compiler.serviceprovider.JavaVersionUtil;
+import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.c.function.CEntryPoint;
 import org.graalvm.nativeimage.c.type.CCharPointerPointer;
 
 import com.oracle.graal.pointsto.infrastructure.SubstitutionProcessor;
 import com.oracle.graal.pointsto.util.AnalysisError;
 import com.oracle.graal.pointsto.util.AnalysisError.ParsingError;
+import com.oracle.graal.pointsto.util.GraalAccess;
 import com.oracle.graal.pointsto.util.ParallelExecutionException;
 import com.oracle.graal.pointsto.util.Timer;
 import com.oracle.graal.pointsto.util.Timer.StopTimer;
+import com.oracle.graal.pointsto.util.TimerCollection;
 import com.oracle.svm.core.FallbackExecutor;
 import com.oracle.svm.core.JavaMainWrapper;
 import com.oracle.svm.core.JavaMainWrapper.JavaMainSupport;
 import com.oracle.svm.core.OS;
 import com.oracle.svm.core.SubstrateOptions;
+import com.oracle.svm.core.option.HostedOptionKey;
 import com.oracle.svm.core.option.SubstrateOptionsParser;
+import com.oracle.svm.core.util.ExitStatus;
 import com.oracle.svm.core.util.InterruptImageBuilding;
 import com.oracle.svm.core.util.UserError;
 import com.oracle.svm.core.util.UserError.UserException;
 import com.oracle.svm.core.util.VMError;
-import com.oracle.svm.hosted.analysis.Inflation;
-import com.oracle.svm.hosted.c.GraalAccess;
 import com.oracle.svm.hosted.code.CEntryPointData;
 import com.oracle.svm.hosted.image.AbstractImage.NativeImageKind;
 import com.oracle.svm.hosted.option.HostedOptionParser;
+import com.oracle.svm.util.ClassUtil;
+import com.oracle.svm.util.LogUtils;
 import com.oracle.svm.util.ModuleSupport;
 import com.oracle.svm.util.ReflectionUtil;
 import com.oracle.svm.util.ReflectionUtil.ReflectionUtilError;
 
+import jdk.graal.compiler.options.OptionValues;
+import jdk.graal.compiler.serviceprovider.JavaVersionUtil;
 import jdk.vm.ci.aarch64.AArch64;
 import jdk.vm.ci.amd64.AMD64;
 import jdk.vm.ci.code.Architecture;
+import jdk.vm.ci.riscv64.RISCV64;
+import jdk.vm.ci.runtime.JVMCI;
 
-public class NativeImageGeneratorRunner implements ImageBuildTask {
+public class NativeImageGeneratorRunner {
 
     private volatile NativeImageGenerator generator;
     public static final String IMAGE_BUILDER_ARG_FILE_OPTION = "--image-args-file=";
 
     public static void main(String[] args) {
+        List<NativeImageGeneratorRunnerProvider> providers = new ArrayList<>();
+        ServiceLoader.load(NativeImageGeneratorRunnerProvider.class).forEach(providers::add);
+
+        if (providers.isEmpty()) {
+            new NativeImageGeneratorRunner().start(args);
+        } else {
+            if (providers.size() > 1) {
+                throw VMError.shouldNotReachHere("There are multiple services provided under %s: %s", NativeImageGeneratorRunnerProvider.class.getName(), providers);
+            }
+
+            providers.getFirst().run(args);
+        }
+    }
+
+    protected void start(String[] args) {
         List<String> arguments = new ArrayList<>(Arrays.asList(args));
         arguments = extractDriverArguments(arguments);
         final String[] classPath = extractImagePathEntries(arguments, SubstrateOptions.IMAGE_CLASSPATH_PREFIX);
         final String[] modulePath = extractImagePathEntries(arguments, SubstrateOptions.IMAGE_MODULEPATH_PREFIX);
-        int watchPID = extractWatchPID(arguments);
+        String keepAliveFile = extractKeepAliveFile(arguments);
         TimerTask timerTask = null;
-        if (watchPID >= 0) {
-            VMError.guarantee(OS.getCurrent().hasProcFS, SubstrateOptions.WATCHPID_PREFIX + " <pid> requires system with /proc");
+        if (keepAliveFile != null) {
             timerTask = new TimerTask() {
-                int cmdlineHashCode = 0;
+                Path file = Paths.get(keepAliveFile);
+                int fileHashCode = 0;
 
                 @Override
                 public void run() {
                     try {
-                        int currentCmdlineHashCode = Arrays.hashCode(Files.readAllBytes(Paths.get("/proc/" + watchPID + "/cmdline")));
-                        if (cmdlineHashCode == 0) {
-                            cmdlineHashCode = currentCmdlineHashCode;
-                        } else if (currentCmdlineHashCode != cmdlineHashCode) {
-                            System.exit(1);
+                        int currentFileHashCode = Arrays.hashCode(Files.readAllBytes(file));
+                        if (fileHashCode == 0) {
+                            fileHashCode = currentFileHashCode;
+                        } else if (currentFileHashCode != fileHashCode) {
+                            throw new RuntimeException();
                         }
-                    } catch (IOException e) {
-                        System.exit(1);
+                    } catch (Exception e) {
+                        System.exit(ExitStatus.WATCHDOG_EXIT.getValue());
                     }
                 }
             };
@@ -116,8 +138,32 @@ public class NativeImageGeneratorRunner implements ImageBuildTask {
         int exitStatus;
         ClassLoader applicationClassLoader = Thread.currentThread().getContextClassLoader();
         try {
-            ImageClassLoader imageClassLoader = installNativeImageClassLoader(classPath, modulePath);
-            exitStatus = new NativeImageGeneratorRunner().build(arguments.toArray(new String[0]), imageClassLoader);
+            ImageClassLoader imageClassLoader = installNativeImageClassLoader(classPath, modulePath, arguments);
+            List<String> remainingArguments = imageClassLoader.classLoaderSupport.getRemainingArguments();
+            if (!remainingArguments.isEmpty()) {
+                throw UserError.abort("Unknown options: %s", String.join(" ", remainingArguments));
+            }
+
+            Integer checkDependencies = SubstrateOptions.CheckBootModuleDependencies.getValue(imageClassLoader.classLoaderSupport.getParsedHostedOptions());
+            if (checkDependencies > 0) {
+                checkBootModuleDependencies(checkDependencies > 1);
+            }
+            exitStatus = build(imageClassLoader);
+        } catch (UserException e) {
+            reportUserError(e.getMessage());
+            exitStatus = ExitStatus.BUILDER_ERROR.getValue();
+        } catch (InterruptImageBuilding e) {
+            if (e.getReason().isPresent()) {
+                if (!e.getReason().get().isEmpty()) {
+                    LogUtils.info(e.getReason().get());
+                }
+                exitStatus = ExitStatus.OK.getValue();
+            } else {
+                exitStatus = ExitStatus.BUILDER_INTERRUPT_WITHOUT_REASON.getValue();
+            }
+        } catch (Throwable err) {
+            reportFatalError(err);
+            exitStatus = ExitStatus.BUILDER_ERROR.getValue();
         } finally {
             uninstallNativeImageClassLoader();
             Thread.currentThread().setContextClassLoader(applicationClassLoader);
@@ -126,6 +172,89 @@ public class NativeImageGeneratorRunner implements ImageBuildTask {
             }
         }
         System.exit(exitStatus);
+    }
+
+    private static void checkBootModuleDependencies(boolean verbose) {
+        Set<Module> allModules = ModuleLayer.boot().modules();
+        List<Module> builderModules = allModules.stream().filter(m -> m.isNamed() && m.getName().startsWith("org.graalvm.nativeimage.")).toList();
+        Set<Module> transitiveBuilderModules = new LinkedHashSet<>();
+        for (Module svmModule : builderModules) {
+            transitiveReaders(svmModule, allModules, transitiveBuilderModules);
+        }
+        if (verbose) {
+            System.out.println(transitiveBuilderModules.stream()
+                            .map(Module::getName)
+                            .collect(Collectors.joining(System.lineSeparator(), "All builder modules: " + System.lineSeparator(), System.lineSeparator())));
+        }
+
+        Set<Module> modulesBuilderDependsOn = new LinkedHashSet<>();
+        for (Module builderModule : transitiveBuilderModules) {
+            transitiveRequires(verbose, builderModule, allModules, modulesBuilderDependsOn);
+        }
+        modulesBuilderDependsOn.removeAll(transitiveBuilderModules);
+        if (verbose) {
+            System.out.println(modulesBuilderDependsOn.stream()
+                            .map(Module::getName)
+                            .collect(Collectors.joining(System.lineSeparator(), "All modules the builder modules depend on: " + System.lineSeparator(), System.lineSeparator())));
+        }
+
+        Set<String> expectedBuilderDependencies = Set.of(
+                        "java.base",
+                        "java.instrument",
+                        "java.management",
+                        "java.logging",
+                        // workaround for GR-47773 on the module-path which requires java.sql (like
+                        // truffle) or java.xml
+                        "java.sql",
+                        "java.xml",
+                        "java.transaction.xa",
+                        "jdk.management",
+                        "java.compiler",
+                        "jdk.jfr",
+                        "jdk.zipfs",
+                        "jdk.management.jfr");
+
+        Set<String> unexpectedBuilderDependencies = modulesBuilderDependsOn.stream().map(Module::getName).collect(Collectors.toSet());
+        unexpectedBuilderDependencies.removeAll(expectedBuilderDependencies);
+        if (!unexpectedBuilderDependencies.isEmpty()) {
+            throw VMError.shouldNotReachHere("Unexpected image builder module-dependencies: " + String.join(", ", unexpectedBuilderDependencies));
+        }
+    }
+
+    public static void transitiveReaders(Module readModule, Set<Module> potentialReaders, Set<Module> actualReaders) {
+        for (Module potentialReader : potentialReaders) {
+            if (potentialReader.canRead(readModule)) {
+                if (actualReaders.add(potentialReader)) {
+                    transitiveReaders(potentialReader, potentialReaders, actualReaders);
+                }
+            }
+        }
+    }
+
+    private static void transitiveRequires(boolean verbose, Module requiringModule, Set<Module> potentialNeededModules, Set<Module> actualNeededModules) {
+        for (Module potentialNeedModule : potentialNeededModules) {
+            if (requiringModule.canRead(potentialNeedModule)) {
+                /* Filter out GraalVM modules */
+                if (potentialNeedModule.getName().equals("jdk.internal.vm.ci") || /* JVMCI */
+                                /* graal */
+                                potentialNeedModule.getName().startsWith("org.graalvm.") ||
+                                potentialNeedModule.getName().startsWith("jdk.graal.compiler") ||
+                                /* enterprise graal */
+                                potentialNeedModule.getName().startsWith("com.oracle.graal.") ||
+                                /* exclude all truffle modules */
+                                potentialNeedModule.getName().startsWith("com.oracle.truffle.") ||
+                                /* llvm-backend optional dependencies */
+                                potentialNeedModule.getName().startsWith("com.oracle.svm.shadowed.")) {
+                    continue;
+                }
+                if (actualNeededModules.add(potentialNeedModule)) {
+                    if (verbose) {
+                        System.out.println(requiringModule + " reads " + potentialNeedModule);
+                    }
+                    transitiveRequires(verbose, potentialNeedModule, potentialNeededModules, actualNeededModules);
+                }
+            }
+        }
     }
 
     public static void uninstallNativeImageClassLoader() {
@@ -147,12 +276,19 @@ public class NativeImageGeneratorRunner implements ImageBuildTask {
      *
      * @param classpath for the application and image should be built for.
      * @param modulepath for the application and image should be built for (only for Java >= 11).
+     * @param arguments
      * @return NativeImageClassLoaderSupport that exposes the {@code ClassLoader} for image building
      *         via {@link NativeImageClassLoaderSupport#getClassLoader()}.
      */
-    public static ImageClassLoader installNativeImageClassLoader(String[] classpath, String[] modulepath) {
+    public static ImageClassLoader installNativeImageClassLoader(String[] classpath, String[] modulepath, List<String> arguments) {
         NativeImageSystemClassLoader nativeImageSystemClassLoader = NativeImageSystemClassLoader.singleton();
         NativeImageClassLoaderSupport nativeImageClassLoaderSupport = new NativeImageClassLoaderSupport(nativeImageSystemClassLoader.defaultSystemClassLoader, classpath, modulepath);
+        nativeImageClassLoaderSupport.setupHostedOptionParser(arguments);
+        nativeImageClassLoaderSupport.setupLibGraalClassLoader();
+        /* Perform additional post-processing with the created nativeImageClassLoaderSupport */
+        for (NativeImageClassLoaderPostProcessing postProcessing : ServiceLoader.load(NativeImageClassLoaderPostProcessing.class)) {
+            postProcessing.apply(nativeImageClassLoaderSupport);
+        }
         ClassLoader nativeImageClassLoader = nativeImageClassLoaderSupport.getClassLoader();
         Thread.currentThread().setContextClassLoader(nativeImageClassLoader);
         /*
@@ -162,10 +298,6 @@ public class NativeImageGeneratorRunner implements ImageBuildTask {
          */
         nativeImageSystemClassLoader.setNativeImageClassLoader(nativeImageClassLoader);
 
-        if (JavaVersionUtil.JAVA_SPEC >= 11 && !nativeImageClassLoaderSupport.imagecp.isEmpty()) {
-            ModuleSupport.openModuleByClass(JavaVersionUtil.class, null);
-        }
-
         /*
          * Iterating all classes can already trigger class initialization: We need annotation
          * information, which triggers class initialization of annotation classes and enum classes
@@ -173,6 +305,12 @@ public class NativeImageGeneratorRunner implements ImageBuildTask {
          * "during image build" set up already at this time.
          */
         NativeImageGenerator.setSystemPropertiesForImageEarly();
+
+        /*
+         * Size the common pool before creating the image class loader because it is the first
+         * component to use the common pool.
+         */
+        NativeImageOptions.setCommonPoolParallelism(nativeImageClassLoaderSupport.getParsedHostedOptions());
 
         return new ImageClassLoader(NativeImageGenerator.getTargetPlatform(nativeImageClassLoader), nativeImageClassLoaderSupport);
     }
@@ -187,7 +325,7 @@ public class NativeImageGeneratorRunner implements ImageBuildTask {
                 String options = new String(Files.readAllBytes(Paths.get(argFilePath)));
                 result.addAll(Arrays.asList(options.split("\0")));
             } catch (IOException e) {
-                throw VMError.shouldNotReachHere("Exception occurred during image builder argument file processing.", e);
+                throw VMError.shouldNotReachHere("Exception occurred during image builder argument file processing", e);
             }
         }
         return result;
@@ -208,23 +346,18 @@ public class NativeImageGeneratorRunner implements ImageBuildTask {
         }
     }
 
-    public static int extractWatchPID(List<String> arguments) {
-        int cpIndex = arguments.indexOf(SubstrateOptions.WATCHPID_PREFIX);
+    public static String extractKeepAliveFile(List<String> arguments) {
+        int cpIndex = arguments.indexOf(SubstrateOptions.KEEP_ALIVE_PREFIX);
         if (cpIndex >= 0) {
             if (cpIndex + 1 >= arguments.size()) {
-                throw UserError.abort("ProcessID must be provided after the '%s' argument.", SubstrateOptions.WATCHPID_PREFIX);
+                throw UserError.abort("Path to keep-alive file must be provided after the '%s' argument", SubstrateOptions.KEEP_ALIVE_PREFIX);
             }
             arguments.remove(cpIndex);
             String pidStr = arguments.get(cpIndex);
             arguments.remove(cpIndex);
-            return Integer.parseInt(pidStr);
+            return pidStr;
         }
-        return -1;
-    }
-
-    /** Unless the check should be ignored, check that I am running on JDK-8. */
-    public static boolean isValidJavaVersion() {
-        return (Boolean.getBoolean("substratevm.IgnoreGraalVersionCheck") || JavaVersionUtil.JAVA_SPEC <= 8);
+        return null;
     }
 
     private static void reportToolUserError(String msg) {
@@ -233,180 +366,204 @@ public class NativeImageGeneratorRunner implements ImageBuildTask {
 
     private static boolean isValidArchitecture() {
         final Architecture originalTargetArch = GraalAccess.getOriginalTarget().arch;
-        return originalTargetArch instanceof AMD64 || originalTargetArch instanceof AArch64;
+        return originalTargetArch instanceof AMD64 || originalTargetArch instanceof AArch64 || originalTargetArch instanceof RISCV64;
     }
 
     private static boolean isValidOperatingSystem() {
-        final OS currentOs = OS.getCurrent();
-        return currentOs == OS.LINUX || currentOs == OS.DARWIN || currentOs == OS.WINDOWS;
+        return OS.LINUX.isCurrent() || OS.DARWIN.isCurrent() || OS.WINDOWS.isCurrent();
     }
 
     @SuppressWarnings("try")
-    private int buildImage(String[] arguments, ImageClassLoader classLoader) {
+    private int buildImage(ImageClassLoader classLoader) {
         if (!verifyValidJavaVersionAndPlatform()) {
-            return 1;
+            return ExitStatus.BUILDER_ERROR.getValue();
         }
-        Timer totalTimer = new Timer("[total]", false);
-        ForkJoinPool analysisExecutor = null;
-        ForkJoinPool compilationExecutor = null;
-        OptionValues parsedHostedOptions = null;
+
+        HostedOptionParser optionParser = classLoader.classLoaderSupport.getHostedOptionParser();
+        OptionValues parsedHostedOptions = classLoader.classLoaderSupport.getParsedHostedOptions();
+
+        String imageName = SubstrateOptions.Name.getValue(parsedHostedOptions);
+        TimerCollection timerCollection = new TimerCollection();
+        Timer totalTimer = timerCollection.get(TimerCollection.Registry.TOTAL);
+
+        if (NativeImageOptions.ListCPUFeatures.getValue(parsedHostedOptions)) {
+            printCPUFeatures(classLoader.platform);
+            return ExitStatus.OK.getValue();
+        }
+
+        ProgressReporter reporter = new ProgressReporter(parsedHostedOptions);
+        Throwable unhandledThrowable = null;
+        boolean wasSuccessfulBuild = false;
         try (StopTimer ignored = totalTimer.start()) {
-            Timer classlistTimer = new Timer("classlist", false);
+            Timer classlistTimer = timerCollection.get(TimerCollection.Registry.CLASSLIST);
             try (StopTimer ignored1 = classlistTimer.start()) {
-                classLoader.initAllClasses();
+                classLoader.loadAllClasses();
             }
-
-            HostedOptionParser optionParser = new HostedOptionParser(classLoader);
-            String[] remainingArgs = optionParser.parse(arguments);
-            if (remainingArgs.length > 0) {
-                throw UserError.abort("Unknown options: %s", Arrays.toString(remainingArgs));
-            }
-
-            /*
-             * We do not have the VMConfiguration and the HostedOptionValues set up yet, so we need
-             * to pass the OptionValues explicitly when accessing options.
-             */
-            parsedHostedOptions = new OptionValues(optionParser.getHostedValues());
-            DebugContext debug = new Builder(parsedHostedOptions, new GraalDebugHandlersFactory(GraalAccess.getOriginalSnippetReflection())).build();
-
-            String imageName = SubstrateOptions.Name.getValue(parsedHostedOptions);
             if (imageName.length() == 0) {
-                throw UserError.abort("No output file name specified. Use '%s'.", SubstrateOptionsParser.commandArgument(SubstrateOptions.Name, "<output-file>"));
+                throw UserError.abort("No output file name specified. Use '%s'", SubstrateOptionsParser.commandArgument(SubstrateOptions.Name, "<output-file>"));
             }
+            try {
+                Map<Method, CEntryPointData> entryPoints = new HashMap<>();
+                Pair<Method, CEntryPointData> mainEntryPointData = Pair.empty();
+                JavaMainSupport javaMainSupport = null;
 
-            totalTimer.setPrefix(imageName);
-            classlistTimer.setPrefix(imageName);
-
-            // print the time here to avoid interactions with flags processing
-            classlistTimer.print();
-
-            Map<Method, CEntryPointData> entryPoints = new HashMap<>();
-            Pair<Method, CEntryPointData> mainEntryPointData = Pair.empty();
-            JavaMainSupport javaMainSupport = null;
-
-            NativeImageKind imageKind;
-            boolean isStaticExecutable = SubstrateOptions.StaticExecutable.getValue(parsedHostedOptions);
-            boolean isSharedLibrary = SubstrateOptions.SharedLibrary.getValue(parsedHostedOptions);
-            if (isStaticExecutable && isSharedLibrary) {
-                throw UserError.abort("Cannot pass both option: %s and %s", SubstrateOptionsParser.commandArgument(SubstrateOptions.SharedLibrary, "+"),
-                                SubstrateOptionsParser.commandArgument(SubstrateOptions.StaticExecutable, "+"));
-            } else if (isSharedLibrary) {
-                imageKind = NativeImageKind.SHARED_LIBRARY;
-            } else if (isStaticExecutable) {
-                imageKind = NativeImageKind.STATIC_EXECUTABLE;
-            } else {
-                imageKind = NativeImageKind.EXECUTABLE;
-            }
-
-            String className = SubstrateOptions.Class.getValue(parsedHostedOptions);
-            String moduleName = SubstrateOptions.Module.getValue(parsedHostedOptions);
-            if (imageKind.isExecutable && moduleName.isEmpty() && className.isEmpty()) {
-                throw UserError.abort("Must specify main entry point class when building %s native image. Use '%s'.", imageKind,
-                                SubstrateOptionsParser.commandArgument(SubstrateOptions.Class, "<fully-qualified-class-name>"));
-            }
-
-            if (!className.isEmpty() || !moduleName.isEmpty()) {
-                Method mainEntryPoint;
-                Class<?> mainClass;
-                try {
-                    Object jpmsModule = null;
-                    if (!moduleName.isEmpty()) {
-                        jpmsModule = classLoader.findModule(moduleName)
-                                        .orElseThrow(() -> {
-                                            String errorMsg = "Module " + moduleName + " for mainclass not found.";
-                                            return UserError.abort(errorMsg);
-                                        });
-                    }
-                    mainClass = classLoader.loadClassFromModule(jpmsModule, className);
-                } catch (ClassNotFoundException ex) {
-                    throw UserError.abort("Main entry point class '%s' not found.", className);
+                NativeImageKind imageKind = null;
+                boolean isStaticExecutable = SubstrateOptions.StaticExecutable.getValue(parsedHostedOptions);
+                boolean isSharedLibrary = SubstrateOptions.SharedLibrary.getValue(parsedHostedOptions);
+                boolean isImageLayer = SubstrateOptions.LayerCreate.hasBeenSet(parsedHostedOptions);
+                if (isStaticExecutable && isSharedLibrary) {
+                    reportConflictingOptions(SubstrateOptions.SharedLibrary, SubstrateOptions.StaticExecutable);
+                } else if (isStaticExecutable && isImageLayer) {
+                    reportConflictingOptions(SubstrateOptions.StaticExecutable, SubstrateOptions.LayerCreate);
+                } else if (isSharedLibrary && isImageLayer) {
+                    reportConflictingOptions(SubstrateOptions.SharedLibrary, SubstrateOptions.LayerCreate);
+                } else if (isSharedLibrary) {
+                    imageKind = NativeImageKind.SHARED_LIBRARY;
+                } else if (isImageLayer) {
+                    imageKind = NativeImageKind.IMAGE_LAYER;
+                } else if (isStaticExecutable) {
+                    imageKind = NativeImageKind.STATIC_EXECUTABLE;
+                } else {
+                    imageKind = NativeImageKind.EXECUTABLE;
                 }
-                String mainEntryPointName = SubstrateOptions.Method.getValue(parsedHostedOptions);
-                if (mainEntryPointName.isEmpty()) {
-                    throw UserError.abort("Must specify main entry point method when building %s native image. Use '%s'.", imageKind,
-                                    SubstrateOptionsParser.commandArgument(SubstrateOptions.Method, "<method-name>"));
+
+                String className = SubstrateOptions.Class.getValue(parsedHostedOptions);
+                String moduleName = SubstrateOptions.Module.getValue(parsedHostedOptions);
+                if (imageKind.isExecutable && moduleName.isEmpty() && className.isEmpty()) {
+                    throw UserError.abort("Must specify main entry point class when building %s native image. Use '%s'.", imageKind,
+                                    SubstrateOptionsParser.commandArgument(SubstrateOptions.Class, "<fully-qualified-class-name>"));
                 }
-                try {
-                    /* First look for an main method with the C-level signature for arguments. */
-                    mainEntryPoint = mainClass.getDeclaredMethod(mainEntryPointName, int.class, CCharPointerPointer.class);
-                } catch (NoSuchMethodException ignored2) {
-                    Method javaMainMethod;
+
+                reporter.printStart(imageName, imageKind);
+
+                if (!className.isEmpty() || !moduleName.isEmpty()) {
+                    Method mainEntryPoint;
+                    Class<?> mainClass;
                     try {
+                        Module mainModule = null;
+                        if (!moduleName.isEmpty()) {
+                            mainModule = classLoader.findModule(moduleName)
+                                            .orElseThrow(() -> UserError.abort("Module " + moduleName + " for mainclass not found."));
+                        }
+                        if (className.isEmpty()) {
+                            className = ImageClassLoader.getMainClassFromModule(mainModule)
+                                            .orElseThrow(() -> UserError.abort("Module %s does not have a ModuleMainClass attribute, use -m <module>/<main-class>", moduleName));
+                        }
+                        mainClass = classLoader.forName(className, mainModule);
+                        if (mainClass == null) {
+                            throw UserError.abort(classLoader.getMainClassNotFoundErrorMessage(className));
+                        }
+                    } catch (ClassNotFoundException ex) {
+                        throw UserError.abort(classLoader.getMainClassNotFoundErrorMessage(className));
+                    } catch (UnsupportedClassVersionError ex) {
+                        if (ex.getMessage().contains("compiled by a more recent version of the Java Runtime")) {
+                            throw UserError.abort("Unable to load '%s' due to a Java version mismatch.%n" +
+                                            "Please take one of the following actions:%n" +
+                                            " 1) Recompile the source files for your application using Java %s, then try running native-image again%n" +
+                                            " 2) Use a version of native-image corresponding to the version of Java with which you compiled the source files for your application%n%n" +
+                                            "Root cause: %s",
+                                            className, JavaVersionUtil.JAVA_SPEC, ex);
+                        } else {
+                            throw UserError.abort(ex.getMessage());
+                        }
+                    }
+                    String mainEntryPointName = SubstrateOptions.Method.getValue(parsedHostedOptions);
+                    if (mainEntryPointName.isEmpty()) {
+                        throw UserError.abort("Must specify main entry point method when building %s native image. Use '%s'.", imageKind,
+                                        SubstrateOptionsParser.commandArgument(SubstrateOptions.Method, "<method-name>"));
+                    }
+                    try {
+                        /*
+                         * First look for an main method with the C-level signature for arguments.
+                         */
+                        mainEntryPoint = mainClass.getDeclaredMethod(mainEntryPointName, int.class, CCharPointerPointer.class);
+                    } catch (NoSuchMethodException ignored2) {
+                        Method javaMainMethod;
                         /*
                          * If no C-level main method was found, look for a Java-level main method
                          * and use our wrapper to invoke it.
                          */
-                        javaMainMethod = ReflectionUtil.lookupMethod(mainClass, mainEntryPointName, String[].class);
-                    } catch (ReflectionUtilError ex) {
-                        throw UserError.abort(ex.getCause(),
-                                        "Method '%s.%s' is declared as the main entry point but it can not be found. " +
-                                                        "Make sure that class '%s' is on the classpath and that method '%s(String[])' exists in that class.",
-                                        mainClass.getName(),
-                                        mainEntryPointName,
-                                        mainClass.getName(),
-                                        mainEntryPointName);
-                    }
+                        if ("main".equals(mainEntryPointName) && JavaMainWrapper.instanceMainMethodSupported()) {
+                            // Instance main method only supported for "main" method name
+                            try {
+                                /*
+                                 * JDK-8306112: Implementation of JEP 445: Unnamed Classes and
+                                 * Instance Main Methods (Preview)
+                                 *
+                                 * MainMethodFinder will perform all the necessary checks
+                                 */
+                                String mainMethodFinderClassName = JavaVersionUtil.JAVA_SPEC >= 22 ? "jdk.internal.misc.MethodFinder" : "jdk.internal.misc.MainMethodFinder";
+                                Class<?> mainMethodFinder = ReflectionUtil.lookupClass(false, mainMethodFinderClassName);
+                                Method findMainMethod = ReflectionUtil.lookupMethod(mainMethodFinder, "findMainMethod", Class.class);
+                                javaMainMethod = (Method) findMainMethod.invoke(null, mainClass);
+                            } catch (InvocationTargetException ex) {
+                                assert ex.getTargetException() instanceof NoSuchMethodException;
+                                throw UserError.abort(ex.getCause(),
+                                                "Method '%s.%s' is declared as the main entry point but it can not be found. " +
+                                                                "Make sure that class '%s' is on the classpath and that non-private " +
+                                                                "method '%s()' or '%s(String[])'.",
+                                                mainClass.getName(),
+                                                mainEntryPointName,
+                                                mainClass.getName(),
+                                                mainEntryPointName,
+                                                mainEntryPointName);
+                            }
+                        } else {
+                            try {
+                                javaMainMethod = ReflectionUtil.lookupMethod(mainClass, mainEntryPointName, String[].class);
+                                final int mainMethodModifiers = javaMainMethod.getModifiers();
+                                if (!Modifier.isStatic(mainMethodModifiers)) {
+                                    throw UserError.abort("Java main method '%s.%s(String[])' is not static.", mainClass.getName(), mainEntryPointName);
+                                }
+                                if (!Modifier.isPublic(mainMethodModifiers)) {
+                                    throw UserError.abort("Java main method '%s.%s(String[])' is not public.", mainClass.getName(), mainEntryPointName);
+                                }
+                            } catch (ReflectionUtilError ex) {
+                                throw UserError.abort(ex.getCause(),
+                                                "Method '%s.%s' is declared as the main entry point but it can not be found. " +
+                                                                "Make sure that class '%s' is on the classpath and that method '%s(String[])' exists in that class.",
+                                                mainClass.getName(),
+                                                mainEntryPointName,
+                                                mainClass.getName(),
+                                                mainEntryPointName);
+                            }
+                        }
 
-                    if (javaMainMethod.getReturnType() != void.class) {
-                        throw UserError.abort("Java main method '%s.%s(String[])' does not have the return type 'void'.", mainClass.getName(), mainEntryPointName);
+                        if (javaMainMethod.getReturnType() != void.class) {
+                            throw UserError.abort("Java main method '%s.%s(%s)' does not have the return type 'void'.", mainClass.getName(), mainEntryPointName,
+                                            javaMainMethod.getParameterCount() == 1 ? "String[]" : "");
+                        }
+                        javaMainSupport = createJavaMainSupport(javaMainMethod, classLoader);
+                        mainEntryPoint = getMainEntryMethod(classLoader);
                     }
-                    final int mainMethodModifiers = javaMainMethod.getModifiers();
-                    if (!Modifier.isStatic(mainMethodModifiers)) {
-                        throw UserError.abort("Java main method '%s.%s(String[])' is not static.", mainClass.getName(), mainEntryPointName);
-                    }
-                    if (!Modifier.isPublic(mainMethodModifiers)) {
-                        throw UserError.abort("Java main method '%s.%s(String[])' is not public.", mainClass.getName(), mainEntryPointName);
-                    }
-                    javaMainSupport = new JavaMainSupport(javaMainMethod);
-                    mainEntryPoint = JavaMainWrapper.class.getDeclaredMethod("run", int.class, CCharPointerPointer.class);
-                }
-                CEntryPoint annotation = mainEntryPoint.getAnnotation(CEntryPoint.class);
-                if (annotation == null) {
-                    throw UserError.abort("Entry point must have the '@%s' annotation", CEntryPoint.class.getSimpleName());
+                    verifyMainEntryPoint(mainEntryPoint);
+
+                    mainEntryPointData = createMainEntryPointData(imageKind, mainEntryPoint);
                 }
 
-                Class<?>[] pt = mainEntryPoint.getParameterTypes();
-                if (pt.length != 2 || pt[0] != int.class || pt[1] != CCharPointerPointer.class || mainEntryPoint.getReturnType() != int.class) {
-                    throw UserError.abort("Main entry point must have signature 'int main(int argc, CCharPointerPointer argv)'.");
+                generator = createImageGenerator(classLoader, optionParser, mainEntryPointData, reporter);
+                generator.run(entryPoints, javaMainSupport, imageName, imageKind, SubstitutionProcessor.IDENTITY, optionParser.getRuntimeOptionNames(), timerCollection);
+                wasSuccessfulBuild = true;
+            } finally {
+                if (!wasSuccessfulBuild) {
+                    reporter.printUnsuccessfulInitializeEnd();
                 }
-                mainEntryPointData = Pair.create(mainEntryPoint, CEntryPointData.create(mainEntryPoint, imageKind.mainEntryPointName));
             }
-
-            int maxConcurrentThreads = NativeImageOptions.getMaximumNumberOfConcurrentThreads(parsedHostedOptions);
-            analysisExecutor = Inflation.createExecutor(debug, NativeImageOptions.getMaximumNumberOfAnalysisThreads(parsedHostedOptions));
-            compilationExecutor = Inflation.createExecutor(debug, maxConcurrentThreads);
-            generator = new NativeImageGenerator(classLoader, optionParser, mainEntryPointData);
-            generator.run(entryPoints, javaMainSupport, imageName, imageKind, SubstitutionProcessor.IDENTITY,
-                            compilationExecutor, analysisExecutor, optionParser.getRuntimeOptionNames());
         } catch (InterruptImageBuilding e) {
-            if (analysisExecutor != null) {
-                analysisExecutor.shutdownNow();
-            }
-            if (compilationExecutor != null) {
-                compilationExecutor.shutdownNow();
-            }
-            if (e.getReason().isPresent()) {
-                if (!e.getReason().get().isEmpty()) {
-                    NativeImageGeneratorRunner.info(e.getReason().get());
-                }
-                return 0;
-            } else {
-                /* InterruptImageBuilding without explicit reason is exit code 3 */
-                return 3;
-            }
+            throw e;
         } catch (FallbackFeature.FallbackImageRequest e) {
             if (FallbackExecutor.class.getName().equals(SubstrateOptions.Class.getValue())) {
                 NativeImageGeneratorRunner.reportFatalError(e, "FallbackImageRequest while building fallback image.");
-                return 1;
+                return ExitStatus.BUILDER_ERROR.getValue();
             }
-            reportUserException(e, parsedHostedOptions, NativeImageGeneratorRunner::warn);
-            return 2;
+            reportUserException(e, parsedHostedOptions);
+            return ExitStatus.FALLBACK_IMAGE.getValue();
         } catch (ParsingError e) {
             NativeImageGeneratorRunner.reportFatalError(e);
-            return 1;
+            return ExitStatus.BUILDER_ERROR.getValue();
         } catch (UserException | AnalysisError e) {
             reportUserError(e, parsedHostedOptions);
-            return 1;
+            return ExitStatus.BUILDER_ERROR.getValue();
         } catch (ParallelExecutionException pee) {
             boolean hasUserError = false;
             for (Throwable exception : pee.getExceptions()) {
@@ -416,48 +573,98 @@ public class NativeImageGeneratorRunner implements ImageBuildTask {
                 } else if (exception instanceof AnalysisError && !(exception instanceof ParsingError)) {
                     reportUserError(exception, parsedHostedOptions);
                     hasUserError = true;
+                } else if (exception.getCause() instanceof UserException) {
+                    reportUserError(exception.getCause(), parsedHostedOptions);
+                    hasUserError = true;
                 }
             }
             if (hasUserError) {
-                return 1;
+                return ExitStatus.BUILDER_ERROR.getValue();
             }
 
             if (pee.getExceptions().size() > 1) {
-                System.err.println(pee.getExceptions().size() + " fatal errors detected:");
+                System.out.println(pee.getExceptions().size() + " fatal errors detected:");
             }
             for (Throwable exception : pee.getExceptions()) {
                 NativeImageGeneratorRunner.reportFatalError(exception);
             }
-            return 1;
+            return ExitStatus.BUILDER_ERROR.getValue();
         } catch (Throwable e) {
-            NativeImageGeneratorRunner.reportFatalError(e);
-            return 1;
+            unhandledThrowable = e;
+            return ExitStatus.BUILDER_ERROR.getValue();
         } finally {
+            reportEpilog(imageName, reporter, classLoader, wasSuccessfulBuild, unhandledThrowable, parsedHostedOptions);
             NativeImageGenerator.clearSystemPropertiesForImage();
-            ImageSingletonsSupportImpl.HostedManagement.clearInThread();
+            ImageSingletonsSupportImpl.HostedManagement.clear();
         }
-        totalTimer.print();
-        return 0;
+        return ExitStatus.OK.getValue();
+    }
+
+    private static void reportConflictingOptions(HostedOptionKey<Boolean> o1, HostedOptionKey<?> o2) {
+        throw UserError.abort("Cannot pass both options: %s and %s", SubstrateOptionsParser.commandArgument(o1, "+"), SubstrateOptionsParser.commandArgument(o2, "+"));
+    }
+
+    protected void reportEpilog(String imageName, ProgressReporter reporter, ImageClassLoader classLoader, boolean wasSuccessfulBuild, Throwable unhandledThrowable, OptionValues parsedHostedOptions) {
+        reporter.printEpilog(Optional.ofNullable(imageName), Optional.ofNullable(generator), classLoader, wasSuccessfulBuild, Optional.ofNullable(unhandledThrowable), parsedHostedOptions);
+    }
+
+    protected NativeImageGenerator createImageGenerator(ImageClassLoader classLoader, HostedOptionParser optionParser, Pair<Method, CEntryPointData> mainEntryPointData, ProgressReporter reporter) {
+        return new NativeImageGenerator(classLoader, optionParser, mainEntryPointData, reporter);
+    }
+
+    protected Pair<Method, CEntryPointData> createMainEntryPointData(NativeImageKind imageKind, Method mainEntryPoint) {
+        Pair<Method, CEntryPointData> mainEntryPointData;
+        Class<?>[] pt = mainEntryPoint.getParameterTypes();
+        if (pt.length != 2 || pt[0] != int.class || pt[1] != CCharPointerPointer.class || mainEntryPoint.getReturnType() != int.class) {
+            throw UserError.abort("Main entry point must have signature 'int main(int argc, CCharPointerPointer argv)'.");
+        }
+        mainEntryPointData = Pair.create(mainEntryPoint, CEntryPointData.create(mainEntryPoint, imageKind.mainEntryPointName));
+        return mainEntryPointData;
+    }
+
+    protected Method getMainEntryMethod(@SuppressWarnings("unused") ImageClassLoader classLoader) throws NoSuchMethodException {
+        return JavaMainWrapper.class.getDeclaredMethod("run", int.class, CCharPointerPointer.class);
+    }
+
+    protected JavaMainSupport createJavaMainSupport(Method javaMainMethod, @SuppressWarnings("unused") ImageClassLoader classLoader) throws IllegalAccessException {
+        return new JavaMainSupport(javaMainMethod);
+    }
+
+    protected void verifyMainEntryPoint(Method mainEntryPoint) {
+        CEntryPoint annotation = mainEntryPoint.getAnnotation(CEntryPoint.class);
+        if (annotation == null) {
+            throw UserError.abort("Entry point must have the '@%s' annotation", CEntryPoint.class.getSimpleName());
+        }
     }
 
     public static boolean verifyValidJavaVersionAndPlatform() {
-        if (!isValidJavaVersion()) {
-            reportToolUserError("supports only Java 1.8 with an update version 40+. Detected Java version is: " + getJavaVersion());
-            return false;
-        }
         if (!isValidArchitecture()) {
-            reportToolUserError("runs only on architecture AMD64. Detected architecture: " + GraalAccess.getOriginalTarget().arch.getClass().getSimpleName());
+            reportToolUserError("Runs on AMD64, AArch64 and RISCV64 only. Detected architecture: " + ClassUtil.getUnqualifiedName(GraalAccess.getOriginalTarget().arch.getClass()));
         }
         if (!isValidOperatingSystem()) {
-            reportToolUserError("runs on Linux, Mac OS X and Windows only. Detected OS: " + System.getProperty("os.name"));
+            reportToolUserError("Runs on Linux, Mac OS X and Windows only. Detected OS: " + System.getProperty("os.name"));
             return false;
         }
 
         return true;
     }
 
-    public static String getJavaVersion() {
-        return System.getProperty("java.version");
+    public static void printCPUFeatures(Platform platform) {
+        StringBuilder message = new StringBuilder();
+        Architecture arch = JVMCI.getRuntime().getHostJVMCIBackend().getTarget().arch;
+        if (NativeImageGenerator.includedIn(platform, Platform.AMD64.class)) {
+            message.append("All AMD64 CPUFeatures: ").append(Arrays.toString(AMD64.CPUFeature.values()));
+            if (arch instanceof AMD64) {
+                message.append(System.lineSeparator()).append("Host machine AMD64 CPUFeatures: ").append(((AMD64) arch).getFeatures().toString());
+            }
+        } else {
+            assert NativeImageGenerator.includedIn(platform, Platform.AARCH64.class);
+            message.append("All AArch64 CPUFeatures: ").append(Arrays.toString(AArch64.CPUFeature.values()));
+            if (arch instanceof AArch64) {
+                message.append(System.lineSeparator()).append("Host machine AArch64 CPUFeatures: ").append(((AArch64) arch).getFeatures().toString());
+            }
+        }
+        System.out.println(message);
     }
 
     /**
@@ -466,8 +673,8 @@ public class NativeImageGeneratorRunner implements ImageBuildTask {
      * @param e error to be reported.
      */
     protected static void reportFatalError(Throwable e) {
-        System.err.print("Fatal error:");
-        e.printStackTrace();
+        System.out.print("Fatal error: ");
+        e.printStackTrace(System.out);
     }
 
     /**
@@ -477,8 +684,8 @@ public class NativeImageGeneratorRunner implements ImageBuildTask {
      * @param msg message to report.
      */
     protected static void reportFatalError(Throwable e, String msg) {
-        System.err.print("Fatal error: " + msg);
-        e.printStackTrace();
+        System.out.print("Fatal error: " + msg);
+        e.printStackTrace(System.out);
     }
 
     /**
@@ -487,7 +694,7 @@ public class NativeImageGeneratorRunner implements ImageBuildTask {
      * @param msg error message that is printed.
      */
     public static void reportUserError(String msg) {
-        System.err.println("Error: " + msg);
+        System.out.println("Error: " + msg);
     }
 
     /**
@@ -497,55 +704,31 @@ public class NativeImageGeneratorRunner implements ImageBuildTask {
      * @param parsedHostedOptions
      */
     public static void reportUserError(Throwable e, OptionValues parsedHostedOptions) {
-        reportUserException(e, parsedHostedOptions, NativeImageGeneratorRunner::reportUserError);
+        reportUserException(e, parsedHostedOptions);
     }
 
-    private static void reportUserException(Throwable e, OptionValues parsedHostedOptions, Consumer<String> report) {
-        if (e instanceof UserException) {
-            UserException ue = (UserException) e;
+    private static void reportUserException(Throwable e, OptionValues parsedHostedOptions) {
+        if (e instanceof UserException ue) {
             for (String message : ue.getMessages()) {
-                report.accept(message);
+                reportUserError(message);
             }
         } else {
-            report.accept(e.getMessage());
+            reportUserError(e.getMessage());
+        }
+        Throwable cause = e.getCause();
+        if (cause != null) {
+            System.out.print("Caused by: ");
+            cause.printStackTrace(System.out);
         }
         if (parsedHostedOptions != null && NativeImageOptions.ReportExceptionStackTraces.getValue(parsedHostedOptions)) {
-            e.printStackTrace();
-        } else {
-            report.accept("Use " + SubstrateOptionsParser.commandArgument(NativeImageOptions.ReportExceptionStackTraces, "+") +
-                            " to print stacktrace of underlying exception");
+            System.out.print("Internal exception: ");
+            e.printStackTrace(System.out);
         }
+        System.out.flush();
     }
 
-    /**
-     * Report an informational message in SVM.
-     *
-     * @param msg message that is printed.
-     */
-    private static void info(String msg) {
-        System.out.println("Info: " + msg);
-    }
-
-    /**
-     * Report a warning message in SVM.
-     *
-     * @param msg warning message that is printed.
-     */
-    private static void warn(String msg) {
-        System.err.println("Warning: " + msg);
-    }
-
-    @Override
-    public int build(String[] args, ImageClassLoader imageClassLoader) {
-        return buildImage(args, imageClassLoader);
-    }
-
-    @Override
-    public void interruptBuild() {
-        final NativeImageGenerator generatorInstance = generator;
-        if (generatorInstance != null) {
-            generatorInstance.interruptBuild();
-        }
+    public int build(ImageClassLoader imageClassLoader) {
+        return buildImage(imageClassLoader);
     }
 
     /**
@@ -558,24 +741,29 @@ public class NativeImageGeneratorRunner implements ImageBuildTask {
     public static class JDK9Plus {
 
         public static void main(String[] args) {
-            ModuleSupport.exportAndOpenAllPackagesToUnnamed("org.graalvm.sdk", false);
-            ModuleSupport.exportAndOpenAllPackagesToUnnamed("org.graalvm.truffle", false);
-            ModuleSupport.exportAndOpenAllPackagesToUnnamed("jdk.internal.vm.ci", false);
-            ModuleSupport.exportAndOpenAllPackagesToUnnamed("jdk.internal.vm.compiler", false);
-            ModuleSupport.exportAndOpenAllPackagesToUnnamed("jdk.internal.vm.compiler.management", true);
-            ModuleSupport.exportAndOpenAllPackagesToUnnamed("com.oracle.graal.graal_enterprise", true);
-            ModuleSupport.exportAndOpenPackageToUnnamed("java.base", "jdk.internal.loader", false);
-            if (JavaVersionUtil.JAVA_SPEC >= 15) {
-                ModuleSupport.exportAndOpenPackageToUnnamed("java.base", "jdk.internal.misc", false);
-            }
-            ModuleSupport.exportAndOpenPackageToUnnamed("java.base", "sun.text.spi", false);
-            ModuleSupport.exportAndOpenPackageToUnnamed("java.base", "jdk.internal.org.objectweb.asm", false);
-            if (JavaVersionUtil.JAVA_SPEC >= 16) {
-                ModuleSupport.exportAndOpenPackageToUnnamed("java.base", "sun.reflect.annotation", false);
-                ModuleSupport.exportAndOpenPackageToUnnamed("java.base", "sun.security.jca", false);
-                ModuleSupport.exportAndOpenPackageToUnnamed("jdk.jdeps", "com.sun.tools.classfile", false);
-            }
+            setModuleAccesses();
             NativeImageGeneratorRunner.main(args);
+        }
+
+        public static void setModuleAccesses() {
+            ModuleSupport.accessPackagesToClass(ModuleSupport.Access.OPEN, null, false, "org.graalvm.word");
+            ModuleSupport.accessPackagesToClass(ModuleSupport.Access.OPEN, null, false, "org.graalvm.nativeimage");
+            ModuleSupport.accessPackagesToClass(ModuleSupport.Access.OPEN, null, false, "org.graalvm.collections");
+            ModuleSupport.accessPackagesToClass(ModuleSupport.Access.OPEN, null, false, "org.graalvm.polyglot");
+            ModuleSupport.accessPackagesToClass(ModuleSupport.Access.OPEN, null, false, "org.graalvm.truffle");
+            ModuleSupport.accessPackagesToClass(ModuleSupport.Access.OPEN, null, false, "jdk.internal.vm.ci");
+            ModuleSupport.accessPackagesToClass(ModuleSupport.Access.OPEN, null, false, "jdk.graal.compiler");
+            ModuleSupport.accessPackagesToClass(ModuleSupport.Access.OPEN, null, true, "jdk.graal.compiler.management");
+            ModuleSupport.accessPackagesToClass(ModuleSupport.Access.OPEN, null, true, "com.oracle.graal.graal_enterprise");
+            ModuleSupport.accessPackagesToClass(ModuleSupport.Access.OPEN, null, false, "java.base", "jdk.internal.loader");
+            ModuleSupport.accessPackagesToClass(ModuleSupport.Access.OPEN, null, false, "java.base", "jdk.internal.misc");
+            ModuleSupport.accessPackagesToClass(ModuleSupport.Access.OPEN, null, false, "java.base", "sun.text.spi");
+            ModuleSupport.accessPackagesToClass(ModuleSupport.Access.OPEN, null, false, "java.base", "sun.reflect.annotation");
+            ModuleSupport.accessPackagesToClass(ModuleSupport.Access.OPEN, null, false, "java.base", "sun.security.jca");
+            ModuleSupport.accessPackagesToClass(ModuleSupport.Access.OPEN, null, false, "jdk.jdeps", "com.sun.tools.classfile");
+            ModuleSupport.accessPackagesToClass(ModuleSupport.Access.OPEN, null, false, "org.graalvm.truffle.runtime");
+            ModuleSupport.accessPackagesToClass(ModuleSupport.Access.OPEN, null, false, "org.graalvm.truffle.compiler");
+            ModuleSupport.accessPackagesToClass(ModuleSupport.Access.OPEN, null, true, "com.oracle.truffle.enterprise");
         }
     }
 }

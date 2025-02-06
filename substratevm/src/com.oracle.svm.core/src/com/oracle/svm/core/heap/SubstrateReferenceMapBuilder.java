@@ -24,9 +24,9 @@
  */
 package com.oracle.svm.core.heap;
 
-import org.graalvm.compiler.core.common.LIRKind;
-import org.graalvm.compiler.lir.LIRFrameState;
-import org.graalvm.compiler.lir.framemap.ReferenceMapBuilder;
+import jdk.graal.compiler.core.common.LIRKind;
+import jdk.graal.compiler.lir.LIRFrameState;
+import jdk.graal.compiler.lir.framemap.ReferenceMapBuilder;
 
 import com.oracle.svm.core.CalleeSavedRegisters;
 import com.oracle.svm.core.util.VMError;
@@ -61,7 +61,7 @@ public class SubstrateReferenceMapBuilder extends ReferenceMapBuilder {
         } else if (ValueUtil.isRegister(value)) {
             Register register = ValueUtil.asRegister(value);
             assert referenceMap.debugMarkRegister(ValueUtil.asRegister(value).number, value);
-            if (CalleeSavedRegisters.supportedByPlatform()) {
+            if (CalleeSavedRegisters.supportedByPlatform() && CalleeSavedRegisters.singleton().calleeSaveable(register)) {
                 offset = CalleeSavedRegisters.singleton().getOffsetInFrame(register);
                 offsetValid = true;
             }

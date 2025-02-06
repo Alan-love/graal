@@ -35,7 +35,6 @@ import java.util.stream.StreamSupport;
 import com.oracle.objectfile.ObjectFile.Element;
 import com.oracle.objectfile.ObjectFile.ProgbitsSectionImpl;
 import com.oracle.objectfile.ObjectFile.RelocationKind;
-import com.oracle.objectfile.ObjectFile.RelocationRecord;
 import com.oracle.objectfile.io.AssemblyBuffer;
 import com.oracle.objectfile.io.OutputAssembler;
 
@@ -59,7 +58,7 @@ public abstract class StringSectionImpl extends BasicElementImpl implements Prog
          */
         StringTable t = new StringTable();
         if (contentProviders == null) {
-            throw new IllegalStateException("no content provider assigned");
+            throw new IllegalStateException("No content provider assigned");
         }
         /*
          * Add the empty string so that we begin with it (i.e. a '\0' byte). DWARF and ELF string
@@ -120,18 +119,18 @@ public abstract class StringSectionImpl extends BasicElementImpl implements Prog
      */
 
     @Override
-    public Element getOrCreateRelocationElement(boolean useImplicitAddend) {
-        throw new UnsupportedOperationException("can't mark relocaction sites in string section");
+    public Element getOrCreateRelocationElement(long addend) {
+        throw new UnsupportedOperationException("Can't mark relocaction sites in string section");
     }
 
     @Override
-    public RelocationRecord markRelocationSite(int offset, RelocationKind k, String symbolName, boolean useImplicitAddend, Long explicitAddend) {
-        throw new UnsupportedOperationException("can't mark relocaction sites in string section");
+    public void markRelocationSite(int offset, RelocationKind k, String symbolName, long addend) {
+        throw new UnsupportedOperationException("Can't mark relocaction sites in string section");
     }
 
     @Override
-    public RelocationRecord markRelocationSite(int offset, ByteBuffer bb, RelocationKind k, String symbolName, boolean useImplicitAddend, Long explicitAddend) {
-        throw new UnsupportedOperationException("can't mark relocaction sites in string section");
+    public void markRelocationSite(int offset, ByteBuffer bb, RelocationKind k, String symbolName, long addend) {
+        throw new UnsupportedOperationException("Can't mark relocaction sites in string section");
     }
 
     @Override

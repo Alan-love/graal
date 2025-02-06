@@ -42,12 +42,13 @@ import org.graalvm.polyglot.Engine;
 import org.graalvm.polyglot.Instrument;
 
 import com.oracle.truffle.api.Option;
+import com.oracle.truffle.api.exception.AbstractTruffleException;
 import com.oracle.truffle.api.instrumentation.SourceSectionFilter;
 import com.oracle.truffle.api.instrumentation.TruffleInstrument;
 import com.oracle.truffle.tools.coverage.CoverageTracker;
 import com.oracle.truffle.tools.coverage.SourceCoverage;
 
-@Registration(id = CoverageInstrument.ID, name = "Code Coverage", version = CoverageInstrument.VERSION, services = CoverageTracker.class)
+@Registration(id = CoverageInstrument.ID, name = "Code Coverage", version = CoverageInstrument.VERSION, services = CoverageTracker.class, website = "https://www.graalvm.org/tools/code-coverage/")
 public class CoverageInstrument extends TruffleInstrument {
 
     public static final String ID = "coverage";
@@ -73,22 +74,22 @@ public class CoverageInstrument extends TruffleInstrument {
     static final OptionKey<Boolean> ENABLED = new OptionKey<>(false);
     @Option(help = "Keep count of each element's coverage (default: false).", category = OptionCategory.USER, stability = OptionStability.STABLE)
     static final OptionKey<Boolean> Count = new OptionKey<>(false);
-    @Option(name = "Output", help = "Can be: human readable 'histogram' (per file coverage summary) or 'detailed' (per line coverage summary), machine readable 'json', tool compliant 'lcov'. (default: histogram)",
-            category = OptionCategory.USER, stability = OptionStability.STABLE)
+    @Option(name = "Output", help = "Can be: human readable 'histogram' (per file coverage summary) or 'detailed' (per line coverage summary), machine readable 'json', tool compliant 'lcov' (default: histogram).",
+            usageSyntax = "histogram|detailed|json|lcov", category = OptionCategory.USER, stability = OptionStability.STABLE)
     static final OptionKey<Output> OUTPUT = new OptionKey<>(Output.HISTOGRAM, CLI_OUTPUT_TYPE);
-    @Option(name = "FilterRootName", help = "Wildcard filter for program roots. (eg. Math.*, default:*).", category = OptionCategory.USER, stability = OptionStability.STABLE)
-    static final OptionKey<Object[]> FILTER_ROOT = new OptionKey<>(new Object[0], WildcardHandler.WILDCARD_FILTER_TYPE);
-    @Option(name = "FilterFile", help = "Wildcard filter for source file paths. (eg. *program*.sl, default:*).", category = OptionCategory.USER, stability = OptionStability.STABLE)
-    static final OptionKey<Object[]> FILTER_FILE = new OptionKey<>(new Object[0], WildcardHandler.WILDCARD_FILTER_TYPE);
-    @Option(name = "FilterMimeType", help = "Only track languages with mime-type. (eg. +, default:no filter).", category = OptionCategory.USER, stability = OptionStability.STABLE)
+    @Option(name = "FilterRootName", help = "Wildcard filter for program roots. (eg. Math.*) (default: no filter)", usageSyntax = "<filter>", category = OptionCategory.USER, stability = OptionStability.STABLE)
+    static final OptionKey<WildcardFilter> FILTER_ROOT = new OptionKey<>(WildcardFilter.DEFAULT, WildcardFilter.WILDCARD_FILTER_TYPE);
+    @Option(name = "FilterFile", help = "Wildcard filter for source file paths. (eg. *program*.sl)  (default: no filter).", usageSyntax = "<filter>", category = OptionCategory.USER, stability = OptionStability.STABLE)
+    static final OptionKey<WildcardFilter> FILTER_FILE = new OptionKey<>(WildcardFilter.DEFAULT, WildcardFilter.WILDCARD_FILTER_TYPE);
+    @Option(name = "FilterMimeType", help = "Only track languages with mime-type. (default: no filter)", usageSyntax = "<mimeType>", category = OptionCategory.USER, stability = OptionStability.STABLE)
     static final OptionKey<String> FILTER_MIME_TYPE = new OptionKey<>("");
-    @Option(name = "FilterLanguage", help = "Only track languages with given ID. (eg. js, default:no filter).", category = OptionCategory.USER, stability = OptionStability.STABLE)
+    @Option(name = "FilterLanguage", help = "Only track languages with given ID. (eg. js) (default: no filter).", usageSyntax = "<languageId>", category = OptionCategory.USER, stability = OptionStability.STABLE)
     static final OptionKey<String> FILTER_LANGUAGE = new OptionKey<>("");
-    @Option(name = "TrackInternal", help = "Track internal elements (default:false).", category = OptionCategory.INTERNAL)
+    @Option(name = "TrackInternal", help = "Track internal elements. (default: false)", category = OptionCategory.INTERNAL)
     static final OptionKey<Boolean> TRACK_INTERNAL = new OptionKey<>(false);
-    @Option(name = "OutputFile", help = "Save output to the given file. Output is printed to standard output stream by default.", category = OptionCategory.USER, stability = OptionStability.STABLE)
+    @Option(name = "OutputFile", help = "Save output to the given file. Output is printed to standard output stream by default.", usageSyntax = "<path>", category = OptionCategory.USER, stability = OptionStability.STABLE)
     static final OptionKey<String> OUTPUT_FILE = new OptionKey<>("");
-    @Option(help = "Consider a source code line covered only if covered in it's entirety. (default: true)", category = OptionCategory.USER, stability = OptionStability.EXPERIMENTAL)
+    @Option(help = "Consider a source code line covered only if covered in it's entirety (default: true)", usageSyntax = "true|false", category = OptionCategory.USER, stability = OptionStability.EXPERIMENTAL)
     static final OptionKey<Boolean> StrictLines = new OptionKey<>(true);
     // @formatter:on
 
@@ -107,6 +108,15 @@ public class CoverageInstrument extends TruffleInstrument {
     private CoverageTracker tracker;
     private Boolean enabled;
 
+    /*
+     * Guest languages could change the working directory of the current process, The JVM assumes
+     * that the working directory does not change. When this assumption is broken relative file
+     * paths no longer work correctly. For this reason we save the absolute path to the output file
+     * at the very start so that we avoid issues of broken relative paths See GR-36526 for more
+     * context.
+     */
+    private String absoluteOutputPath;
+
     public static CoverageTracker getTracker(Engine engine) {
         Instrument instrument = engine.getInstruments().get(ID);
         if (instrument == null) {
@@ -122,38 +132,42 @@ public class CoverageInstrument extends TruffleInstrument {
         CoverageInstrument.factory = factory;
     }
 
-    private static PrintStream chooseOutputStream(TruffleInstrument.Env env, OptionKey<String> option) {
+    protected static PrintStream chooseOutputStream(Env env, String absoluteOutputPath) {
         try {
-            if (option.hasBeenSet(env.getOptions())) {
-                final String outputPath = option.getValue(env.getOptions());
-                final File file = new File(outputPath);
-                if (file.exists()) {
-                    throw new CoverageException("Cannot redirect output to an existing file!");
-                }
+            if (absoluteOutputPath != null) {
+                final File file = new File(absoluteOutputPath);
+                new PrintStream(env.out()).println("Printing output to " + file.getAbsolutePath());
                 return new PrintStream(new FileOutputStream(file));
             } else {
                 return new PrintStream(env.out());
             }
         } catch (FileNotFoundException e) {
-            throw new CoverageException("Cannot redirect output to a directory");
+            throw new AbstractTruffleException() {
+                static final long serialVersionUID = -1;
+
+                @Override
+                public String getMessage() {
+                    return "File IO Exception caught during output printing.";
+                }
+            };
         }
     }
 
     private static SourceSectionFilter getSourceSectionFilter(OptionValues options) {
-        final Object[] filterFile = FILTER_FILE.getValue(options);
+        final WildcardFilter filterFile = FILTER_FILE.getValue(options);
         final String filterMimeType = FILTER_MIME_TYPE.getValue(options);
         final String filterLanguage = FILTER_LANGUAGE.getValue(options);
         final Boolean internals = TRACK_INTERNAL.getValue(options);
         final SourceSectionFilter.Builder builder = SourceSectionFilter.newBuilder();
         builder.sourceIs(source -> {
             boolean internal = (internals || !source.isInternal());
-            boolean file = WildcardHandler.testWildcardExpressions(source.getPath(), filterFile);
+            boolean file = filterFile.testWildcardExpressions(source.getPath());
             boolean mimeType = filterMimeType.equals("") || filterMimeType.equals(source.getMimeType());
             final boolean languageId = filterLanguage.equals("") || filterMimeType.equals(source.getLanguage());
             return internal && file && mimeType && languageId;
         });
-        final Object[] filterRootName = FILTER_ROOT.getValue(options);
-        builder.rootNameIs(s -> WildcardHandler.testWildcardExpressions(s, filterRootName));
+        final WildcardFilter filterRootName = FILTER_ROOT.getValue(options);
+        builder.rootNameIs(filterRootName::testWildcardExpressions);
         return builder.build();
     }
 
@@ -165,31 +179,39 @@ public class CoverageInstrument extends TruffleInstrument {
         enabled = ENABLED.getValue(options);
         if (enabled) {
             tracker.start(new CoverageTracker.Config(getSourceSectionFilter(options), Count.getValue(options)));
+            if (CoverageInstrument.OUTPUT_FILE.hasBeenSet(env.getOptions())) {
+                absoluteOutputPath = new File(CoverageInstrument.OUTPUT_FILE.getValue(env.getOptions())).getAbsolutePath();
+            }
+        }
+    }
+
+    @Override
+    protected void onFinalize(Env env) {
+        if (enabled) {
+            SourceCoverage[] coverage = tracker.getCoverage();
+            final OptionValues options = env.getOptions();
+            final boolean strictLines = StrictLines.getValue(options);
+            PrintStream out = chooseOutputStream(env, absoluteOutputPath);
+            switch (OUTPUT.getValue(options)) {
+                case HISTOGRAM:
+                    new CoverageCLI(out, coverage, strictLines).printHistogramOutput();
+                    break;
+                case DETAILED:
+                    new CoverageCLI(out, coverage, strictLines).printLinesOutput();
+                    break;
+                case JSON:
+                    new JSONPrinter(out, coverage).print();
+                    break;
+                case LCOV:
+                    new LCOVPrinter(out, coverage, strictLines).print();
+                    break;
+            }
         }
     }
 
     @Override
     protected void onDispose(Env env) {
         if (enabled) {
-            SourceCoverage[] coverage = tracker.getCoverage();
-            final OptionValues options = env.getOptions();
-            final boolean strictLines = StrictLines.getValue(options);
-            try (PrintStream out = chooseOutputStream(env, OUTPUT_FILE)) {
-                switch (OUTPUT.getValue(options)) {
-                    case HISTOGRAM:
-                        new CoverageCLI(out, coverage, strictLines).printHistogramOutput();
-                        break;
-                    case DETAILED:
-                        new CoverageCLI(out, coverage, strictLines).printLinesOutput();
-                        break;
-                    case JSON:
-                        new JSONPrinter(out, coverage).print();
-                        break;
-                    case LCOV:
-                        new LCOVPrinter(out, coverage, strictLines).print();
-                        break;
-                }
-            }
             tracker.close();
         }
     }
@@ -203,7 +225,12 @@ public class CoverageInstrument extends TruffleInstrument {
         HISTOGRAM,
         DETAILED,
         JSON,
-        LCOV,
+        LCOV;
+
+        @Override
+        public String toString() {
+            return this.name().toLowerCase();
+        }
     }
 
 }

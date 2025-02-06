@@ -24,35 +24,39 @@
  */
 package com.oracle.svm.core.graal.nodes;
 
-import org.graalvm.compiler.core.common.type.StampFactory;
-import org.graalvm.compiler.graph.NodeClass;
-import org.graalvm.compiler.nodeinfo.InputType;
-import org.graalvm.compiler.nodeinfo.NodeCycles;
-import org.graalvm.compiler.nodeinfo.NodeInfo;
-import org.graalvm.compiler.nodeinfo.NodeSize;
-import org.graalvm.compiler.nodes.AbstractStateSplit;
-import org.graalvm.compiler.nodes.debug.ControlFlowAnchored;
-import org.graalvm.compiler.nodes.spi.LIRLowerable;
-import org.graalvm.compiler.nodes.spi.NodeLIRBuilderTool;
+import jdk.graal.compiler.core.common.type.StampFactory;
+import jdk.graal.compiler.graph.NodeClass;
+import jdk.graal.compiler.nodeinfo.InputType;
+import jdk.graal.compiler.nodeinfo.NodeCycles;
+import jdk.graal.compiler.nodeinfo.NodeInfo;
+import jdk.graal.compiler.nodeinfo.NodeSize;
+import jdk.graal.compiler.nodes.AbstractStateSplit;
+import jdk.graal.compiler.nodes.spi.NodeLIRBuilderTool;
 
 /**
  * The anchor for DeoptProxyNode when no full {@link DeoptEntryNode deoptimization entry} is
  * required.
  */
 @NodeInfo(allowedUsageTypes = InputType.Anchor, cycles = NodeCycles.CYCLES_0, size = NodeSize.SIZE_0)
-public class DeoptProxyAnchorNode extends AbstractStateSplit implements LIRLowerable, ControlFlowAnchored {
+public class DeoptProxyAnchorNode extends AbstractStateSplit implements DeoptEntrySupport {
     public static final NodeClass<DeoptProxyAnchorNode> TYPE = NodeClass.create(DeoptProxyAnchorNode.class);
 
-    public DeoptProxyAnchorNode() {
-        this(TYPE);
-    }
+    private final int proxifiedInvokeBci;
 
-    protected DeoptProxyAnchorNode(NodeClass<? extends DeoptProxyAnchorNode> c) {
-        super(c, StampFactory.forVoid());
+    public DeoptProxyAnchorNode(int proxifiedInvokeBci) {
+        super(TYPE, StampFactory.forVoid());
+        assert proxifiedInvokeBci >= 0 : "DeoptProxyAnchorNode should be proxing an invoke";
+
+        this.proxifiedInvokeBci = proxifiedInvokeBci;
     }
 
     @Override
     public void generate(NodeLIRBuilderTool gen) {
         /* No-op */
+    }
+
+    @Override
+    public int getProxifiedInvokeBci() {
+        return proxifiedInvokeBci;
     }
 }

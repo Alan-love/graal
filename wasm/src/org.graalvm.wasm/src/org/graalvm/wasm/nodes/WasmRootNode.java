@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2019, 2025, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -40,196 +40,107 @@
  */
 package org.graalvm.wasm.nodes;
 
-import com.oracle.truffle.api.CompilerDirectives;
-import com.oracle.truffle.api.CompilerDirectives.CompilationFinal;
-import com.oracle.truffle.api.TruffleLanguage;
-import com.oracle.truffle.api.TruffleLanguage.ContextReference;
-import com.oracle.truffle.api.frame.VirtualFrame;
-import com.oracle.truffle.api.nodes.ExplodeLoop;
-import com.oracle.truffle.api.nodes.NodeInfo;
-import com.oracle.truffle.api.nodes.RootNode;
-import org.graalvm.wasm.WasmCodeEntry;
+import org.graalvm.wasm.WasmArguments;
 import org.graalvm.wasm.WasmContext;
 import org.graalvm.wasm.WasmInstance;
 import org.graalvm.wasm.WasmLanguage;
-import org.graalvm.wasm.WasmType;
-import org.graalvm.wasm.WasmVoidResult;
-import org.graalvm.wasm.exception.Failure;
-import org.graalvm.wasm.exception.WasmException;
+import org.graalvm.wasm.WasmModule;
 
-@NodeInfo(language = "wasm", description = "The root node of all WebAssembly functions")
-public class WasmRootNode extends RootNode implements WasmNodeInterface {
+import com.oracle.truffle.api.CompilerAsserts;
+import com.oracle.truffle.api.CompilerDirectives.CompilationFinal;
+import com.oracle.truffle.api.TruffleLanguage;
+import com.oracle.truffle.api.frame.Frame;
+import com.oracle.truffle.api.frame.FrameDescriptor;
+import com.oracle.truffle.api.frame.VirtualFrame;
+import com.oracle.truffle.api.nodes.Node;
+import com.oracle.truffle.api.nodes.NodeInfo;
+import com.oracle.truffle.api.nodes.RootNode;
+import com.oracle.truffle.api.profiles.BranchProfile;
 
-    protected final WasmInstance instance;
-    private final WasmCodeEntry codeEntry;
-    @CompilationFinal private ContextReference<WasmContext> rawContextReference;
-    @Child private WasmNode body;
+@NodeInfo(language = WasmLanguage.ID, description = "The root node of all WebAssembly functions")
+public abstract class WasmRootNode extends RootNode {
 
-    public WasmRootNode(TruffleLanguage<?> language, WasmInstance instance, WasmCodeEntry codeEntry) {
-        super(language);
-        this.instance = instance;
-        this.codeEntry = codeEntry;
-        this.body = null;
+    private final WasmModule module;
+
+    private final BranchProfile nonLinkedProfile = BranchProfile.create();
+    /** Bound module instance (single-context mode only). */
+    @CompilationFinal private WasmInstance boundInstance;
+
+    public WasmRootNode(TruffleLanguage<?> language, FrameDescriptor frameDescriptor, WasmModule module) {
+        super(language, frameDescriptor);
+        this.module = module;
     }
 
-    protected ContextReference<WasmContext> contextReference() {
-        if (rawContextReference == null) {
-            CompilerDirectives.transferToInterpreterAndInvalidate();
-            rawContextReference = lookupContextReference(WasmLanguage.class);
+    protected final WasmContext getContext() {
+        return WasmContext.get(this);
+    }
+
+    protected WasmModule module() {
+        return module;
+    }
+
+    @SuppressWarnings("static-method")
+    public final void tryInitialize(WasmContext context, WasmInstance instance) {
+        // We want to ensure that linking always precedes the running of the WebAssembly code.
+        // This linking should be as late as possible, because a WebAssembly context should
+        // be able to parse multiple modules before the code gets run.
+        if (!instance.isLinkCompleted()) {
+            nonLinkedProfile.enter();
+            context.linker().tryLink(instance);
         }
-        return rawContextReference;
     }
 
-    public void setBody(WasmNode body) {
-        this.body = insert(body);
+    @Override
+    protected int findBytecodeIndex(Node node, Frame frame) {
+        if (node == null) {
+            // uncached wasm calls without location may happen
+            return -1;
+        }
+        if (node instanceof WasmCallNode n) {
+            // cached wasm call with location may happen
+            return n.getBytecodeOffset();
+        } else {
+            // for wasm exceptions we might be able to get the stack trace
+            return -1;
+        }
+    }
+
+    protected final WasmInstance instance(VirtualFrame frame) {
+        WasmInstance instance = boundInstance;
+        if (instance == null) {
+            instance = WasmArguments.getModuleInstance(frame.getArguments());
+        } else {
+            CompilerAsserts.partialEvaluationConstant(instance);
+            assert instance == WasmArguments.getModuleInstance(frame.getArguments());
+        }
+        assert instance == WasmContext.get(this).lookupModuleInstance(module());
+        return instance;
+    }
+
+    public final void setBoundModuleInstance(WasmInstance boundInstance) {
+        CompilerAsserts.neverPartOfCompilation();
+        assert this.boundInstance == null;
+        this.boundInstance = boundInstance;
+    }
+
+    @Override
+    public Object execute(VirtualFrame frame) {
+        assert WasmArguments.isValid(frame.getArguments());
+        final WasmContext context = getContext();
+        final WasmInstance instance = instance(frame);
+        tryInitialize(context, instance);
+        return executeWithContext(frame, context, instance);
+    }
+
+    public abstract Object executeWithContext(VirtualFrame frame, WasmContext context, WasmInstance instance);
+
+    @Override
+    public final String toString() {
+        return getName();
     }
 
     @Override
     protected boolean isInstrumentable() {
         return false;
-    }
-
-    public void tryInitialize(WasmContext context) {
-        // We want to ensure that linking always precedes the running of the WebAssembly code.
-        // This linking should be as late as possible, because a WebAssembly context should
-        // be able to parse multiple modules before the code gets run.
-        context.linker().tryLink(instance);
-    }
-
-    @Override
-    public final Object execute(VirtualFrame frame) {
-        final WasmContext context = contextReference().get();
-        tryInitialize(context);
-        return executeWithContext(frame, context);
-    }
-
-    public Object executeWithContext(VirtualFrame frame, WasmContext context) {
-        // WebAssembly structure dictates that a function's arguments are provided to the function
-        // as local variables, followed by any additional local variables that the function
-        // declares. A VirtualFrame contains a special array for the arguments, so we need to move
-        // the arguments to the array that holds the locals.
-        //
-        // The operand stack is also represented in the same long array.
-        //
-        // This combined array is kept inside a frame slot.
-        // The reason for this is that the operand stack cannot be passed
-        // as an argument to the loop-node's execute method,
-        // and must be restored at the beginning of the loop body.
-        final int maxStackSize = codeEntry.maxStackSize();
-        final int numLocals = body.codeEntry().numLocals();
-        long[] stacklocals = new long[numLocals + maxStackSize];
-        frame.setObject(codeEntry.stackLocalsSlot(), stacklocals);
-        moveArgumentsToLocals(frame, stacklocals);
-
-        // WebAssembly rules dictate that a function's locals must be initialized to zero before
-        // function invocation. For more information, check the specification:
-        // https://webassembly.github.io/spec/core/exec/instructions.html#function-calls
-        initializeLocals(stacklocals);
-
-        try {
-            body.execute(context, frame, stacklocals);
-        } catch (StackOverflowError e) {
-            throw WasmException.create(Failure.CALL_STACK_EXHAUSTED);
-        }
-
-        switch (body.returnTypeId()) {
-            case 0x00:
-            case WasmType.VOID_TYPE: {
-                return WasmVoidResult.getInstance();
-            }
-            case WasmType.I32_TYPE: {
-                long returnValue = pop(stacklocals, numLocals);
-                assert returnValue >>> 32 == 0;
-                return (int) returnValue;
-            }
-            case WasmType.I64_TYPE: {
-                long returnValue = pop(stacklocals, numLocals);
-                return returnValue;
-            }
-            case WasmType.F32_TYPE: {
-                long returnValue = pop(stacklocals, numLocals);
-                assert returnValue >>> 32 == 0;
-                return Float.intBitsToFloat((int) returnValue);
-            }
-            case WasmType.F64_TYPE: {
-                long returnValue = pop(stacklocals, numLocals);
-                return Double.longBitsToDouble(returnValue);
-            }
-            default:
-                throw WasmException.format(Failure.UNSPECIFIED_INTERNAL, this, "Unknown return type id: %d", body.returnTypeId());
-        }
-    }
-
-    @ExplodeLoop
-    private void moveArgumentsToLocals(VirtualFrame frame, long[] stacklocals) {
-        Object[] args = frame.getArguments();
-        int numArgs = body.instance().symbolTable().function(codeEntry().functionIndex()).numArguments();
-        assert args.length == numArgs : "Expected number of arguments " + numArgs + ", actual " + args.length;
-        for (int i = 0; i != numArgs; ++i) {
-            final Object arg = args[i];
-            byte type = body.codeEntry().localType(i);
-            switch (type) {
-                case WasmType.I32_TYPE:
-                    pushInt(stacklocals, i, (int) arg);
-                    break;
-                case WasmType.I64_TYPE:
-                    push(stacklocals, i, (long) arg);
-                    break;
-                case WasmType.F32_TYPE:
-                    pushFloat(stacklocals, i, (float) arg);
-                    break;
-                case WasmType.F64_TYPE:
-                    pushDouble(stacklocals, i, (double) arg);
-                    break;
-            }
-        }
-    }
-
-    @ExplodeLoop
-    private void initializeLocals(long[] stacklocals) {
-        int numArgs = body.instance().symbolTable().function(codeEntry().functionIndex()).numArguments();
-        for (int i = numArgs; i != body.codeEntry().numLocals(); ++i) {
-            byte type = body.codeEntry().localType(i);
-            switch (type) {
-                case WasmType.I32_TYPE:
-                    // Already set to 0 at allocation.
-                    break;
-                case WasmType.I64_TYPE:
-                    // Already set to 0 at allocation.
-                    break;
-                case WasmType.F32_TYPE:
-                    stacklocals[i] = Float.floatToRawIntBits(0.0f);
-                    break;
-                case WasmType.F64_TYPE:
-                    stacklocals[i] = Double.doubleToRawLongBits(0.0);
-                    break;
-            }
-        }
-    }
-
-    @Override
-    public WasmCodeEntry codeEntry() {
-        return codeEntry;
-    }
-
-    @Override
-    public String toString() {
-        return getName();
-    }
-
-    @Override
-    public String getName() {
-        if (codeEntry == null) {
-            return "function";
-        }
-        return codeEntry.function().name();
-    }
-
-    @Override
-    public String getQualifiedName() {
-        if (codeEntry == null) {
-            return getName();
-        }
-        return codeEntry.function().moduleName() + "." + getName();
     }
 }

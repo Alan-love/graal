@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -47,20 +47,24 @@ import com.oracle.truffle.regex.tregex.util.json.Json;
 import com.oracle.truffle.regex.tregex.util.json.JsonObject;
 
 /**
- * A common supertype to the root node and look-ahead and look-behind assertions. Every AST subtree
- * contains a {@link Group} which contains the syntactic subtree, as well as a {@link MatchFound}
- * node, which is needed for NFA-like traversal of the AST, see
+ * A common supertype to the root node, lookahead and lookbehind assertions and atomic groups. Every
+ * AST subtree contains a {@link Group} which contains the syntactic subtree, as well as a
+ * {@link MatchFound} node, which is needed for NFA-like traversal of the AST, see
  * {@link com.oracle.truffle.regex.tregex.parser.ast.visitors.NFATraversalRegexASTVisitor}.
  */
 public abstract class RegexASTSubtreeRootNode extends Term implements RegexASTVisitorIterable {
 
+    private int globalSubTreeId = -1;
     private int subTreeId = -1;
     private Group group;
     private PositionAssertion anchoredInitialState;
     private MatchFound unAnchoredInitialState;
     private PositionAssertion anchoredFinalState;
     private MatchFound matchFound;
+    private MatchFound matchFoundChecked;
     private boolean visitorGroupVisited = false;
+
+    private final SubTreeIndex subtrees = new SubTreeIndex();
 
     RegexASTSubtreeRootNode() {
     }
@@ -81,6 +85,27 @@ public abstract class RegexASTSubtreeRootNode extends Term implements RegexASTVi
         setGroup(copy.group.copyRecursive(ast, compilationBuffer));
     }
 
+    @Override
+    public void markAsDead() {
+        super.markAsDead();
+        anchoredInitialState.markAsDead();
+        unAnchoredInitialState.markAsDead();
+        anchoredFinalState.markAsDead();
+        matchFound.markAsDead();
+    }
+
+    public boolean globalSubTreeIdInitialized() {
+        return globalSubTreeId >= 0;
+    }
+
+    public int getGlobalSubTreeId() {
+        return globalSubTreeId;
+    }
+
+    public void setGlobalSubTreeId(int globalSubTreeId) {
+        this.globalSubTreeId = globalSubTreeId;
+    }
+
     public boolean subTreeIdInitialized() {
         return subTreeId >= 0;
     }
@@ -91,6 +116,10 @@ public abstract class RegexASTSubtreeRootNode extends Term implements RegexASTVi
 
     public void setSubTreeId(int subTreeId) {
         this.subTreeId = subTreeId;
+    }
+
+    public SubTreeIndex getSubtrees() {
+        return subtrees;
     }
 
     @Override
@@ -118,6 +147,12 @@ public abstract class RegexASTSubtreeRootNode extends Term implements RegexASTVi
         if (unAnchoredInitialState != null) {
             unAnchoredInitialState.setNext(group);
         }
+        if (anchoredFinalState != null) {
+            anchoredFinalState.setNext(group);
+        }
+        if (matchFound != null) {
+            matchFound.setNext(group);
+        }
     }
 
     /**
@@ -130,6 +165,7 @@ public abstract class RegexASTSubtreeRootNode extends Term implements RegexASTVi
     public void setMatchFound(MatchFound matchFound) {
         this.matchFound = matchFound;
         matchFound.setParent(this);
+        matchFound.setNext(group);
     }
 
     public Term getAnchoredInitialState() {
@@ -159,6 +195,11 @@ public abstract class RegexASTSubtreeRootNode extends Term implements RegexASTVi
     public void setAnchoredFinalState(PositionAssertion anchoredFinalState) {
         this.anchoredFinalState = anchoredFinalState;
         anchoredFinalState.setParent(this);
+        anchoredFinalState.setNext(group);
+    }
+
+    public boolean isFixedWidth() {
+        return getGroup().getMinPath() == getGroup().getMaxPath();
     }
 
     @Override
@@ -189,5 +230,14 @@ public abstract class RegexASTSubtreeRootNode extends Term implements RegexASTVi
     @Override
     protected JsonObject toJson(String typeName) {
         return super.toJson(typeName).append(Json.prop("group", astNodeId(group)));
+    }
+
+    public void setMatchFoundChecked(MatchFound matchFoundChecked) {
+        this.matchFoundChecked = matchFoundChecked;
+    }
+
+    public MatchFound getMatchFoundChecked() {
+        assert matchFoundChecked != null;
+        return matchFoundChecked;
     }
 }

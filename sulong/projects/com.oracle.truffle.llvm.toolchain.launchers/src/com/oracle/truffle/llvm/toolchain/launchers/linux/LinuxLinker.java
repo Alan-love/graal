@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, 2019, Oracle and/or its affiliates.
+ * Copyright (c) 2019, 2023, Oracle and/or its affiliates.
  *
  * All rights reserved.
  *
@@ -38,14 +38,15 @@ import java.util.List;
 
 public final class LinuxLinker extends Driver {
 
-    public static final String LLD = "ld.lld";
+    public static final String LLD = "lld";
+    public static final String LD_LLD = "ld.lld";
 
     private LinuxLinker() {
-        super(LLD);
+        super(LD_LLD);
     }
 
     public static List<String> getLinkerFlags() {
-        return Arrays.asList("--mllvm=-lto-embed-bitcode", "--lto-O0");
+        return Arrays.asList("--mllvm=-lto-embed-bitcode=optimized", "--lto-O0");
     }
 
     public static void link(String[] args) {

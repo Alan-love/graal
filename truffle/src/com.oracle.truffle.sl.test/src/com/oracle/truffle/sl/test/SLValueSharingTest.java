@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2020, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -40,26 +40,23 @@
  */
 package com.oracle.truffle.sl.test;
 
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertTrue;
+
 import org.graalvm.polyglot.Context;
-import org.graalvm.polyglot.PolyglotException;
 import org.graalvm.polyglot.Value;
-import org.junit.Assert;
 import org.junit.Test;
 
-public class SLValueSharingTest {
+public class SLValueSharingTest extends AbstractSLTest {
 
     public static class JavaObject {
         public Object sharedField;
     }
 
-    /*
-     * Tests that if a language tries to share a value through host interop it fails with an error
-     * that shows the location in the guest code.
-     */
     @Test
     public void testImplicitValueSharing() {
         JavaObject obj = new JavaObject();
-        Context.Builder b = Context.newBuilder().allowAllAccess(true);
+        Context.Builder b = newContextBuilder().allowAllAccess(true);
         try (Context c0 = b.build();
                         Context c1 = b.build()) {
 
@@ -68,14 +65,11 @@ public class SLValueSharingTest {
 
             c0.getBindings("sl").getMember("test").execute(obj);
             Value test1 = c1.getBindings("sl").getMember("test");
-            try {
-                test1.execute(obj);
-                Assert.fail();
-            } catch (PolyglotException e) {
-                Assert.assertEquals(28, e.getSourceLocation().getCharIndex());
-                Assert.assertEquals(43, e.getSourceLocation().getCharEndIndex());
-                Assert.assertTrue(e.getMessage(), e.getMessage().contains("cannot be passed from one context to another"));
-            }
+
+            Value v = test1.execute(obj);
+
+            assertTrue(v.hasMembers());
+            assertEquals(v, c1.asValue(obj.sharedField));
         }
 
     }

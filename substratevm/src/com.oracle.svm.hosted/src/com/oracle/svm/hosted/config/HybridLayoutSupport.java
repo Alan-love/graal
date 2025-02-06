@@ -26,63 +26,67 @@ package com.oracle.svm.hosted.config;
 
 import java.lang.reflect.Modifier;
 
-import org.graalvm.collections.Pair;
+import org.graalvm.nativeimage.ImageSingletons;
 
-import com.oracle.svm.core.annotate.Hybrid;
+import com.oracle.svm.core.hub.Hybrid;
 import com.oracle.svm.hosted.meta.HostedField;
 import com.oracle.svm.hosted.meta.HostedInstanceClass;
 import com.oracle.svm.hosted.meta.HostedType;
 
+import jdk.graal.compiler.api.replacements.Fold;
+import jdk.vm.ci.meta.MetaAccessProvider;
+import jdk.vm.ci.meta.ResolvedJavaType;
+
 public class HybridLayoutSupport {
-    public boolean isHybrid(HostedType clazz) {
+    @Fold
+    public static HybridLayoutSupport singleton() {
+        return ImageSingletons.lookup(HybridLayoutSupport.class);
+    }
+
+    public boolean isHybrid(ResolvedJavaType clazz) {
         return clazz.isAnnotationPresent(Hybrid.class);
     }
 
+    @SuppressWarnings("unused")
     public boolean isHybridField(HostedField field) {
-        return field.getAnnotation(Hybrid.Array.class) != null || field.getAnnotation(Hybrid.TypeIDSlots.class) != null;
-    }
-
-    public boolean canHybridFieldsBeDuplicated(HostedType clazz) {
-        assert isHybrid(clazz) : "Can only be called on hybrid types";
-        return clazz.getAnnotation(Hybrid.class).canHybridFieldsBeDuplicated();
+        return false;
     }
 
     /**
-     * Finds the hybrid array and bitset fields of a class annotated with {@link Hybrid}.
+     * If {@code true}, allow the data in the hybrid fields to be duplicated between the hybrid
+     * object and a separate object for the array. For image heap objects, a duplication can occur
+     * if inlining and constant folding result in the internal reference to a hybrid field being
+     * folded to a constant value, which must be written into the image heap separately from the
+     * hybrid object.
      *
-     * @param hybridClass A class annotated with {@link Hybrid}
-     * @return A {@link Pair} containing the (non-null) hybrid array field in the left position, and
-     *         the (nullable) hybrid bitset field in the right position.
+     * If {@code false}, a duplication of the hybrid fields must never happen.
      */
-    public HybridFields findHybridFields(HostedInstanceClass hybridClass) {
-        assert hybridClass.getAnnotation(Hybrid.class) != null;
-        assert Modifier.isFinal(hybridClass.getModifiers());
-
-        HostedField foundArrayField = null;
-        HostedField foundTypeIDSlotsField = null;
-        for (HostedField field : hybridClass.getInstanceFields(true)) {
-            if (field.getAnnotation(Hybrid.Array.class) != null) {
-                assert foundArrayField == null : "must have exactly one hybrid array field";
-                assert field.getType().isArray();
-                foundArrayField = field;
-            }
-            if (field.getAnnotation(Hybrid.TypeIDSlots.class) != null) {
-                assert foundTypeIDSlotsField == null : "must have at most one typeid slot field";
-                assert field.getType().isArray();
-                foundTypeIDSlotsField = field;
-            }
-        }
-        assert foundArrayField != null : "must have exactly one hybrid array field";
-        return new HybridFields(foundArrayField, foundTypeIDSlotsField);
+    public boolean canHybridFieldsBeDuplicated(HostedType clazz) {
+        assert isHybrid(clazz) : "Can only be called on hybrid types";
+        return false;
     }
 
-    public static class HybridFields {
-        public final HostedField arrayField;
-        public final HostedField typeIDSlotsField;
+    public boolean canInstantiateAsInstance(HostedType clazz) {
+        assert isHybrid(clazz) : "Can only be called on hybrid types";
+        return false;
+    }
 
-        public HybridFields(HostedField arrayField, HostedField typeIDSlotsField) {
+    /** Determines characteristics of a hybrid class. */
+    protected HybridInfo inspectHybrid(HostedInstanceClass hybridClass, MetaAccessProvider metaAccess) {
+        assert Modifier.isFinal(hybridClass.getModifiers()) : "Hybrid class must be final " + hybridClass;
+
+        Class<?> componentType = hybridClass.getAnnotation(Hybrid.class).componentType();
+        assert componentType != void.class : "@Hybrid.componentType cannot be void";
+        return new HybridInfo((HostedType) metaAccess.lookupJavaType(componentType), null);
+    }
+
+    public static class HybridInfo {
+        public final HostedType arrayComponentType;
+        public final HostedField arrayField;
+
+        public HybridInfo(HostedType arrayComponentType, HostedField arrayField) {
+            this.arrayComponentType = arrayComponentType;
             this.arrayField = arrayField;
-            this.typeIDSlotsField = typeIDSlotsField;
         }
     }
 }

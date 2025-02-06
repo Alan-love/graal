@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2016, 2020, Oracle and/or its affiliates.
+ * Copyright (c) 2016, 2024, Oracle and/or its affiliates.
  *
  * All rights reserved.
  *
@@ -31,8 +31,12 @@ package com.oracle.truffle.llvm.runtime.nodes.intrinsics.llvm;
 
 import com.oracle.truffle.api.dsl.NodeChild;
 import com.oracle.truffle.api.dsl.Specialization;
+import com.oracle.truffle.api.frame.VirtualFrame;
+import com.oracle.truffle.llvm.runtime.NodeFactory;
+import com.oracle.truffle.llvm.runtime.except.LLVMParserException;
 import com.oracle.truffle.llvm.runtime.memory.LLVMMemMoveNode;
 import com.oracle.truffle.llvm.runtime.nodes.api.LLVMExpressionNode;
+import com.oracle.truffle.llvm.runtime.nodes.memory.move.LLVMPrimitiveMoveNode;
 import com.oracle.truffle.llvm.runtime.pointer.LLVMPointer;
 
 public abstract class LLVMMemMove {
@@ -49,6 +53,22 @@ public abstract class LLVMMemMove {
             this.memMove = memMove;
         }
 
+        public static LLVMExpressionNode createIntrinsic(LLVMExpressionNode[] args, LLVMMemMoveNode memMove, NodeFactory nodeFactory) {
+            LLVMExpressionNode serialMovesReplacement = LLVMPrimitiveMoveNode.createSerialMoves(args, nodeFactory, memMove);
+            if (serialMovesReplacement != null) {
+                return serialMovesReplacement;
+            }
+
+            if (args.length == 6) {
+                return LLVMMemMoveFactory.LLVMMemMoveI64NodeGen.create(memMove, args[1], args[2], args[3], args[5]);
+            } else if (args.length == 5) {
+                // LLVM 7 drops the alignment argument
+                return LLVMMemMoveFactory.LLVMMemMoveI64NodeGen.create(memMove, args[1], args[2], args[3], args[4]);
+            } else {
+                throw new LLVMParserException("Illegal number of arguments to @llvm.memmove.*: " + args.length);
+            }
+        }
+
         /**
          * @param dest @NodeChild
          * @param source @NodeChild
@@ -57,8 +77,8 @@ public abstract class LLVMMemMove {
          * @see LLVMMemMoveI64
          */
         @Specialization
-        protected Object doVoid(LLVMPointer dest, LLVMPointer source, long length, boolean isVolatile) {
-            memMove.executeWithTarget(dest, source, length);
+        protected Object doVoid(VirtualFrame frame, LLVMPointer dest, LLVMPointer source, long length, boolean isVolatile) {
+            memMove.executeWithTarget(frame, dest, source, length);
             return null;
         }
     }

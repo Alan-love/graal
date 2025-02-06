@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012, 2018, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2012, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -123,7 +123,7 @@ public class SpecializationFallthroughTest {
                         });
     }
 
-    /* TODO assert falltrough do1 before do2 */
+    /* TODO GR-38632 assert falltrough do1 before do2 */
     @NodeChildren({@NodeChild("a")})
     static class FallthroughTest1 extends ValueNode {
 

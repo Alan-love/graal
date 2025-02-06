@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2020, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -40,15 +40,20 @@
  */
 package com.oracle.truffle.sl.test;
 
+import static com.oracle.truffle.tck.DebuggerTester.getSourceImpl;
 import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
-import org.junit.After;
-import org.junit.Before;
-import org.junit.Test;
 
 import java.util.function.Function;
+
+import org.graalvm.polyglot.Source;
+import org.graalvm.polyglot.Value;
+import org.junit.After;
+import org.junit.Before;
+import org.junit.BeforeClass;
+import org.junit.Test;
 
 import com.oracle.truffle.api.debug.Breakpoint;
 import com.oracle.truffle.api.debug.DebugException;
@@ -57,22 +62,22 @@ import com.oracle.truffle.api.debug.DebugStackTraceElement;
 import com.oracle.truffle.api.debug.DebuggerSession;
 import com.oracle.truffle.api.debug.SuspendedEvent;
 import com.oracle.truffle.tck.DebuggerTester;
-import static com.oracle.truffle.tck.DebuggerTester.getSourceImpl;
-
-import org.graalvm.polyglot.Context;
-import org.graalvm.polyglot.Source;
-import org.graalvm.polyglot.Value;
 
 /**
  * Test of host interop in debugger: {@link DebuggerSession#setShowHostStackFrames(boolean)}.
  */
-public class SLJavaInteropDebugTest {
+public class SLJavaInteropDebugTest extends AbstractSLTest {
+
+    @BeforeClass
+    public static void runWithWeakEncapsulationOnly() {
+        TruffleTestAssumptions.assumeWeakEncapsulation();
+    }
 
     private DebuggerTester tester;
 
     @Before
     public void before() {
-        tester = new DebuggerTester(Context.newBuilder().allowAllAccess(true));
+        tester = new DebuggerTester(newContextBuilder().allowAllAccess(true));
     }
 
     @After
@@ -231,7 +236,7 @@ public class SLJavaInteropDebugTest {
                 assertEquals(frameInfo[frameInfoIndex], element.getName());
                 Integer line = (Integer) frameInfo[frameInfoIndex + 2];
                 if (line != null && frameInfoIndex > 0) {
-                    assertEquals((int) line, element.getSourceSection().getStartLine());
+                    assertEquals("Invalid line in stack trace at index " + frameInfoIndex + ".", (int) line, element.getSourceSection().getStartLine());
                 } else {
                     assertNull(element.getSourceSection());
                 }

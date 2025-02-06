@@ -27,7 +27,7 @@ package com.oracle.svm.core.genscavenge;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
 
-import com.oracle.svm.core.annotate.Uninterruptible;
+import com.oracle.svm.core.Uninterruptible;
 import com.oracle.svm.core.code.CodeInfo;
 import com.oracle.svm.core.heap.RuntimeCodeInfoGCSupport;
 
@@ -57,18 +57,6 @@ public class RuntimeCodeInfoGCSupportImpl extends RuntimeCodeInfoGCSupport {
     @Override
     @Uninterruptible(reason = "Called when installing code.", callerMustBe = true)
     public void registerDeoptMetadata(CodeInfo codeInfo) {
-        // nothing to do (see above)
-    }
-
-    @Override
-    @Uninterruptible(reason = "Called when freeing code.", callerMustBe = true)
-    public void unregisterCodeConstants(CodeInfo codeInfo) {
-        // nothing to do (see above)
-    }
-
-    @Override
-    @Uninterruptible(reason = "Called when freeing code.", callerMustBe = true)
-    public void unregisterRuntimeCodeInfo(CodeInfo codeInfo) {
         // nothing to do (see above)
     }
 }

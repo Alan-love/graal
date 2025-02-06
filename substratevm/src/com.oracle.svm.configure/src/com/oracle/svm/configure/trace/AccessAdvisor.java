@@ -24,77 +24,117 @@
  */
 package com.oracle.svm.configure.trace;
 
-import org.graalvm.compiler.phases.common.LazyValue;
+import java.util.Set;
+import java.util.regex.Pattern;
 
-import com.oracle.svm.configure.filters.RuleNode;
+import com.oracle.svm.configure.filters.ConfigurationFilter;
+import com.oracle.svm.configure.filters.HierarchyFilterNode;
+
+import jdk.graal.compiler.java.LambdaUtils;
+import jdk.graal.compiler.phases.common.LazyValue;
 
 /**
  * Decides if a recorded access should be included in a configuration. Also advises the agent's
  * {@code AccessVerifier} classes which accesses to ignore when the agent is in restriction mode.
  */
 public final class AccessAdvisor {
+    /**
+     * {@link java.lang.reflect.Proxy} generated classes can be put in arbitrary packages depending
+     * on the visibility and module of the interfaces they implement, so we can only match against
+     * their class name using this pattern (which we hope isn't used by anything else).
+     */
+    public static final Pattern PROXY_CLASS_NAME_PATTERN = Pattern.compile("^(.+[/.])?\\$Proxy[0-9]+$");
 
     /** Filter to ignore accesses that <em>originate in</em> methods of these internal classes. */
-    private static final RuleNode internalCallerFilter;
+    private static final HierarchyFilterNode internalCallerFilter;
 
     /** Filter to unconditionally ignore <em>accesses of</em> these classes and their members. */
-    private static final RuleNode internalAccessFilter;
+    private static final HierarchyFilterNode internalAccessFilter;
 
     /**
      * Filter to ignore <em>accesses of</em> these classes and their members when the caller
      * (accessing class) is unknown. Used in addition to {@link #accessFilter}, not instead.
      */
-    private static final RuleNode accessWithoutCallerFilter;
+    private static final HierarchyFilterNode accessWithoutCallerFilter;
 
     static {
-        internalCallerFilter = RuleNode.createRoot();
-        internalCallerFilter.addOrGetChildren("**", RuleNode.Inclusion.Include);
+        internalCallerFilter = HierarchyFilterNode.createInclusiveRoot();
 
-        internalCallerFilter.addOrGetChildren("com.sun.crypto.provider.**", RuleNode.Inclusion.Exclude);
-        internalCallerFilter.addOrGetChildren("com.sun.java.util.jar.pack.**", RuleNode.Inclusion.Exclude);
-        internalCallerFilter.addOrGetChildren("com.sun.net.ssl.**", RuleNode.Inclusion.Exclude);
-        internalCallerFilter.addOrGetChildren("com.sun.nio.file.**", RuleNode.Inclusion.Exclude);
-        internalCallerFilter.addOrGetChildren("com.sun.nio.sctp.**", RuleNode.Inclusion.Exclude);
-        internalCallerFilter.addOrGetChildren("com.sun.nio.zipfs.**", RuleNode.Inclusion.Exclude);
-        internalCallerFilter.addOrGetChildren("java.io.**", RuleNode.Inclusion.Exclude);
-        internalCallerFilter.addOrGetChildren("java.lang.**", RuleNode.Inclusion.Exclude);
-        internalCallerFilter.addOrGetChildren("java.math.**", RuleNode.Inclusion.Exclude);
-        internalCallerFilter.addOrGetChildren("java.net.**", RuleNode.Inclusion.Exclude);
-        internalCallerFilter.addOrGetChildren("java.nio.**", RuleNode.Inclusion.Exclude);
-        internalCallerFilter.addOrGetChildren("java.text.**", RuleNode.Inclusion.Exclude);
-        internalCallerFilter.addOrGetChildren("java.time.**", RuleNode.Inclusion.Exclude);
-        internalCallerFilter.addOrGetChildren("java.util.**", RuleNode.Inclusion.Exclude);
-        internalCallerFilter.addOrGetChildren("javax.crypto.**", RuleNode.Inclusion.Exclude);
-        internalCallerFilter.addOrGetChildren("javax.lang.model.**", RuleNode.Inclusion.Exclude);
-        internalCallerFilter.addOrGetChildren("javax.net.**", RuleNode.Inclusion.Exclude);
-        internalCallerFilter.addOrGetChildren("javax.tools.**", RuleNode.Inclusion.Exclude);
-        internalCallerFilter.addOrGetChildren("jdk.internal.**", RuleNode.Inclusion.Exclude);
-        internalCallerFilter.addOrGetChildren("jdk.jfr.**", RuleNode.Inclusion.Exclude);
-        internalCallerFilter.addOrGetChildren("jdk.net.**", RuleNode.Inclusion.Exclude);
-        internalCallerFilter.addOrGetChildren("jdk.nio.**", RuleNode.Inclusion.Exclude);
-        internalCallerFilter.addOrGetChildren("jdk.vm.**", RuleNode.Inclusion.Exclude);
-        internalCallerFilter.addOrGetChildren("sun.invoke.**", RuleNode.Inclusion.Exclude);
-        internalCallerFilter.addOrGetChildren("sun.launcher.**", RuleNode.Inclusion.Exclude);
-        internalCallerFilter.addOrGetChildren("sun.misc.**", RuleNode.Inclusion.Exclude);
-        internalCallerFilter.addOrGetChildren("sun.net.**", RuleNode.Inclusion.Exclude);
-        internalCallerFilter.addOrGetChildren("sun.nio.**", RuleNode.Inclusion.Exclude);
-        internalCallerFilter.addOrGetChildren("sun.reflect.**", RuleNode.Inclusion.Exclude);
-        internalCallerFilter.addOrGetChildren("sun.text.**", RuleNode.Inclusion.Exclude);
-        internalCallerFilter.addOrGetChildren("sun.util.**", RuleNode.Inclusion.Exclude);
+        internalCallerFilter.addOrGetChildren("com.sun.crypto.provider.**", ConfigurationFilter.Inclusion.Exclude);
+        internalCallerFilter.addOrGetChildren("com.sun.java.util.jar.pack.**", ConfigurationFilter.Inclusion.Exclude);
+        internalCallerFilter.addOrGetChildren("com.sun.net.ssl.**", ConfigurationFilter.Inclusion.Exclude);
+        internalCallerFilter.addOrGetChildren("com.sun.nio.file.**", ConfigurationFilter.Inclusion.Exclude);
+        internalCallerFilter.addOrGetChildren("com.sun.nio.sctp.**", ConfigurationFilter.Inclusion.Exclude);
+        internalCallerFilter.addOrGetChildren("com.sun.nio.zipfs.**", ConfigurationFilter.Inclusion.Exclude);
+        internalCallerFilter.addOrGetChildren("java.io.**", ConfigurationFilter.Inclusion.Exclude);
+        internalCallerFilter.addOrGetChildren("java.io.ObjectInputFilter$Config", ConfigurationFilter.Inclusion.Include);
+
+        internalCallerFilter.addOrGetChildren("java.lang.**", ConfigurationFilter.Inclusion.Exclude);
+        // ClassLoader.findSystemClass calls ClassLoader.loadClass
+        internalCallerFilter.addOrGetChildren("java.lang.ClassLoader", ConfigurationFilter.Inclusion.Include);
+        // The agent should not filter calls from native libraries (JDK11).
+        internalCallerFilter.addOrGetChildren("java.lang.ClassLoader$NativeLibrary", ConfigurationFilter.Inclusion.Include);
+        // Module has resource query wrappers
+        internalCallerFilter.addOrGetChildren("java.lang.Module", ConfigurationFilter.Inclusion.Include);
+        internalCallerFilter.addOrGetChildren("java.math.**", ConfigurationFilter.Inclusion.Exclude);
+        internalCallerFilter.addOrGetChildren("java.net.**", ConfigurationFilter.Inclusion.Exclude);
+        // URLConnection.lookupContentHandlerClassFor calls Class.forName
+        internalCallerFilter.addOrGetChildren("java.net.URLConnection", ConfigurationFilter.Inclusion.Include);
+        internalCallerFilter.addOrGetChildren("java.nio.**", ConfigurationFilter.Inclusion.Exclude);
+        internalCallerFilter.addOrGetChildren("java.text.**", ConfigurationFilter.Inclusion.Exclude);
+        internalCallerFilter.addOrGetChildren("java.time.**", ConfigurationFilter.Inclusion.Exclude);
+        internalCallerFilter.addOrGetChildren("java.util.**", ConfigurationFilter.Inclusion.Exclude);
+        internalCallerFilter.addOrGetChildren("java.util.concurrent.atomic.*", ConfigurationFilter.Inclusion.Include); // Atomic*FieldUpdater
+        internalCallerFilter.addOrGetChildren("java.util.concurrent.atomic.AtomicReference", ConfigurationFilter.Inclusion.Exclude); // AtomicReference.<clinit>
+        internalCallerFilter.addOrGetChildren("java.util.Collections", ConfigurationFilter.Inclusion.Include); // java.util.Collections.zeroLengthArray
+        // LogRecord.readObject looks up resource bundles
+        internalCallerFilter.addOrGetChildren("java.util.logging.LogRecord", ConfigurationFilter.Inclusion.Include);
+        internalCallerFilter.addOrGetChildren("java.util.random.*", ConfigurationFilter.Inclusion.Include); // RandomGeneratorFactory$$Lambda
+        // LazyClassPathLookupIterator calls Class.forName
+        internalCallerFilter.addOrGetChildren("java.util.ServiceLoader$LazyClassPathLookupIterator", ConfigurationFilter.Inclusion.Include);
+        internalCallerFilter.addOrGetChildren("javax.crypto.**", ConfigurationFilter.Inclusion.Exclude);
+        internalCallerFilter.addOrGetChildren("javax.lang.model.**", ConfigurationFilter.Inclusion.Exclude);
+        internalCallerFilter.addOrGetChildren("javax.net.**", ConfigurationFilter.Inclusion.Exclude);
+        internalCallerFilter.addOrGetChildren("javax.tools.**", ConfigurationFilter.Inclusion.Exclude);
+        internalCallerFilter.addOrGetChildren("jdk.internal.**", ConfigurationFilter.Inclusion.Exclude);
+        // BootLoader calls BuiltinClassLoader.getResource
+        internalCallerFilter.addOrGetChildren("jdk.internal.loader.BootLoader", ConfigurationFilter.Inclusion.Include);
+        // The agent should not filter calls from native libraries (JDK17).
+        internalCallerFilter.addOrGetChildren("jdk.internal.loader.NativeLibraries$NativeLibraryImpl", ConfigurationFilter.Inclusion.Include);
+        internalCallerFilter.addOrGetChildren("jdk.jfr.**", ConfigurationFilter.Inclusion.Exclude);
+        internalCallerFilter.addOrGetChildren("jdk.net.**", ConfigurationFilter.Inclusion.Exclude);
+        internalCallerFilter.addOrGetChildren("jdk.nio.**", ConfigurationFilter.Inclusion.Exclude);
+        internalCallerFilter.addOrGetChildren("jdk.vm.**", ConfigurationFilter.Inclusion.Exclude);
+        internalCallerFilter.addOrGetChildren("sun.invoke.**", ConfigurationFilter.Inclusion.Exclude);
+        // BytecodeDescriptor calls Class.forName
+        internalCallerFilter.addOrGetChildren("sun.invoke.util.BytecodeDescriptor", ConfigurationFilter.Inclusion.Include);
+        internalCallerFilter.addOrGetChildren("sun.launcher.**", ConfigurationFilter.Inclusion.Exclude);
+        internalCallerFilter.addOrGetChildren("sun.misc.**", ConfigurationFilter.Inclusion.Exclude);
+        internalCallerFilter.addOrGetChildren("sun.net.**", ConfigurationFilter.Inclusion.Exclude);
+        // Uses constructor reflection on exceptions
+        internalCallerFilter.addOrGetChildren("sun.net.www.protocol.http.*", ConfigurationFilter.Inclusion.Include);
+        internalCallerFilter.addOrGetChildren("sun.nio.**", ConfigurationFilter.Inclusion.Exclude);
+        internalCallerFilter.addOrGetChildren("sun.reflect.**", ConfigurationFilter.Inclusion.Exclude);
+        // The sun.reflect.misc package provides reflection utilities
+        internalCallerFilter.addOrGetChildren("sun.reflect.misc.*", ConfigurationFilter.Inclusion.Include);
+        internalCallerFilter.addOrGetChildren("sun.text.**", ConfigurationFilter.Inclusion.Exclude);
+        internalCallerFilter.addOrGetChildren("sun.util.**", ConfigurationFilter.Inclusion.Exclude);
+        // Bundles calls Bundles.of
+        internalCallerFilter.addOrGetChildren("sun.util.resources.Bundles", ConfigurationFilter.Inclusion.Include);
 
         excludeInaccessiblePackages(internalCallerFilter);
 
         internalCallerFilter.removeRedundantNodes();
 
-        internalAccessFilter = RuleNode.createRoot();
-        internalAccessFilter.addOrGetChildren("**", RuleNode.Inclusion.Include);
+        internalAccessFilter = HierarchyFilterNode.createInclusiveRoot();
         excludeInaccessiblePackages(internalAccessFilter);
         internalAccessFilter.removeRedundantNodes();
 
-        accessWithoutCallerFilter = RuleNode.createRoot(); // in addition to accessFilter
-        accessWithoutCallerFilter.addOrGetChildren("**", RuleNode.Inclusion.Include);
-        accessWithoutCallerFilter.addOrGetChildren("jdk.vm.ci.**", RuleNode.Inclusion.Exclude);
-        accessWithoutCallerFilter.addOrGetChildren("[Ljava.lang.String;", RuleNode.Inclusion.Exclude);
+        accessWithoutCallerFilter = HierarchyFilterNode.createInclusiveRoot(); // in addition to
+                                                                               // accessFilter
+
+        accessWithoutCallerFilter.addOrGetChildren("jdk.vm.ci.**", ConfigurationFilter.Inclusion.Exclude);
+        accessWithoutCallerFilter.addOrGetChildren("[Ljava.lang.String;", ConfigurationFilter.Inclusion.Exclude);
         // ^ String[]: for command-line argument arrays created before Java main method is called
         accessWithoutCallerFilter.removeRedundantNodes();
     }
@@ -104,23 +144,24 @@ public final class AccessAdvisor {
      * by their module and should not be accessible from application code. Generate all with:
      * native-image-configure generate-filters --exclude-unexported-packages-from-modules [--reduce]
      */
-    private static void excludeInaccessiblePackages(RuleNode rootNode) {
-        rootNode.addOrGetChildren("com.oracle.graal.**", RuleNode.Inclusion.Exclude);
-        rootNode.addOrGetChildren("com.oracle.truffle.**", RuleNode.Inclusion.Exclude);
-        rootNode.addOrGetChildren("org.graalvm.compiler.**", RuleNode.Inclusion.Exclude);
-        rootNode.addOrGetChildren("org.graalvm.libgraal.**", RuleNode.Inclusion.Exclude);
+    private static void excludeInaccessiblePackages(HierarchyFilterNode rootNode) {
+        rootNode.addOrGetChildren("com.oracle.graal.**", ConfigurationFilter.Inclusion.Exclude);
+        rootNode.addOrGetChildren("com.oracle.truffle.**", ConfigurationFilter.Inclusion.Exclude);
+        rootNode.addOrGetChildren("jdk.graal.compiler.**", ConfigurationFilter.Inclusion.Exclude);
+        rootNode.addOrGetChildren("org.graalvm.compiler.**", ConfigurationFilter.Inclusion.Exclude);
+        rootNode.addOrGetChildren("org.graalvm.libgraal.**", ConfigurationFilter.Inclusion.Exclude);
     }
 
-    public static RuleNode copyBuiltinCallerFilterTree() {
+    public static HierarchyFilterNode copyBuiltinCallerFilterTree() {
         return internalCallerFilter.copy();
     }
 
-    public static RuleNode copyBuiltinAccessFilterTree() {
+    public static HierarchyFilterNode copyBuiltinAccessFilterTree() {
         return internalAccessFilter.copy();
     }
 
-    private RuleNode callerFilter = internalCallerFilter;
-    private RuleNode accessFilter = internalAccessFilter;
+    private ConfigurationFilter callerFilter = internalCallerFilter;
+    private ConfigurationFilter accessFilter = internalAccessFilter;
     private boolean heuristicsEnabled = true;
     private boolean isInLivePhase = false;
     private int launchPhase = 0;
@@ -129,11 +170,11 @@ public final class AccessAdvisor {
         heuristicsEnabled = enable;
     }
 
-    public void setCallerFilterTree(RuleNode rootNode) {
+    public void setCallerFilterTree(ConfigurationFilter rootNode) {
         callerFilter = rootNode;
     }
 
-    public void setAccessFilterTree(RuleNode rootNode) {
+    public void setAccessFilterTree(ConfigurationFilter rootNode) {
         accessFilter = rootNode;
     }
 
@@ -141,46 +182,81 @@ public final class AccessAdvisor {
         isInLivePhase = live;
     }
 
-    public boolean shouldIgnore(LazyValue<String> queriedClass, LazyValue<String> callerClass) {
+    public boolean shouldIgnore(LazyValue<String> queriedClass, LazyValue<String> callerClass, boolean useLambdaHeuristics) {
         if (heuristicsEnabled && !isInLivePhase) {
             return true;
         }
         String qualifiedCaller = callerClass.get();
         assert qualifiedCaller == null || qualifiedCaller.indexOf('/') == -1 : "expecting Java-format qualifiers, not internal format";
-        if (qualifiedCaller != null && !callerFilter.treeIncludes(qualifiedCaller)) {
+        if (qualifiedCaller != null && !callerFilter.includes(qualifiedCaller)) {
             return true;
         }
         // NOTE: queriedClass can be null for non-class accesses like resources
-        if (callerClass.get() == null && queriedClass.get() != null && !accessWithoutCallerFilter.treeIncludes(queriedClass.get())) {
+        if (callerClass.get() == null && queriedClass.get() != null && !accessWithoutCallerFilter.includes(queriedClass.get())) {
             return true;
         }
-        return accessFilter != null && queriedClass.get() != null && !accessFilter.treeIncludes(queriedClass.get());
+        if (accessFilter != null && queriedClass.get() != null && !accessFilter.includes(queriedClass.get())) {
+            return true;
+        }
+        if (heuristicsEnabled && queriedClass.get() != null) {
+            return (useLambdaHeuristics && queriedClass.get().contains(LambdaUtils.LAMBDA_CLASS_NAME_SUBSTRING)) ||
+                            PROXY_CLASS_NAME_PATTERN.matcher(queriedClass.get()).matches();
+        }
+        return false;
     }
 
-    public boolean shouldIgnoreJniMethodLookup(LazyValue<String> queriedClass, LazyValue<String> name, LazyValue<String> signature, LazyValue<String> callerClass) {
+    public boolean shouldIgnore(LazyValue<String> queriedClass, LazyValue<String> callerClass) {
+        return shouldIgnore(queriedClass, callerClass, true);
+    }
+
+    record JNICallDescriptor(String declaringClass, String name, String signature, boolean required) {
+        public boolean matches(String otherDeclaringClass, String otherName, String otherSignature) {
+            return (declaringClass == null || declaringClass.equals(otherDeclaringClass)) &&
+                            (otherName == null || name.equals(otherName)) &&
+                            (otherSignature == null || signature.equals(otherSignature));
+        }
+    }
+
+    private static final JNICallDescriptor[] JNI_STARTUP_SEQUENCE = new JNICallDescriptor[]{
+                    new JNICallDescriptor("sun.launcher.LauncherHelper", "getApplicationClass", "()Ljava/lang/Class;", true),
+                    new JNICallDescriptor("java.lang.Class", "getCanonicalName", "()Ljava/lang/String;", false),
+                    new JNICallDescriptor("java.lang.String", "lastIndexOf", "(I)I", false),
+                    new JNICallDescriptor("java.lang.String", "substring", "(I)Ljava/lang/String;", false),
+                    new JNICallDescriptor("java.lang.System", "getProperty", "(Ljava/lang/String;)Ljava/lang/String;", false),
+                    new JNICallDescriptor("java.lang.System", "setProperty", "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;", false),
+                    new JNICallDescriptor(null, "main", "([Ljava/lang/String;)V", true),
+    };
+
+    public boolean shouldIgnoreJniLookup(LazyValue<String> queriedClass, LazyValue<String> name, LazyValue<String> signature, LazyValue<String> callerClass) {
         assert !shouldIgnore(queriedClass, callerClass) : "must have been checked before";
         if (!heuristicsEnabled) {
             return false;
         }
-        // Heuristic to ignore this sequence during startup:
-        // 1. Lookup of LauncherHelper.getApplicationClass()
-        // 2. Lookup of Class.getCanonicalName() -- only on Darwin
-        // 3. Lookup of application's main(String[])
-        if ("sun.launcher.LauncherHelper".equals(queriedClass.get())) {
-            if (launchPhase == 0 && "getApplicationClass".equals(name.get()) && "()Ljava/lang/Class;".equals(signature.get())) {
-                launchPhase = 1;
+        if (launchPhase >= 0) {
+            JNICallDescriptor expectedCall = JNI_STARTUP_SEQUENCE[launchPhase];
+            while (!expectedCall.matches(queriedClass.get(), name.get(), signature.get())) {
+                if ("sun.launcher.LauncherHelper".equals(queriedClass.get())) {
+                    return true;
+                }
+                if (!expectedCall.required) {
+                    launchPhase++;
+                    expectedCall = JNI_STARTUP_SEQUENCE[launchPhase];
+                } else {
+                    launchPhase = -1;
+                    return false;
+                }
+            }
+            if (name.get() != null && signature.get() != null) {
+                /*
+                 * We ignore class lookups before field/method lookups but don't skip to the next
+                 * query
+                 */
+                launchPhase++;
+            }
+            if (launchPhase == JNI_STARTUP_SEQUENCE.length) {
+                launchPhase = -1;
             }
             return true;
-        }
-        if (launchPhase == 1 && "getCanonicalName".equals(name.get()) && "()Ljava/lang/String;".equals(signature.get())) {
-            launchPhase = 2;
-            return true;
-        }
-        if (launchPhase > 0) {
-            launchPhase = -1;
-            if ("main".equals(name.get()) && "([Ljava/lang/String;)V".equals(signature.get())) {
-                return true;
-            }
         }
         /*
          * NOTE: JVM invocations cannot be reliably filtered with callerClass == null because these
@@ -188,6 +264,10 @@ public final class AccessAdvisor {
          * executing Java code (yet).
          */
         return false;
+    }
+
+    public static boolean shouldIgnoreResourceLookup(LazyValue<String> resource) {
+        return Set.of("META-INF/services/jdk.vm.ci.services.JVMCIServiceLocator", "META-INF/services/java.lang.System$LoggerFinder").contains(resource.get());
     }
 
     public boolean shouldIgnoreLoadClass(LazyValue<String> queriedClass, LazyValue<String> callerClass) {

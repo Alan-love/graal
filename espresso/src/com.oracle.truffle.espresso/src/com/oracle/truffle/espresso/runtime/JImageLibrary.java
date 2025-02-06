@@ -27,24 +27,27 @@ import static com.oracle.truffle.espresso.runtime.Classpath.JAVA_BASE;
 
 import java.nio.ByteBuffer;
 
+import com.oracle.truffle.api.CompilerDirectives;
 import com.oracle.truffle.api.interop.ArityException;
 import com.oracle.truffle.api.interop.InteropLibrary;
 import com.oracle.truffle.api.interop.TruffleObject;
 import com.oracle.truffle.api.interop.UnsupportedMessageException;
 import com.oracle.truffle.api.interop.UnsupportedTypeException;
-import com.oracle.truffle.espresso.descriptors.Symbol;
-import com.oracle.truffle.espresso.descriptors.Symbol.Name;
+import com.oracle.truffle.espresso.classfile.JavaKind;
+import com.oracle.truffle.espresso.classfile.descriptors.ByteSequence;
+import com.oracle.truffle.espresso.classfile.descriptors.Name;
+import com.oracle.truffle.espresso.classfile.descriptors.Symbol;
+import com.oracle.truffle.espresso.descriptors.EspressoSymbols.Names;
 import com.oracle.truffle.espresso.ffi.NativeSignature;
 import com.oracle.truffle.espresso.ffi.NativeType;
 import com.oracle.truffle.espresso.ffi.nfi.NativeUtils;
-import com.oracle.truffle.espresso.impl.ContextAccess;
+import com.oracle.truffle.espresso.impl.ContextAccessImpl;
 import com.oracle.truffle.espresso.impl.PackageTable.PackageEntry;
 import com.oracle.truffle.espresso.jni.RawBuffer;
 import com.oracle.truffle.espresso.meta.EspressoError;
-import com.oracle.truffle.espresso.meta.JavaKind;
 
 @SuppressWarnings("unused")
-class JImageLibrary implements ContextAccess {
+final class JImageLibrary extends ContextAccessImpl {
     private static final String VERSION_STRING = "11.0";
 
     private static final String LIBJIMAGE_NAME = "jimage";
@@ -53,8 +56,6 @@ class JImageLibrary implements ContextAccess {
     private static final String PACKAGE_TO_MOODULE = "JIMAGE_PackageToModule";
     private static final String FIND_RESOURCE = "JIMAGE_FindResource";
     private static final String GET_RESOURCE = "JIMAGE_GetResource";
-    private static final String RESOURCE_ITERATOR = "JIMAGE_ResourceIterator";
-    private static final String RESOURCE_PATH = "JIMAGE_ResourcePath";
 
     private static final NativeSignature OPEN_SIGNATURE = NativeSignature.create(NativeType.POINTER, NativeType.POINTER, NativeType.POINTER);
     private static final NativeSignature CLOSE_SIGNATURE = NativeSignature.create(NativeType.VOID, NativeType.POINTER);
@@ -67,9 +68,6 @@ class JImageLibrary implements ContextAccess {
     private static final NativeSignature RESOURCE_PATH_SIGNATURE = NativeSignature.create(NativeType.BOOLEAN, NativeType.POINTER, NativeType.LONG, NativeType.POINTER, NativeType.LONG);
 
     private final InteropLibrary uncached;
-
-    // Library pointer
-    private final TruffleObject jimageLibrary;
 
     // Buffers associated with caches are there to prevent GCing of the cached encoded strings.
 
@@ -97,30 +95,19 @@ class JImageLibrary implements ContextAccess {
     // char* buffer, jlong size);
     private final TruffleObject getResource;
 
-    // bool (*JImageResourceVisitor_t)(JImageFile* jimage,
-    // const char* module_name, const char* version, const char* package,
-    // const char* name, const char* extension, void* arg);
-    private final TruffleObject resourceIterator;
-    // bool JIMAGE_ResourcePath(JImageFile* image, JImageLocationRef locationRef,
-    // char* path, size_t max);
-    private final TruffleObject resourcePath;
-
-    private final EspressoContext context;
-
     JImageLibrary(EspressoContext context) {
-        this.context = context;
+        super(context);
         EspressoProperties props = getContext().getVmProperties();
 
         // Load guest's libjimage.
-        jimageLibrary = getNativeAccess().loadLibrary(props.bootLibraryPath(), LIBJIMAGE_NAME, true);
+        // Library pointer
+        TruffleObject jimageLibrary = getNativeAccess().loadLibrary(props.bootLibraryPath(), LIBJIMAGE_NAME, true);
 
         open = getNativeAccess().lookupAndBindSymbol(jimageLibrary, OPEN, OPEN_SIGNATURE);
         close = getNativeAccess().lookupAndBindSymbol(jimageLibrary, CLOSE, CLOSE_SIGNATURE);
         packageToModule = getNativeAccess().lookupAndBindSymbol(jimageLibrary, PACKAGE_TO_MOODULE, PACKAGE_TO_MODULE_SIGNATURE);
         findResource = getNativeAccess().lookupAndBindSymbol(jimageLibrary, FIND_RESOURCE, FIND_RESOURCE_SIGNATURE);
         getResource = getNativeAccess().lookupAndBindSymbol(jimageLibrary, GET_RESOURCE, GET_RESOURCE_SIGNATURE);
-        resourceIterator = getNativeAccess().lookupAndBindSymbol(jimageLibrary, RESOURCE_ITERATOR, RESOURCE_ITERATOR_SIGNATURE);
-        resourcePath = getNativeAccess().lookupAndBindSymbol(jimageLibrary, RESOURCE_PATH, RESOURCE_PATH_SIGNATURE);
 
         this.javaBaseBuffer = RawBuffer.getNativeString(JAVA_BASE);
         this.versionBuffer = RawBuffer.getNativeString(VERSION_STRING);
@@ -140,7 +127,7 @@ class JImageLibrary implements ContextAccess {
         execute(close, jimage);
     }
 
-    public byte[] getClassBytes(TruffleObject jimage, String name) {
+    public byte[] getClassBytes(TruffleObject jimage, ByteSequence name) {
         // Prepare calls
         ByteBuffer sizeBuffer = NativeUtils.allocateDirect(JavaKind.Long.getByteCount());
         TruffleObject sizePtr = NativeUtils.byteBufferPointer(sizeBuffer);
@@ -160,7 +147,7 @@ class JImageLibrary implements ContextAccess {
         return result;
     }
 
-    private long findLocation(TruffleObject jimage, TruffleObject sizePtr, String name) {
+    private long findLocation(TruffleObject jimage, TruffleObject sizePtr, ByteSequence name) {
         try (RawBuffer nameBuffer = RawBuffer.getNativeString(name)) {
             TruffleObject namePtr = nameBuffer.pointer();
             long location = (long) execute(findResource, jimage, emptyStringBuffer.pointer(), versionBuffer.pointer(), namePtr, sizePtr);
@@ -169,7 +156,7 @@ class JImageLibrary implements ContextAccess {
                 return location;
             }
 
-            String pkg = packageFromName(name);
+            ByteSequence pkg = packageFromName(name);
             if (pkg == null) {
                 return 0;
             }
@@ -199,7 +186,7 @@ class JImageLibrary implements ContextAccess {
                     return 0;
                 }
                 Symbol<Name> moduleName = pkgEntry.module().getName();
-                if (moduleName == Name.java_base) {
+                if (moduleName == Names.java_base) {
                     return (long) execute(findResource, jimage, javaBaseBuffer.pointer(), versionBuffer.pointer(), namePtr, sizePtr);
                 } else {
                     String nameAsString = moduleName == null ? "" : moduleName.toString();
@@ -211,30 +198,20 @@ class JImageLibrary implements ContextAccess {
         }
     }
 
-    private String packageToModule(TruffleObject jimage, String pkg) {
-        try (RawBuffer pkgBuffer = RawBuffer.getNativeString(pkg)) {
-            return NativeUtils.interopPointerToString((TruffleObject) execute(packageToModule, jimage, pkgBuffer.pointer()));
-        }
-    }
-
-    private static String packageFromName(String name) {
-        int lastSlash = name.lastIndexOf('/');
+    private static ByteSequence packageFromName(ByteSequence name) {
+        int lastSlash = name.lastIndexOf((byte) '/');
         if (lastSlash == -1) {
             return null;
         }
-        return name.substring(0, lastSlash);
+        return name.subSequence(0, lastSlash);
     }
 
     private Object execute(Object target, Object... args) {
         try {
             return uncached.execute(target, args);
         } catch (UnsupportedTypeException | UnsupportedMessageException | ArityException e) {
+            CompilerDirectives.transferToInterpreterAndInvalidate();
             throw EspressoError.shouldNotReachHere(e);
         }
-    }
-
-    @Override
-    public EspressoContext getContext() {
-        return context;
     }
 }

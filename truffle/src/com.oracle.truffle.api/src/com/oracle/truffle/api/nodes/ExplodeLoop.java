@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2012, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -46,8 +46,11 @@ import java.lang.annotation.RetentionPolicy;
 import java.lang.annotation.Target;
 
 /**
- * Specifies for a method that the loops with constant number of invocations should be fully
- * unrolled.
+ * Specifies that loops originating from within this method should be fully unrolled. This is only
+ * compatible with loops that have a partial-evaluation-constant number of iterations - loops
+ * without a constant number of iterations will cause the compiler to bailout due to the graph
+ * exceeding maximum size. The annotation does not apply to loops from within other methods that are
+ * inlined into this method.
  *
  * @since 0.8 or earlier
  */
@@ -65,7 +68,7 @@ public @interface ExplodeLoop {
      * term <i>loop exit</i> refers to control flow exiting the loop, such as {@code return} or
      * {@code break}. Example:
      *
-     * {@codesnippet loopEndsExits}
+     * {@snippet file="com/oracle/truffle/api/nodes/ExplodeLoop.java" region="loopEndsExits"}
      *
      * There are 4 loop explosion kinds (plus {@code MERGE_EXPLODE}, which is meant for bytecode
      * interpreters), configurable by 2 parameters: UNROLL vs EXPLODE and UNTIL_RETURN vs not.
@@ -75,41 +78,44 @@ public @interface ExplodeLoop {
      * The first parameter specifies whether the partial evaluator should duplicate loop ends.
      * UNROLL merges after each loop end and EXPLODE keeps exploding nested iterations like a tree.
      *
-     * {@codesnippet unrollVsExplodeLoop}
+     * {@snippet file="com/oracle/truffle/api/nodes/ExplodeLoop.java" region="unrollVsExplodeLoop"}
      *
      * gets unrolled with {@code FULL_UNROLL} to:
      *
-     * {@codesnippet unrollVsExplodeLoopUnrolled}
+     * {@snippet file="com/oracle/truffle/api/nodes/ExplodeLoop.java"
+     * region="unrollVsExplodeLoopUnrolled"}
      *
      * and exploded with {@code FULL_EXPLODE} to:
      *
-     * {@codesnippet unrollVsExplodeLoopExploded}
+     * {@snippet file="com/oracle/truffle/api/nodes/ExplodeLoop.java"
+     * region="unrollVsExplodeLoopExploded"}
      *
      * <h2>UNTIL_RETURN</h2>
      *
      * The second parameter specifies whether the partial evaluator should duplicate loop exits.
      * UNTIL_RETURN duplicates them, otherwise control flow is merged.
      *
-     * {@codesnippet untilReturnLoop}
+     * {@snippet file="com/oracle/truffle/api/nodes/ExplodeLoop.java" region="untilReturnLoop"}
      *
      * is expanded with {@code FULL_UNROLL_UNTIL_RETURN} to:
      *
-     * {@codesnippet untilReturn}
+     * {@snippet file="com/oracle/truffle/api/nodes/ExplodeLoop.java" region="untilReturn"}
      *
      * while {@code FULL_UNROLL} merges loop exits:
      *
-     * {@codesnippet notUntilReturn}
+     * {@snippet file="com/oracle/truffle/api/nodes/ExplodeLoop.java" region="notUntilReturn"}
      *
      * <h3>break</h3>
      *
      * Note that {@code break} statements inside the loop will duplicate code after the loop since
      * they add new loop exits:
      *
-     * {@codesnippet breaksLoop}
+     * {@snippet file="com/oracle/truffle/api/nodes/ExplodeLoop.java" region="breaksLoop"}
      *
      * is expanded with {@code FULL_UNROLL_UNTIL_RETURN} to:
      *
-     * {@codesnippet breaksLoopUnrollUntilReturn}
+     * {@snippet file="com/oracle/truffle/api/nodes/ExplodeLoop.java"
+     * region="breaksLoopUnrollUntilReturn"}
      *
      * @since 0.15
      */
@@ -177,7 +183,7 @@ public @interface ExplodeLoop {
 @SuppressFBWarnings("UC")
 @SuppressWarnings("static-method")
 class Snippets {
-    // BEGIN: loopEndsExits
+    // @start region = "loopEndsExits"
     int loopEndExits() {
         int state = -1;
         for (int i = 0; i < 4; i++) {
@@ -199,9 +205,9 @@ class Snippets {
         // loop exit (after last iteration)
         return state;
     }
-    // END: loopEndsExits
+    // @end region = "loopEndsExits"
 
-    // BEGIN: unrollVsExplodeLoop
+    // @start region = "unrollVsExplodeLoop"
     @ExplodeLoop
     void unrollVsExplodeLoop() {
         int state = 1;
@@ -213,9 +219,9 @@ class Snippets {
             }
         }
     }
-    // END: unrollVsExplodeLoop
+    // @end region = "unrollVsExplodeLoop"
 
-    // BEGIN: unrollVsExplodeLoopUnrolled
+    // @start region = "unrollVsExplodeLoopUnrolled"
     void unrollVsExplodeLoopUnrolled() {
         int state = 1;
         if (c(0, 1)) {
@@ -230,10 +236,10 @@ class Snippets {
             state = 3;
         }
     }
-    // END: unrollVsExplodeLoopUnrolled
+    // @end region = "unrollVsExplodeLoopUnrolled"
 
     @SuppressWarnings("unused")
-    // BEGIN: unrollVsExplodeLoopExploded
+    // @start region = "unrollVsExplodeLoopExploded"
     void unrollVsExplodeLoopExploded() {
         int state = 1;
         if (c(0, 1)) {
@@ -250,9 +256,9 @@ class Snippets {
             }
         }
     }
-    // END: unrollVsExplodeLoopExploded
+    // @end region = "unrollVsExplodeLoopExploded"
 
-    // BEGIN: untilReturnLoop
+    // @start region = "untilReturnLoop"
     @ExplodeLoop
     int untilReturnLoop() {
         for (int i = 0; i < 2; i++) {
@@ -264,9 +270,9 @@ class Snippets {
         // exit2
         return fallback();
     }
-    // END: untilReturnLoop
+    // @end region = "untilReturnLoop"
 
-    // BEGIN: untilReturn
+    // @start region = "untilReturn"
     int untilReturn() {
         if (condition(0)) {
             return f(0);
@@ -278,9 +284,9 @@ class Snippets {
 
         return fallback();
     }
-    // END: untilReturn
+    // @end region = "untilReturn"
 
-    // BEGIN: notUntilReturn
+    // @start region = "notUntilReturn"
     int notUntilReturn() {
         int i;
         for (;;) {
@@ -299,9 +305,9 @@ class Snippets {
 
         return f(i);
     }
-    // END: notUntilReturn
+    // @end region = "notUntilReturn"
 
-    // BEGIN: breaksLoop
+    // @start region = "breaksLoop"
     @ExplodeLoop
     int breaksLoop() {
         int state = -1;
@@ -317,9 +323,9 @@ class Snippets {
 
         return fallback(state);
     }
-    // END: breaksLoop
+    // @end region = "breaksLoop"
 
-    // BEGIN: breaksLoopUnrollUntilReturn
+    // @start region = "breaksLoopUnrollUntilReturn"
     int breaksLoopUnrollUntilReturn() {
         if (condition1(0)) {
             return f(0);
@@ -335,7 +341,7 @@ class Snippets {
 
         return fallback(-1);
     }
-    // END: breaksLoopUnrollUntilReturn
+    // @end region = "breaksLoopUnrollUntilReturn"
 
     private boolean c(int i, int state) {
         return i == state;

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2017, 2021, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -29,9 +29,9 @@ import java.io.IOException;
 import java.io.PrintWriter;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
-import java.net.UnknownHostException;
 import java.net.URI;
 import java.net.URISyntaxException;
+import java.net.UnknownHostException;
 import java.security.SecureRandom;
 import java.util.ArrayList;
 import java.util.Base64;
@@ -42,6 +42,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
+import java.time.Duration;
+import java.time.temporal.ChronoUnit;
 
 import org.graalvm.options.OptionCategory;
 import org.graalvm.options.OptionDescriptor;
@@ -60,25 +62,24 @@ import com.oracle.truffle.api.instrumentation.EventBinding;
 import com.oracle.truffle.api.instrumentation.TruffleInstrument;
 import com.oracle.truffle.api.interop.TruffleObject;
 import com.oracle.truffle.api.nodes.LanguageInfo;
-
 import com.oracle.truffle.tools.chromeinspector.InspectorExecutionContext;
-import com.oracle.truffle.tools.chromeinspector.objects.Inspector;
 import com.oracle.truffle.tools.chromeinspector.client.InspectWSClient;
+import com.oracle.truffle.tools.chromeinspector.objects.Inspector;
 import com.oracle.truffle.tools.chromeinspector.server.ConnectionWatcher;
 import com.oracle.truffle.tools.chromeinspector.server.InspectServerSession;
-import com.oracle.truffle.tools.chromeinspector.server.WSInterceptorServer;
 import com.oracle.truffle.tools.chromeinspector.server.InspectorServer;
 import com.oracle.truffle.tools.chromeinspector.server.InspectorServerConnection;
+import com.oracle.truffle.tools.chromeinspector.server.WSInterceptorServer;
 
 /**
  * Chrome inspector as an instrument.
  */
-@TruffleInstrument.Registration(id = InspectorInstrument.INSTRUMENT_ID, name = "Chrome Inspector", version = InspectorInstrument.VERSION, services = TruffleObject.class)
+@TruffleInstrument.Registration(id = InspectorInstrument.INSTRUMENT_ID, name = "Chrome Inspector", version = InspectorInstrument.VERSION, services = TruffleObject.class, website = "https://www.graalvm.org/tools/chrome-debugger/")
 public final class InspectorInstrument extends TruffleInstrument {
 
     private static final int DEFAULT_PORT = 9229;
     private static final HostAndPort DEFAULT_ADDRESS = new HostAndPort(null, DEFAULT_PORT);
-    private static final String HELP_URL = "https://www.graalvm.org/docs/tools/chrome-debugger";
+    private static final String HELP_URL = "https://www.graalvm.org/tools/chrome-debugger";
 
     private Server server;
     private ConnectionWatcher connectionWatcher;
@@ -130,6 +131,64 @@ public final class InspectorInstrument extends TruffleInstrument {
         return uris;
     });
 
+    static final OptionType<Long> TIMEOUT = new OptionType<>("[1, inf)ms|s|m|h|d", (str) -> {
+        ChronoUnit foundUnit = null;
+        long value = -1;
+        try {
+            for (ChronoUnit unit : ChronoUnit.values()) {
+                String unitName = getUnitName(unit);
+                if (unitName == null) {
+                    continue;
+                }
+                if (str.endsWith(unitName)) {
+                    foundUnit = unit;
+                    String time = str.substring(0, str.length() - unitName.length());
+                    value = Long.parseLong(time);
+                    break;
+                }
+            }
+            if (value <= 0) {
+                throw invalidUnitValue(str);
+            }
+            assert foundUnit != null;
+            try {
+                Duration duration = Duration.of(value, foundUnit);
+                return duration.toMillis();
+            } catch (ArithmeticException ex) {
+                return Long.MAX_VALUE;
+            }
+        } catch (NumberFormatException | ArithmeticException e) {
+            throw invalidUnitValue(str);
+        }
+    });
+
+    private static String getUnitName(ChronoUnit unit) {
+        switch (unit) {
+            case MILLIS:
+                return "ms";
+            case SECONDS:
+                return "s";
+            case MINUTES:
+                return "m";
+            case HOURS:
+                return "h";
+            case DAYS:
+                return "d";
+        }
+        return null;
+    }
+
+    private static IllegalArgumentException invalidUnitValue(String value) {
+        throw new IllegalArgumentException("Invalid timeout '" + value + "' specified. " //
+                        + "A valid timeout duration consists of a positive integer value followed by a chronological time unit. " //
+                        + "For example '15m' or '60s'. Valid time units are " //
+                        + "'ms' for milliseconds, " //
+                        + "'s' for seconds, " //
+                        + "'m' for minutes, " //
+                        + "'h' for hours, and " //
+                        + "'d' for days.");
+    }
+
     private static URI createURIFromPath(String path) throws URISyntaxException {
         String lpath = path.toLowerCase();
         int index = 0;
@@ -167,48 +226,55 @@ public final class InspectorInstrument extends TruffleInstrument {
         }
     }
 
-    @com.oracle.truffle.api.Option(name = "", help = "Start the Chrome inspector on [[host:]port]. (default: <loopback address>:" + DEFAULT_PORT +
-                    ")", category = OptionCategory.USER, stability = OptionStability.STABLE) //
+    @com.oracle.truffle.api.Option(name = "", help = "Start the Chrome inspector on [[host:]port].", usageSyntax = "[[<host>]:<port>]", category = OptionCategory.USER, stability = OptionStability.STABLE) //
     static final OptionKey<HostAndPort> Inspect = new OptionKey<>(DEFAULT_ADDRESS, ADDRESS_OR_BOOLEAN);
 
-    @com.oracle.truffle.api.Option(help = "Attach to an existing endpoint instead of creating a new one. (default:false)", category = OptionCategory.INTERNAL) //
+    @com.oracle.truffle.api.Option(help = "Attach to an existing endpoint instead of creating a new one.", category = OptionCategory.INTERNAL) //
     static final OptionKey<Boolean> Attach = new OptionKey<>(false);
 
-    @com.oracle.truffle.api.Option(help = "Suspend the execution at first executed source line. (default:true)", category = OptionCategory.USER, stability = OptionStability.STABLE) //
+    @com.oracle.truffle.api.Option(help = "Suspend the execution at first executed source line (default: true).", usageSyntax = "true|false", category = OptionCategory.USER, stability = OptionStability.STABLE) //
     static final OptionKey<Boolean> Suspend = new OptionKey<>(true);
 
-    @com.oracle.truffle.api.Option(help = "Do not execute any source code until inspector client is attached. (default:false)", category = OptionCategory.USER, stability = OptionStability.STABLE) //
+    @com.oracle.truffle.api.Option(help = "Timeout of a debugger suspension. The debugger session is disconnected after the timeout expires. (default: no timeout). Example value: '5m'.", //
+                    usageSyntax = "[1, inf)ms|s|m|h|d", category = OptionCategory.USER, stability = OptionStability.STABLE) //
+    static final OptionKey<Long> SuspensionTimeout = new OptionKey<>(null, TIMEOUT);
+
+    @com.oracle.truffle.api.Option(help = "Do not execute any source code until inspector client is attached.", category = OptionCategory.USER, stability = OptionStability.STABLE) //
     static final OptionKey<Boolean> WaitAttached = new OptionKey<>(false);
 
-    @com.oracle.truffle.api.Option(help = "Specifies list of directories or ZIP/JAR files representing source path. (default:none)", category = OptionCategory.USER, stability = OptionStability.STABLE) //
+    private static final String SOURCE_PATH_USAGE = "<path>,<path>,...";
+
+    @com.oracle.truffle.api.Option(help = "Specifies list of directories or ZIP/JAR files representing source path (default: empty list).", usageSyntax = SOURCE_PATH_USAGE, category = OptionCategory.USER, stability = OptionStability.STABLE) //
     static final OptionKey<List<URI>> SourcePath = new OptionKey<>(Collections.emptyList(), SOURCE_PATH);
 
-    @com.oracle.truffle.api.Option(help = "Hide internal errors that can occur as a result of debugger inspection. (default:false)", category = OptionCategory.EXPERT) //
+    @com.oracle.truffle.api.Option(help = "Hide internal errors that can occur as a result of debugger inspection.", category = OptionCategory.EXPERT) //
     static final OptionKey<Boolean> HideErrors = new OptionKey<>(false);
 
     @com.oracle.truffle.api.Option(help = "Path to the chrome inspect. This path should be unpredictable. Do note that any website opened in your browser that has knowledge of the URL can connect to the debugger. A predictable path can thus be " +
-                    "abused by a malicious website to execute arbitrary code on your computer, even if you are behind a firewall. (default: randomly generated)", category = OptionCategory.USER, stability = OptionStability.STABLE) //
+                    "abused by a malicious website to execute arbitrary code on your computer, even if you are behind a firewall. (default: randomly generated)", //
+                    usageSyntax = "<path>", category = OptionCategory.USER, stability = OptionStability.STABLE) //
     static final OptionKey<String> Path = new OptionKey<>("");
 
-    @com.oracle.truffle.api.Option(help = "Inspect internal sources. (default:false)", category = OptionCategory.INTERNAL) //
+    @com.oracle.truffle.api.Option(help = "Inspect internal sources.", category = OptionCategory.INTERNAL) //
     static final OptionKey<Boolean> Internal = new OptionKey<>(false);
 
-    @com.oracle.truffle.api.Option(help = "Inspect language initialization. (default:false)", category = OptionCategory.INTERNAL) //
+    @com.oracle.truffle.api.Option(help = "Inspect language initialization.", category = OptionCategory.INTERNAL) //
     static final OptionKey<Boolean> Initialization = new OptionKey<>(false);
 
-    @com.oracle.truffle.api.Option(help = "Use TLS/SSL. (default: false for loopback address, true otherwise)", category = OptionCategory.USER, stability = OptionStability.STABLE) //
+    @com.oracle.truffle.api.Option(help = "Use TLS/SSL. (default: false for loopback address, true otherwise)", usageSyntax = "true|false", category = OptionCategory.USER, stability = OptionStability.STABLE) //
     static final OptionKey<Boolean> Secure = new OptionKey<>(true);
 
-    @com.oracle.truffle.api.Option(help = "File path to keystore used for secure connection. (default:javax.net.ssl.keyStore system property)", category = OptionCategory.USER, stability = OptionStability.STABLE) //
+    @com.oracle.truffle.api.Option(help = "File path to keystore used for secure connection. (default:javax.net.ssl.keyStore system property)", usageSyntax = "<path>", category = OptionCategory.USER, stability = OptionStability.STABLE) //
     static final OptionKey<String> KeyStore = new OptionKey<>("");
 
-    @com.oracle.truffle.api.Option(help = "The keystore type. (default:javax.net.ssl.keyStoreType system property, or \\\"JKS\\\")", category = OptionCategory.USER, stability = OptionStability.STABLE) //
+    @com.oracle.truffle.api.Option(help = "The keystore type. (default:javax.net.ssl.keyStoreType system property, or \\\"JKS\\\")", usageSyntax = "<keystoreType>", category = OptionCategory.USER, stability = OptionStability.STABLE) //
     static final OptionKey<String> KeyStoreType = new OptionKey<>("");
 
-    @com.oracle.truffle.api.Option(help = "The keystore password. (default:javax.net.ssl.keyStorePassword system property)", category = OptionCategory.USER, stability = OptionStability.STABLE) //
+    @com.oracle.truffle.api.Option(help = "The keystore password. (default:javax.net.ssl.keyStorePassword system property)", usageSyntax = "<keystorePassword>", category = OptionCategory.USER, stability = OptionStability.STABLE) //
     static final OptionKey<String> KeyStorePassword = new OptionKey<>("");
 
-    @com.oracle.truffle.api.Option(help = "Password for recovering keys from a keystore. (default:javax.net.ssl.keyPassword system property, or keystore password)", category = OptionCategory.USER, stability = OptionStability.STABLE) //
+    @com.oracle.truffle.api.Option(help = "Password for recovering keys from a keystore. (default:javax.net.ssl.keyPassword system property, or keystore password)", //
+                    usageSyntax = "<keystorePassword>", category = OptionCategory.USER, stability = OptionStability.STABLE) //
     static final OptionKey<String> KeyPassword = new OptionKey<>("");
 
     public static final String INSTRUMENT_ID = "inspect";
@@ -223,7 +289,7 @@ public final class InspectorInstrument extends TruffleInstrument {
             try {
                 server = new Server(env, "Main Context", hostAndPort, options.get(Attach), options.get(Suspend), options.get(WaitAttached), options.get(HideErrors), options.get(Internal),
                                 options.get(Initialization), options.get(Path), options.hasBeenSet(Secure), options.get(Secure), new KeyStoreOptions(options), options.get(SourcePath),
-                                connectionWatcher);
+                                options.get(SuspensionTimeout), connectionWatcher);
             } catch (IOException e) {
                 throw new InspectorIOException(hostAndPort.getHostPort(), e);
             }
@@ -247,7 +313,8 @@ public final class InspectorInstrument extends TruffleInstrument {
                 hostAndPort = new HostAndPort(host, port);
                 try {
                     server = new Server(env, "Main Context", hostAndPort, false, false, wait, options.get(HideErrors), options.get(Internal),
-                                    options.get(Initialization), null, options.hasBeenSet(Secure), options.get(Secure), new KeyStoreOptions(options), options.get(SourcePath), connectionWatcher);
+                                    options.get(Initialization), null, options.hasBeenSet(Secure), options.get(Secure), new KeyStoreOptions(options), options.get(SourcePath),
+                                    options.get(SuspensionTimeout), connectionWatcher);
                 } catch (IOException e) {
                     PrintWriter info = new PrintWriter(env.err());
                     info.println(new InspectorIOException(hostAndPort.getHostPort(), e).getLocalizedMessage());
@@ -261,8 +328,9 @@ public final class InspectorInstrument extends TruffleInstrument {
                 if (server != null) {
                     return server.getConnection().getExecutionContext();
                 } else {
-                    PrintWriter err = (options.get(HideErrors)) ? null : new PrintWriter(env.err(), true);
-                    return new InspectorExecutionContext("Main Context", options.get(Internal), options.get(Initialization), env, Collections.emptyList(), err);
+                    PrintWriter info = new PrintWriter(env.err(), true);
+                    PrintWriter err = (options.get(HideErrors)) ? null : info;
+                    return new InspectorExecutionContext("Main Context", options.get(Internal), options.get(Initialization), env, Collections.emptyList(), info, err, options.get(SuspensionTimeout));
                 }
             }
         }));
@@ -294,7 +362,7 @@ public final class InspectorInstrument extends TruffleInstrument {
             @Override
             public Iterator<OptionDescriptor> iterator() {
                 Iterator<OptionDescriptor> iterator = descriptors.iterator();
-                return new Iterator<OptionDescriptor>() {
+                return new Iterator<>() {
                     @Override
                     public boolean hasNext() {
                         return iterator.hasNext();
@@ -307,7 +375,7 @@ public final class InspectorInstrument extends TruffleInstrument {
                             String example = " Example: " + File.separator + "projects" + File.separator + "foo" + File.separator + "src" + File.pathSeparator + "sources.jar" + File.pathSeparator +
                                             "package.zip!/src";
                             descriptor = OptionDescriptor.newBuilder(SourcePath, descriptor.getName()).deprecated(descriptor.isDeprecated()).category(descriptor.getCategory()).help(
-                                            descriptor.getHelp() + example).build();
+                                            descriptor.getHelp() + example).usageSyntax(SOURCE_PATH_USAGE).build();
                         }
                         return descriptor;
                     }
@@ -376,6 +444,11 @@ public final class InspectorInstrument extends TruffleInstrument {
             }
             return new InetSocketAddress(ia, port);
         }
+
+        @Override
+        public String toString() {
+            return (host != null ? host : "<loopback address>") + ":" + port;
+        }
     }
 
     private static final class Server {
@@ -387,7 +460,7 @@ public final class InspectorInstrument extends TruffleInstrument {
 
         Server(final Env env, final String contextName, final HostAndPort hostAndPort, final boolean attach, final boolean debugBreak, final boolean waitAttached, final boolean hideErrors,
                         final boolean inspectInternal, final boolean inspectInitialization, final String pathOrNull, final boolean secureHasBeenSet, final boolean secureValue,
-                        final KeyStoreOptions keyStoreOptions, final List<URI> sourcePath, final ConnectionWatcher connectionWatcher) throws IOException {
+                        final KeyStoreOptions keyStoreOptions, final List<URI> sourcePath, final Long suspensionTimeout, final ConnectionWatcher connectionWatcher) throws IOException {
             InetSocketAddress socketAddress = hostAndPort.createSocket();
             PrintWriter info = new PrintWriter(env.err(), true);
             final String pathContainingToken;
@@ -401,7 +474,7 @@ public final class InspectorInstrument extends TruffleInstrument {
             boolean secure = (!secureHasBeenSet && socketAddress.getAddress().isLoopbackAddress()) ? false : secureValue;
 
             PrintWriter err = (hideErrors) ? null : info;
-            executionContext = new InspectorExecutionContext(contextName, inspectInternal, inspectInitialization, env, sourcePath, err);
+            executionContext = new InspectorExecutionContext(contextName, inspectInternal, inspectInitialization, env, sourcePath, info, err, suspensionTimeout);
             if (attach) {
                 wss = new InspectWSClient(socketAddress, pathContainingToken, executionContext, debugBreak, secure, keyStoreOptions, connectionWatcher, info);
                 urlContainingToken = ((InspectWSClient) wss).getURI().toString();
@@ -412,7 +485,7 @@ public final class InspectorInstrument extends TruffleInstrument {
                 } catch (URISyntaxException ex) {
                     throw new IOException(ex);
                 }
-                InspectServerSession iss = InspectServerSession.create(executionContext, debugBreak, connectionWatcher);
+                InspectServerSession iss = InspectServerSession.create(executionContext, debugBreak, connectionWatcher, () -> doFinalize());
                 boolean disposeIss = true;
                 try {
                     WSInterceptorServer interceptor = new WSInterceptorServer(socketAddress.getPort(), token, iss, connectionWatcher);
@@ -434,7 +507,7 @@ public final class InspectorInstrument extends TruffleInstrument {
                         info.println("E.g. in Chrome open: " + server.getDevtoolsAddress(token));
                         info.flush();
                     } else {
-                        restartServerEndpointOnClose(hostAndPort, env, wsuri, executionContext, connectionWatcher, iss, interceptor);
+                        restartServerEndpointOnClose(hostAndPort, env, wsuri, executionContext, connectionWatcher, iss, interceptor, () -> doFinalize());
                         interceptor.opened(serverEndpoint);
                         wss = interceptor;
                         urlContainingToken = wsuri.toString();
@@ -483,7 +556,13 @@ public final class InspectorInstrument extends TruffleInstrument {
                     @TruffleBoundary
                     private void waitForRunPermission() {
                         try {
-                            executionContext.waitForRunPermission();
+                            boolean success = executionContext.waitForRunPermission(suspensionTimeout);
+                            if (!success) {
+                                // Timeout expired, abandon debugging
+                                info.println("Timeout of " + suspensionTimeout + "ms as specified via '--" + InspectorInstrument.INSTRUMENT_ID +
+                                                ".SuspensionTimeout' was reached. Debugging is abandoned.");
+                                doFinalize();
+                            }
                         } catch (InterruptedException ex) {
                         }
                         final EventBinding<?> binding = execEnter.getAndSet(null);
@@ -507,6 +586,7 @@ public final class InspectorInstrument extends TruffleInstrument {
             return Base64.getEncoder().withoutPadding().encodeToString(tokenRaw).replace('/', '_').replace('+', '-');
         }
 
+        @SuppressFBWarnings(value = "DMI_RANDOM_USED_ONLY_ONCE", justification = "avoiding a static field which would cache the random seed in a native image")
         private static byte[] generateSecureRawToken() {
             // 256 bits of entropy ought to be enough for everybody
             final byte[] tokenRaw = new byte[32];
@@ -515,10 +595,10 @@ public final class InspectorInstrument extends TruffleInstrument {
         }
 
         private static void restartServerEndpointOnClose(HostAndPort hostAndPort, Env env, URI wsuri, InspectorExecutionContext executionContext, ConnectionWatcher connectionWatcher,
-                        InspectServerSession iss, WSInterceptorServer interceptor) {
+                        InspectServerSession iss, WSInterceptorServer interceptor, Runnable sessionDisposal) {
             iss.onClose(() -> {
                 // debugBreak = false, do not break on re-connect
-                InspectServerSession newSession = InspectServerSession.create(executionContext, false, connectionWatcher);
+                InspectServerSession newSession = InspectServerSession.create(executionContext, false, connectionWatcher, sessionDisposal);
                 interceptor.newSession(newSession);
                 MessageEndpoint serverEndpoint;
                 try {
@@ -530,7 +610,7 @@ public final class InspectorInstrument extends TruffleInstrument {
                     throw new InspectorIOException(hostAndPort.getHostPort(), ioex);
                 }
                 interceptor.opened(serverEndpoint);
-                restartServerEndpointOnClose(hostAndPort, env, wsuri, executionContext, connectionWatcher, newSession, interceptor);
+                restartServerEndpointOnClose(hostAndPort, env, wsuri, executionContext, connectionWatcher, newSession, interceptor, sessionDisposal);
             });
         }
 
@@ -543,6 +623,7 @@ public final class InspectorInstrument extends TruffleInstrument {
 
         void doFinalize() {
             if (wss != null) {
+                wss.closing(token);
                 try {
                     wss.close(token);
                 } catch (IOException ioex) {

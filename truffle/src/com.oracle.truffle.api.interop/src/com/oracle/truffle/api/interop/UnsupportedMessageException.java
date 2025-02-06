@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2016, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2016, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -96,7 +96,7 @@ public final class UnsupportedMessageException extends InteropException {
      * if the {@link InteropException} is translated to a source language error. If the
      * {@link InteropException} is discarded, then the cause will most likely get discarded by the
      * source language as well. Note that the cause must be of type
-     * {@link com.oracle.truffle.api.TruffleException} in addition to {@link Throwable} otherwise an
+     * {@link com.oracle.truffle.api.exception.AbstractTruffleException} otherwise an
      * {@link IllegalArgumentException} is thrown.
      * <p>
      * This method is designed to be used in {@link CompilerDirectives#inCompiledCode() compiled}
@@ -105,7 +105,6 @@ public final class UnsupportedMessageException extends InteropException {
      * @param cause the guest language exception that caused the error.
      * @since 20.2
      */
-    @SuppressWarnings("deprecation")
     public static UnsupportedMessageException create(Throwable cause) {
         return new UnsupportedMessageException(cause);
     }

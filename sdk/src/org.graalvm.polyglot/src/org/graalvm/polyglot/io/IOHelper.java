@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2023, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -41,9 +41,7 @@
 package org.graalvm.polyglot.io;
 
 import java.io.IOException;
-import java.io.OutputStream;
 import java.lang.reflect.Method;
-import java.nio.Buffer;
 import java.nio.ByteBuffer;
 import java.nio.channels.SeekableByteChannel;
 import java.nio.file.AccessMode;
@@ -57,14 +55,16 @@ import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.util.EnumSet;
 import java.util.HashSet;
-import java.util.List;
 import java.util.Map;
-import java.util.Objects;
 import java.util.Set;
+
 import org.graalvm.polyglot.Engine;
+import org.graalvm.polyglot.io.MessageTransport.VetoException;
 import org.graalvm.polyglot.impl.AbstractPolyglotImpl;
 
 final class IOHelper {
+
+    static final IOAccessorImpl ACCESS = new IOAccessorImpl();
 
     private IOHelper() {
         throw new IllegalStateException("No instance allowed.");
@@ -74,19 +74,18 @@ final class IOHelper {
         copy(source, target, fileSystem, fileSystem, options);
     }
 
-    /**
-     * See {@code org.graalvm.compiler.serviceprovider.BufferUtil}.
-     */
-    private static Buffer asBaseBuffer(Buffer obj) {
-        return obj;
-    }
-
     static void copy(final Path source, final Path target, final FileSystem sourceFileSystem, final FileSystem targetFileSystem, CopyOption... options) throws IOException {
         if (source.equals(target)) {
             return;
         }
-        final Path sourceReal = sourceFileSystem.toRealPath(source, LinkOption.NOFOLLOW_LINKS);
-        final Path targetReal = targetFileSystem.toRealPath(target, LinkOption.NOFOLLOW_LINKS);
+        Path sourceReal = sourceFileSystem.toRealPath(source, LinkOption.NOFOLLOW_LINKS);
+        Path targetReal;
+        try {
+            targetReal = targetFileSystem.toRealPath(target, LinkOption.NOFOLLOW_LINKS);
+        } catch (NoSuchFileException doesNotExist) {
+            // Target does not exist
+            targetReal = target;
+        }
         if (sourceReal.equals(targetReal)) {
             return;
         }
@@ -136,11 +135,11 @@ final class IOHelper {
                             SeekableByteChannel targetChannel = targetFileSystem.newByteChannel(targetReal, writeOptions)) {
                 final ByteBuffer buffer = ByteBuffer.allocateDirect(1 << 16);
                 while (sourceChannel.read(buffer) != -1) {
-                    asBaseBuffer(buffer).flip();
+                    buffer.flip();
                     while (buffer.hasRemaining()) {
                         targetChannel.write(buffer);
                     }
-                    asBaseBuffer(buffer).clear();
+                    buffer.clear();
                 }
             }
         }
@@ -184,37 +183,57 @@ final class IOHelper {
         sourceFileSystem.delete(source);
     }
 
-    static final AbstractPolyglotImpl IMPL = initImpl();
+    /*
+     * ImplHolder is needed because at the time of initializing this Engine might not yet be fully
+     * initialized.
+     */
+    static class ImplHolder {
 
-    private static AbstractPolyglotImpl initImpl() {
-        try {
-            Method method = Engine.class.getDeclaredMethod("getImpl");
-            method.setAccessible(true);
-            AbstractPolyglotImpl polyglotImpl = (AbstractPolyglotImpl) method.invoke(null);
-            polyglotImpl.setIO(new IOAccessImpl());
-            return polyglotImpl;
-        } catch (Exception e) {
-            throw new IllegalStateException("Failed to initialize execution listener class.", e);
+        static final AbstractPolyglotImpl IMPL = initImpl();
+
+        private static AbstractPolyglotImpl initImpl() {
+            try {
+                Method method = Engine.class.getDeclaredMethod("getImpl");
+                method.setAccessible(true);
+                AbstractPolyglotImpl polyglotImpl = (AbstractPolyglotImpl) method.invoke(null);
+                return polyglotImpl;
+            } catch (Exception e) {
+                throw new IllegalStateException("Failed to initialize execution listener class.", e);
+            }
         }
+
     }
 
-    private static final class IOAccessImpl extends AbstractPolyglotImpl.IOAccess {
+    private static final class IOAccessorImpl extends AbstractPolyglotImpl.IOAccessor {
 
         @Override
-        public ProcessHandler.ProcessCommand newProcessCommand(List<String> cmd, String cwd, Map<String, String> environment, boolean redirectErrorStream,
-                        ProcessHandler.Redirect inputRedirect, ProcessHandler.Redirect outputRedirect, ProcessHandler.Redirect errorRedirect) {
-            return new ProcessHandler.ProcessCommand(cmd, cwd, environment, redirectErrorStream, inputRedirect, outputRedirect, errorRedirect);
+        public Object createIOAccess(String name, boolean allowHostFileAccess, boolean allowSocketAccess, FileSystem fileSystem) {
+            return new IOAccess(name, allowHostFileAccess, allowSocketAccess, fileSystem);
         }
 
         @Override
-        public ProcessHandler.Redirect createRedirectToStream(OutputStream stream) {
-            Objects.requireNonNull("Stream must be non null.");
-            return new ProcessHandler.Redirect(ProcessHandler.Redirect.Type.STREAM, stream);
+        public FileSystem getFileSystem(Object ioAccess) {
+            return ((IOAccess) ioAccess).getFileSystem();
         }
 
         @Override
-        public OutputStream getOutputStream(ProcessHandler.Redirect redirect) {
-            return redirect.getOutputStream();
+        public boolean hasHostFileAccess(Object ioAccess) {
+            return ((IOAccess) ioAccess).hasHostFileAccess();
+        }
+
+        @Override
+        public boolean hasHostSocketAccess(Object ioAccess) {
+            return ((IOAccess) ioAccess).hasHostSocketAccess();
+        }
+
+        @Override
+        public boolean isVetoException(Throwable exception) {
+            return exception instanceof VetoException;
+        }
+
+        @Override
+        public Exception createVetoException(String message) {
+            return new VetoException(message);
         }
     }
 }

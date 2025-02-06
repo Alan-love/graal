@@ -32,6 +32,7 @@ import java.io.OutputStream;
 import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
@@ -45,10 +46,12 @@ import java.util.function.Consumer;
  * "http://hg.openjdk.java.net/jdk6/jdk6/jdk/raw-file/tip/src/share/demo/jvmti/hprof/manual.html">
  * Java Profiler Heap Dump Format</a>.
  * <p>
- * {@codesnippet org.graalvm.tools.insight.test.heap.HeapDumpTest#generateSampleHeapDump}
+ * {@snippet file = "org/graalvm/tools/insight/test/heap/HeapDumpTest.java" region =
+ * "org.graalvm.tools.insight.test.heap.HeapDumpTest#generateSampleHeapDump"}
  *
  * @since 21.1
  */
+@SuppressWarnings("javadoc")
 public final class HeapDump {
     // constants for the Java Profiler Heap Dump Format
     private static final String MAGIC = "JAVA PROFILE 1.0.1";
@@ -63,6 +66,7 @@ public final class HeapDump {
     private static final int HEAP_ROOT_THREAD_OBJECT = 0x08;
     private static final int HEAP_CLASS_DUMP = 0x20;
     private static final int HEAP_INSTANCE_DUMP = 0x21;
+    private static final int HEAP_OBJECT_ARRAY_DUMP = 0x22;
     private static final int HEAP_PRIMITIVE_ARRAY_DUMP = 0x23;
 
     // types used in heap dump
@@ -103,6 +107,7 @@ public final class HeapDump {
     private final ClassInstance typeObject;
     private final ClassInstance typeString;
     private final ClassInstance typeThread;
+    private ClassInstance typeObjectArray;
 
     HeapDump() {
         this.builder = null;
@@ -119,18 +124,19 @@ public final class HeapDump {
         newClass("char[]").dumpClass();
         this.typeString = newClass("java.lang.String").field("value", char[].class).field("hash", Integer.TYPE).dumpClass();
         this.typeThread = newClass("java.lang.Thread").field("daemon", Boolean.TYPE).field("name", String.class).field("priority", Integer.TYPE).dumpClass();
+        this.typeObjectArray = newClass("[Ljava/lang/Object;").dumpClass();
     }
 
     /**
      * Starts generating new {@code .hprof} file. Follow with {@link Builder#dumpHeap} call.
      * <p>
-     * {@codesnippet org.graalvm.tools.insight.test.heap.HeapDumpTest#generateSampleHeapDump}
+     * {@snippet file = "org/graalvm/tools/insight/test/heap/HeapDumpTest.java" region =
+     * "org.graalvm.tools.insight.test.heap.HeapDumpTest#generateSampleHeapDump"}
      *
      * @param os output stream to write data to
      * @return new builder
-     * @throws IOException on I/O error
      */
-    public static Builder newHeapBuilder(OutputStream os) throws IOException {
+    public static Builder newHeapBuilder(OutputStream os) {
         final HeapDump dummyWrapper = new HeapDump();
         return dummyWrapper.new Builder(Identifiers.FOUR, os);
     }
@@ -138,7 +144,8 @@ public final class HeapDump {
     /**
      * Builder to construct content of the heap dump file.
      * <p>
-     * {@codesnippet org.graalvm.tools.insight.test.heap.HeapDumpTest#generateSampleHeapDump}
+     * {@snippet file = "org/graalvm/tools/insight/test/heap/HeapDumpTest.java" region =
+     * "org.graalvm.tools.insight.test.heap.HeapDumpTest#generateSampleHeapDump"}
      *
      * @since 21.1
      */
@@ -170,11 +177,12 @@ public final class HeapDump {
         /**
          * Generates heap dump.
          * <p>
-         * {@codesnippet org.graalvm.tools.insight.test.heap.HeapDumpTest#generateSampleHeapDump}
-         * 
+         * {@snippet file = "org/graalvm/tools/insight/test/heap/HeapDumpTest.java" region =
+         * "org.graalvm.tools.insight.test.heap.HeapDumpTest#generateSampleHeapDump"}
+         *
          * @param generator callback that performs the heap generating operations
          * @throws IOException when an I/O error occurs
-         * 
+         *
          * @see HeapDump#newHeapBuilder(java.io.OutputStream)
          * @since 21.1
          */
@@ -187,12 +195,13 @@ public final class HeapDump {
          * {@link HeapDump dumps} in a single file, it is expected the subsequent values of
          * {@code timeStamp} are not going to be decreasing.
          * <p>
-         * {@codesnippet org.graalvm.tools.insight.test.heap.HeapDumpTest#generateSampleHeapDump}
-         * 
+         * {@snippet file = "org/graalvm/tools/insight/test/heap/HeapDumpTest.java" region =
+         * "org.graalvm.tools.insight.test.heap.HeapDumpTest#generateSampleHeapDump"}
+         *
          * @param timeStamp time when the heap dump is supposed to be taken in milliseconds
          * @param generator callback that performs the heap generating operations
          * @throws IOException when an I/O error occurs
-         * 
+         *
          * @see HeapDump#newHeapBuilder(java.io.OutputStream)
          * @since 21.1
          */
@@ -424,6 +433,22 @@ public final class HeapDump {
         }
     }
 
+    /**
+     * Starts building an object array.
+     *
+     * @param len the size of the array
+     * @return new array builder
+     *
+     * @since 21.3.2
+     */
+    public ArrayBuilder newArray(int len) {
+        try {
+            return new ArrayBuilder(this.typeObjectArray, len, builder.objectCounter.next());
+        } catch (IOException ex) {
+            throw new UncheckedIOException(ex);
+        }
+    }
+
     void flush() throws IOException {
         heap.flush();
     }
@@ -471,8 +496,8 @@ public final class HeapDump {
 
     /**
      * Dumps a primitive value ({@code int}, {@code long}, {@code float}, {@code byte}, {@code char}
-     * & other) into the {@link HeapDump}. Encodes the value as appropriate boxed object (
-     * {@link Integer}, {@link Long}, {@link Float}, {@link Byte}, {@link Character} & co.).
+     * &amp; other) into the {@link HeapDump}. Encodes the value as appropriate boxed object (
+     * {@link Integer}, {@link Long}, {@link Float}, {@link Byte}, {@link Character} &amp; co.).
      *
      * @param obj primitive value
      * @return object instance representing the value in the heap
@@ -501,7 +526,8 @@ public final class HeapDump {
      * Allows one to describe a state of a thread with local variables and record it in the
      * generated {@link HeapDump}.
      * <p>
-     * {@codesnippet org.graalvm.tools.insight.test.heap.HeapDumpTest#cyclic}
+     * {@snippet file = "org/graalvm/tools/insight/test/heap/HeapDumpTest.java" region =
+     * "org.graalvm.tools.insight.test.heap.HeapDumpTest#cyclic"}
      *
      * @since 21.1
      * @see HeapDump#newThread(java.lang.String)
@@ -586,7 +612,8 @@ public final class HeapDump {
     /**
      * Builds structure of a new class for the {@link HeapDump}.
      * <p>
-     * {@codesnippet org.graalvm.tools.insight.test.heap.HeapDumpTest#generateSampleHeapDump}
+     * {@snippet file = "org/graalvm/tools/insight/test/heap/HeapDumpTest.java" region =
+     * "org.graalvm.tools.insight.test.heap.HeapDumpTest#generateSampleHeapDump"}
      *
      * @since 21.1
      * @see HeapDump#newClass(java.lang.String)
@@ -603,7 +630,7 @@ public final class HeapDump {
 
         /**
          * Adds new field with given name and type to the class definition. Primitive {@code type}
-         * (like ({@code int.class} & co.) fields values are stored directly in the
+         * (like ({@code int.class} &amp; co.) fields values are stored directly in the
          * {@link InstanceBuilder instance dump}. Other types are references to other
          * {@link ObjectInstance instances} in the dump.
          *
@@ -692,7 +719,8 @@ public final class HeapDump {
     /**
      * Fills data for new object instance to put into the {@link HeapDump}.
      * <p>
-     * {@codesnippet org.graalvm.tools.insight.test.heap.HeapDumpTest#generateSampleHeapDump}
+     * {@snippet file = "org/graalvm/tools/insight/test/heap/HeapDumpTest.java" region =
+     * "org.graalvm.tools.insight.test.heap.HeapDumpTest#generateSampleHeapDump"}
      *
      * @since 21.1
      * @see HeapDump#newInstance(org.graalvm.tools.insight.heap.HeapDump.ClassInstance)
@@ -880,8 +908,9 @@ public final class HeapDump {
         /**
          * The ID assigned to the instance. Allows one to obtain ID of an instance before it is
          * dumped into the {@link HeapDump}.
-         * <p>
-         * {@codesnippet org.graalvm.tools.insight.test.heap.HeapDumpTest#cyclic}
+         * 
+         * {@snippet file = "org/graalvm/tools/insight/test/heap/HeapDumpTest.java" region =
+         * "org.graalvm.tools.insight.test.heap.HeapDumpTest#cyclic"}
          *
          * @return object reference for the instance that's going to be built when
          *         {@link #dumpInstance()} method is invoked
@@ -930,6 +959,83 @@ public final class HeapDump {
                 } else {
                     builder.ids.writeID(heap, ref == null ? 0 : ((Number) ref).intValue());
                 }
+            }
+        }
+    }
+
+    /**
+     * Fills data for new array to put into the {@link HeapDump}.
+     *
+     * @since 21.3.2
+     * @see HeapDump#newArray(int)
+     */
+    public final class ArrayBuilder {
+        private final ClassInstance clazz;
+        private final ObjectInstance instanceId;
+        private final List<ObjectInstance> elements;
+
+        private ArrayBuilder(ClassInstance clazz, int length, int instanceId) {
+            this.clazz = clazz;
+            this.elements = Arrays.asList(new ObjectInstance[length]);
+            this.instanceId = new ObjectInstance(instanceId);
+        }
+
+        /**
+         * Puts reference to another object into the array.
+         *
+         * @param index zero based index into the array
+         * @param value reference to object in the {@link HeapDump}
+         * @return {@code this} builder
+         *
+         * @since 21.3.2
+         */
+        public ArrayBuilder put(int index, ObjectInstance value) {
+            elements.set(index, value);
+            return this;
+        }
+
+        /**
+         * Dumps the gathered array values into the {@link HeapDump}.
+         *
+         * @return object representing the written instance
+         * @throws UncheckedIOException when an I/O error occurs
+         *
+         * @see #put(int, org.graalvm.tools.insight.heap.HeapDump.ObjectInstance)
+         * @since 21.3.2
+         */
+        public ObjectInstance dumpInstance() throws UncheckedIOException {
+            try {
+                dumpArray(HeapDump.this);
+                return instanceId;
+            } catch (IOException ex) {
+                throw new UncheckedIOException(ex);
+            }
+        }
+
+        /**
+         * The ID assigned to the instance. Allows one to obtain ID of an instance before it is
+         * dumped into the {@link HeapDump}.
+         * <p>
+         * {@snippet file = "org/graalvm/tools/insight/test/heap/HeapDumpTest.java" region =
+         * "org.graalvm.tools.insight.test.heap.HeapDumpTest#cyclic"}
+         *
+         * @return object reference for the instance that's going to be built when
+         *         {@link #dumpInstance()} method is invoked
+         *
+         * @since 21.3.2
+         */
+        public ObjectInstance id() {
+            return instanceId;
+        }
+
+        private void dumpArray(HeapDump thiz) throws IOException {
+            heap.writeByte(HEAP_OBJECT_ARRAY_DUMP);
+            builder.ids.writeID(heap, instanceId.id(thiz));
+            builder.writeDefaultStackTraceSerialNumber(heap);
+            heap.writeInt(elements.size());
+            builder.ids.writeID(heap, clazz.id(thiz));
+            for (ObjectInstance ref : elements) {
+                builder.ids.writeID(heap, ref == null ? 0 : ref.id(thiz));
             }
         }
     }

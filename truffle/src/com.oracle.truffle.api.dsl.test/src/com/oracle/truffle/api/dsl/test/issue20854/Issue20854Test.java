@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2020, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -54,13 +54,15 @@ import com.oracle.truffle.api.library.ExportMessage;
  */
 @SuppressWarnings("unused")
 @ExportLibrary(InteropLibrary.class)
-class Issue20854Test extends BaseType {
+final class Issue20854Test extends BaseType {
 
+    @SuppressWarnings("static-method")
     @ExportMessage
     public boolean isExecutable() {
         return false;
     }
 
+    @SuppressWarnings("static-method")
     @ExportMessage
     Object execute(Object[] args) throws UnsupportedMessageException {
         throw UnsupportedMessageException.create();

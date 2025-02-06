@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2017, 2025, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -40,11 +40,12 @@
  */
 package org.graalvm.polyglot;
 
+import java.util.Objects;
 import java.util.Set;
 
 import org.graalvm.options.OptionDescriptor;
 import org.graalvm.options.OptionDescriptors;
-import org.graalvm.polyglot.impl.AbstractPolyglotImpl.AbstractLanguageImpl;
+import org.graalvm.polyglot.impl.AbstractPolyglotImpl.AbstractLanguageDispatch;
 
 /**
  * A handle for a Graal language installed in an {@link Engine engine}. The handle provides access
@@ -56,10 +57,18 @@ import org.graalvm.polyglot.impl.AbstractPolyglotImpl.AbstractLanguageImpl;
  */
 public final class Language {
 
-    final AbstractLanguageImpl impl;
+    final AbstractLanguageDispatch dispatch;
+    final Object receiver;
+    /**
+     * Strong reference to {@link Engine} to prevent it from being garbage collected and closed
+     * while {@link Language} is still reachable.
+     */
+    final Engine engine;
 
-    Language(AbstractLanguageImpl impl) {
-        this.impl = impl;
+    Language(AbstractLanguageDispatch dispatch, Object receiver, Engine engine) {
+        this.dispatch = dispatch;
+        this.receiver = receiver;
+        this.engine = Objects.requireNonNull(engine);
     }
 
     /**
@@ -70,7 +79,7 @@ public final class Language {
      * @since 19.0
      */
     public String getId() {
-        return impl.getId();
+        return dispatch.getId(receiver);
     }
 
     /**
@@ -80,7 +89,7 @@ public final class Language {
      * @since 19.0
      */
     public String getName() {
-        return impl.getName();
+        return dispatch.getName(receiver);
     }
 
     /**
@@ -90,7 +99,7 @@ public final class Language {
      * @since 19.0
      */
     public String getImplementationName() {
-        return impl.getImplementationName();
+        return dispatch.getImplementationName(receiver);
     }
 
     /**
@@ -99,7 +108,7 @@ public final class Language {
      * @since 19.0
      */
     public String getVersion() {
-        return impl.getVersion();
+        return dispatch.getVersion(receiver);
     }
 
     /**
@@ -110,7 +119,7 @@ public final class Language {
      * @since 19.0
      */
     public boolean isInteractive() {
-        return impl.isInteractive();
+        return dispatch.isInteractive(receiver);
     }
 
     /**
@@ -122,7 +131,18 @@ public final class Language {
      * @since 19.0
      */
     public OptionDescriptors getOptions() {
-        return impl.getOptions();
+        return dispatch.getOptions(receiver);
+    }
+
+    /**
+     * Returns the source options descriptors available for sources of this language.
+     *
+     * @see #getOptions()
+     * @see Source.Builder#option(String, String)
+     * @since 25.0
+     */
+    public OptionDescriptors getSourceOptions() {
+        return dispatch.getSourceOptions(receiver);
     }
 
     /**
@@ -135,7 +155,7 @@ public final class Language {
      * @since 19.0
      */
     public String getDefaultMimeType() {
-        return impl.getDefaultMimeType();
+        return dispatch.getDefaultMimeType(receiver);
     }
 
     /**
@@ -145,7 +165,42 @@ public final class Language {
      * @since 19.0
      */
     public Set<String> getMimeTypes() {
-        return impl.getMimeTypes();
+        return dispatch.getMimeTypes(receiver);
+    }
+
+    /**
+     * Get the URL for the language website.
+     *
+     * @since 21.1.0
+     */
+    public String getWebsite() {
+        return dispatch.getWebsite(receiver);
+    }
+
+    /**
+     * {@inheritDoc}
+     *
+     * @since 24.2
+     */
+    @Override
+    public int hashCode() {
+        return this.dispatch.hashCode(this.receiver);
+    }
+
+    /**
+     * {@inheritDoc}
+     *
+     * @since 24.2
+     */
+    @Override
+    public boolean equals(Object obj) {
+        Object otherImpl;
+        if (obj instanceof Language) {
+            otherImpl = ((Language) obj).receiver;
+        } else {
+            return false;
+        }
+        return dispatch.equals(receiver, otherImpl);
     }
 
 }

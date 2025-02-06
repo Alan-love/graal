@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2019, 2022, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -22,25 +22,42 @@
  */
 package com.oracle.truffle.espresso.impl;
 
-import static com.oracle.truffle.espresso.bytecode.Bytecodes.ALOAD_0;
-import static com.oracle.truffle.espresso.bytecode.Bytecodes.GETFIELD;
-import static com.oracle.truffle.espresso.bytecode.Bytecodes.GETSTATIC;
-import static com.oracle.truffle.espresso.bytecode.Bytecodes.MONITORENTER;
-import static com.oracle.truffle.espresso.bytecode.Bytecodes.MONITOREXIT;
-import static com.oracle.truffle.espresso.bytecode.Bytecodes.PUTFIELD;
-import static com.oracle.truffle.espresso.bytecode.Bytecodes.PUTSTATIC;
-import static com.oracle.truffle.espresso.bytecode.Bytecodes.RETURN;
+import static com.oracle.truffle.espresso.classfile.Constants.ACC_CALLER_SENSITIVE;
+import static com.oracle.truffle.espresso.classfile.Constants.ACC_DONT_INLINE;
+import static com.oracle.truffle.espresso.classfile.Constants.ACC_FINAL;
+import static com.oracle.truffle.espresso.classfile.Constants.ACC_FORCE_INLINE;
+import static com.oracle.truffle.espresso.classfile.Constants.ACC_HIDDEN;
 import static com.oracle.truffle.espresso.classfile.Constants.ACC_NATIVE;
+import static com.oracle.truffle.espresso.classfile.Constants.ACC_SCOPED;
+import static com.oracle.truffle.espresso.classfile.Constants.ACC_STATIC;
+import static com.oracle.truffle.espresso.classfile.Constants.ACC_SYNTHETIC;
 import static com.oracle.truffle.espresso.classfile.Constants.ACC_VARARGS;
 import static com.oracle.truffle.espresso.classfile.Constants.REF_invokeInterface;
 import static com.oracle.truffle.espresso.classfile.Constants.REF_invokeSpecial;
 import static com.oracle.truffle.espresso.classfile.Constants.REF_invokeStatic;
 import static com.oracle.truffle.espresso.classfile.Constants.REF_invokeVirtual;
+import static com.oracle.truffle.espresso.classfile.bytecode.Bytecodes.ALOAD_0;
+import static com.oracle.truffle.espresso.classfile.bytecode.Bytecodes.GETFIELD;
+import static com.oracle.truffle.espresso.classfile.bytecode.Bytecodes.GETSTATIC;
+import static com.oracle.truffle.espresso.classfile.bytecode.Bytecodes.INVOKEDYNAMIC;
+import static com.oracle.truffle.espresso.classfile.bytecode.Bytecodes.JSR;
+import static com.oracle.truffle.espresso.classfile.bytecode.Bytecodes.JSR_W;
+import static com.oracle.truffle.espresso.classfile.bytecode.Bytecodes.MONITORENTER;
+import static com.oracle.truffle.espresso.classfile.bytecode.Bytecodes.MONITOREXIT;
+import static com.oracle.truffle.espresso.classfile.bytecode.Bytecodes.PUTFIELD;
+import static com.oracle.truffle.espresso.classfile.bytecode.Bytecodes.PUTSTATIC;
+import static com.oracle.truffle.espresso.classfile.bytecode.Bytecodes.RET;
+import static com.oracle.truffle.espresso.classfile.bytecode.Bytecodes.RETURN;
 
 import java.io.PrintStream;
+import java.lang.invoke.VarHandle;
 import java.lang.reflect.Modifier;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.List;
+import java.util.Objects;
+import java.util.function.Function;
+import java.util.function.IntFunction;
 import java.util.logging.Level;
 
 import com.oracle.truffle.api.Assumption;
@@ -49,57 +66,79 @@ import com.oracle.truffle.api.CompilerAsserts;
 import com.oracle.truffle.api.CompilerDirectives;
 import com.oracle.truffle.api.CompilerDirectives.CompilationFinal;
 import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
-import com.oracle.truffle.api.Truffle;
-import com.oracle.truffle.api.frame.FrameDescriptor;
-import com.oracle.truffle.api.frame.FrameSlotKind;
+import com.oracle.truffle.api.dsl.Idempotent;
 import com.oracle.truffle.api.interop.TruffleObject;
+import com.oracle.truffle.api.nodes.ExplodeLoop;
 import com.oracle.truffle.api.source.Source;
+import com.oracle.truffle.api.source.SourceSection;
 import com.oracle.truffle.espresso.EspressoOptions;
-import com.oracle.truffle.espresso.bytecode.BytecodeStream;
-import com.oracle.truffle.espresso.bytecode.Bytecodes;
+import com.oracle.truffle.espresso.analysis.frame.EspressoFrameDescriptor;
+import com.oracle.truffle.espresso.analysis.frame.FrameAnalysis;
+import com.oracle.truffle.espresso.analysis.hierarchy.ClassHierarchyAssumption;
+import com.oracle.truffle.espresso.analysis.hierarchy.ClassHierarchyOracle;
+import com.oracle.truffle.espresso.analysis.liveness.LivenessAnalysis;
+import com.oracle.truffle.espresso.bytecode.BytecodePrinter;
 import com.oracle.truffle.espresso.classfile.ConstantPool;
 import com.oracle.truffle.espresso.classfile.Constants;
-import com.oracle.truffle.espresso.classfile.RuntimeConstantPool;
-import com.oracle.truffle.espresso.classfile.attributes.BootstrapMethodsAttribute;
+import com.oracle.truffle.espresso.classfile.ExceptionHandler;
+import com.oracle.truffle.espresso.classfile.JavaKind;
+import com.oracle.truffle.espresso.classfile.ParserException;
+import com.oracle.truffle.espresso.classfile.ParserKlass;
+import com.oracle.truffle.espresso.classfile.ParserMethod;
+import com.oracle.truffle.espresso.classfile.attributes.Attribute;
 import com.oracle.truffle.espresso.classfile.attributes.CodeAttribute;
 import com.oracle.truffle.espresso.classfile.attributes.ExceptionsAttribute;
 import com.oracle.truffle.espresso.classfile.attributes.LineNumberTableAttribute;
 import com.oracle.truffle.espresso.classfile.attributes.LocalVariableTable;
 import com.oracle.truffle.espresso.classfile.attributes.SignatureAttribute;
-import com.oracle.truffle.espresso.classfile.attributes.SourceFileAttribute;
-import com.oracle.truffle.espresso.descriptors.Signatures;
-import com.oracle.truffle.espresso.descriptors.Symbol;
-import com.oracle.truffle.espresso.descriptors.Symbol.Name;
-import com.oracle.truffle.espresso.descriptors.Symbol.Signature;
-import com.oracle.truffle.espresso.descriptors.Symbol.Type;
+import com.oracle.truffle.espresso.classfile.bytecode.BytecodeStream;
+import com.oracle.truffle.espresso.classfile.bytecode.Bytecodes;
+import com.oracle.truffle.espresso.classfile.descriptors.ByteSequence;
+import com.oracle.truffle.espresso.classfile.descriptors.Name;
+import com.oracle.truffle.espresso.classfile.descriptors.Signature;
+import com.oracle.truffle.espresso.classfile.descriptors.SignatureSymbols;
+import com.oracle.truffle.espresso.classfile.descriptors.Symbol;
+import com.oracle.truffle.espresso.classfile.descriptors.Type;
+import com.oracle.truffle.espresso.constantpool.RuntimeConstantPool;
+import com.oracle.truffle.espresso.descriptors.EspressoSymbols.Names;
+import com.oracle.truffle.espresso.descriptors.EspressoSymbols.Types;
 import com.oracle.truffle.espresso.ffi.NativeAccess;
 import com.oracle.truffle.espresso.ffi.NativeSignature;
 import com.oracle.truffle.espresso.ffi.NativeType;
 import com.oracle.truffle.espresso.ffi.Pointer;
+import com.oracle.truffle.espresso.impl.generics.factory.CoreReflectionFactory;
+import com.oracle.truffle.espresso.impl.generics.parser.SignatureParser;
+import com.oracle.truffle.espresso.impl.generics.tree.MethodTypeSignature;
+import com.oracle.truffle.espresso.impl.generics.tree.ReturnType;
+import com.oracle.truffle.espresso.impl.generics.tree.TypeSignature;
+import com.oracle.truffle.espresso.impl.generics.visitor.Reifier;
 import com.oracle.truffle.espresso.jdwp.api.Ids;
 import com.oracle.truffle.espresso.jdwp.api.KlassRef;
-import com.oracle.truffle.espresso.jdwp.api.LineNumberTableRef;
-import com.oracle.truffle.espresso.jdwp.api.LocalVariableTableRef;
-import com.oracle.truffle.espresso.jdwp.api.MethodBreakpoint;
+import com.oracle.truffle.espresso.jdwp.api.MethodHook;
 import com.oracle.truffle.espresso.jdwp.api.MethodRef;
 import com.oracle.truffle.espresso.jni.Mangle;
 import com.oracle.truffle.espresso.meta.EspressoError;
-import com.oracle.truffle.espresso.meta.ExceptionHandler;
-import com.oracle.truffle.espresso.meta.JavaKind;
 import com.oracle.truffle.espresso.meta.Meta;
 import com.oracle.truffle.espresso.meta.MetaUtil;
-import com.oracle.truffle.espresso.nodes.BytecodeNode;
 import com.oracle.truffle.espresso.nodes.EspressoRootNode;
-import com.oracle.truffle.espresso.nodes.NativeMethodNode;
 import com.oracle.truffle.espresso.nodes.interop.AbstractLookupNode;
+import com.oracle.truffle.espresso.nodes.methodhandle.MHInvokeGenericNode.MethodHandleInvoker;
 import com.oracle.truffle.espresso.nodes.methodhandle.MethodHandleIntrinsicNode;
-import com.oracle.truffle.espresso.runtime.Attribute;
 import com.oracle.truffle.espresso.runtime.EspressoContext;
+import com.oracle.truffle.espresso.runtime.EspressoThreadLocalState;
 import com.oracle.truffle.espresso.runtime.MethodHandleIntrinsics;
-import com.oracle.truffle.espresso.runtime.StaticObject;
+import com.oracle.truffle.espresso.runtime.staticobject.StaticObject;
+import com.oracle.truffle.espresso.shared.meta.ErrorType;
+import com.oracle.truffle.espresso.shared.meta.MethodAccess;
+import com.oracle.truffle.espresso.shared.meta.ModifiersProvider;
+import com.oracle.truffle.espresso.shared.meta.SymbolPool;
+import com.oracle.truffle.espresso.shared.resolver.ResolvedCall;
+import com.oracle.truffle.espresso.substitutions.JavaType;
 import com.oracle.truffle.espresso.vm.InterpreterToVM;
+import com.oracle.truffle.espresso.vm.VM.EspressoStackElement;
 
-public final class Method extends Member<Signature> implements TruffleObject, ContextAccess {
+public final class Method extends Member<Signature> implements TruffleObject, ContextAccess,
+                MethodAccess<Klass, Method, Field> {
 
     public static final Method[] EMPTY_ARRAY = new Method[0];
     public static final MethodVersion[] EMPTY_VERSION_ARRAY = new MethodVersion[0];
@@ -110,44 +149,84 @@ public final class Method extends Member<Signature> implements TruffleObject, Co
     private static final byte SETTER_LENGTH = 6;
     private static final byte STATIC_SETTER_LENGTH = 5;
 
-    private final Assumption isLeaf;
-
     private final ObjectKlass declaringKlass;
 
     @CompilationFinal(dimensions = 1) //
     private final Symbol<Type>[] parsedSignature;
 
-    @CompilationFinal private int vtableIndex = -1;
-    @CompilationFinal private int itableIndex = -1;
-
-    private final ExceptionsAttribute exceptionsAttribute;
-
-    @CompilationFinal private int refKind;
-
-    @CompilationFinal(dimensions = 1) //
-    private ObjectKlass[] checkedExceptions;
-
     private final Method proxy;
-    private String genericSignature;
+    @CompilationFinal private String genericSignature;
+    @CompilationFinal(dimensions = 1) private EspressoType[] typeArguments;
+    @CompilationFinal private EspressoType returnType;
+
+    private final Symbol<Signature> rawSignature;
+    private final int rawFlags;
 
     // the parts of the method that can change when it's redefined
     // are encapsulated within the methodVersion
     @CompilationFinal private volatile MethodVersion methodVersion;
 
-    private final Assumption removedByRedefinition = Truffle.getRuntime().createAssumption();
+    private boolean removedByRedefinition;
+    private final ClassHierarchyAssumption isLeaf;
 
-    public Method identity() {
-        return proxy == null ? this : proxy;
+    private MethodHook[] hooks = MethodHook.EMPTY;
+    private final Field.StableBoolean hasActiveHook = new Field.StableBoolean(false);
+
+    Method(Method method) {
+        this(method, method.getCodeAttribute());
     }
 
-    // Multiple maximally-specific interface methods. Fail on call.
-    @CompilationFinal private boolean poisonPill = false;
+    private Method(Method method, CodeAttribute split) {
+        this.rawSignature = method.rawSignature;
+        this.rawFlags = method.rawFlags;
+        this.declaringKlass = method.declaringKlass;
+        this.methodVersion = new MethodVersion(method.getMethodVersion().klassVersion, method.getRuntimeConstantPool(), method.getLinkedMethod(),
+                        method.getMethodVersion().poisonPill, split);
 
-    // Whether we need to use an additional frame slot for monitor unlock on kill.
-    @CompilationFinal private byte usesMonitors = -1;
+        try {
+            this.parsedSignature = getSignatures().parsed(this.getRawSignature());
+        } catch (IllegalArgumentException | ParserException.ClassFormatError e) {
+            CompilerDirectives.transferToInterpreterAndInvalidate();
+            Meta meta = getMeta();
+            throw meta.throwExceptionWithMessage(meta.java_lang_ClassFormatError, e.getMessage());
+        }
+        // Proxy the method, so that we have the same callTarget if it is not yet initialized.
+        // Allows for not duplicating the codeAttribute
+        this.proxy = method.proxy;
+        this.isLeaf = method.isLeaf;
+    }
+
+    Method(ObjectKlass.KlassVersion klassVersion, LinkedMethod linkedMethod, RuntimeConstantPool pool) {
+        this(klassVersion, linkedMethod, linkedMethod.getRawSignature(), pool, linkedMethod.getFlags());
+    }
+
+    Method(ObjectKlass.KlassVersion klassVersion, LinkedMethod linkedMethod, Symbol<Signature> rawSignature, RuntimeConstantPool pool, int rawFlags) {
+        this.declaringKlass = klassVersion.getKlass();
+        this.rawSignature = rawSignature;
+        this.rawFlags = rawFlags;
+        this.methodVersion = new MethodVersion(klassVersion, pool, linkedMethod, false, (CodeAttribute) linkedMethod.getAttribute(CodeAttribute.NAME));
+
+        try {
+            this.parsedSignature = getSignatures().parsed(this.getRawSignature());
+        } catch (IllegalArgumentException | ParserException.ClassFormatError e) {
+            CompilerDirectives.transferToInterpreterAndInvalidate();
+            Meta meta = getMeta();
+            throw meta.throwExceptionWithMessage(meta.java_lang_ClassFormatError, e.getMessage());
+        }
+        this.proxy = this;
+        this.isLeaf = getContext().getClassHierarchyOracle().createLeafAssumptionForNewMethod(this);
+    }
+
+    public Method identity() {
+        return proxy;
+    }
+
+    @Override
+    public Symbol<Name> getName() {
+        return getMethodVersion().getName();
+    }
 
     // can have a different constant pool than it's declaring class
-
     public ConstantPool getConstantPool() {
         return getRuntimeConstantPool();
     }
@@ -165,12 +244,16 @@ public final class Method extends Member<Signature> implements TruffleObject, Co
     }
 
     @Override
+    @Idempotent
     public ObjectKlass getDeclaringKlass() {
         return declaringKlass;
     }
 
     public Symbol<Signature> getRawSignature() {
-        return descriptor;
+        if (rawSignature != null) {
+            return rawSignature;
+        }
+        return getLinkedMethod().getRawSignature();
     }
 
     public Symbol<Type>[] getParsedSignature() {
@@ -178,92 +261,13 @@ public final class Method extends Member<Signature> implements TruffleObject, Co
         return parsedSignature;
     }
 
-    private Source source;
-
-    Method(Method method) {
-        super(method.getRawSignature(), method.getName());
-        this.declaringKlass = method.declaringKlass;
-        this.methodVersion = new MethodVersion(method.getRuntimeConstantPool(), method.getLinkedMethod(), method.getCodeAttribute());
-
-        try {
-            this.parsedSignature = getSignatures().parsed(this.getRawSignature());
-        } catch (IllegalArgumentException | ClassFormatError e) {
-            CompilerDirectives.transferToInterpreterAndInvalidate();
-            Meta meta = getMeta();
-            throw meta.throwExceptionWithMessage(meta.java_lang_ClassFormatError, e.getMessage());
-        }
-
-        // Proxy the method, so that we have the same callTarget if it is not yet initialized.
-        // Allows for not duplicating the methodVersion
-        this.proxy = method.proxy == null ? method : method.proxy;
-        this.poisonPill = method.poisonPill;
-        this.isLeaf = method.isLeaf;
-        this.exceptionsAttribute = (ExceptionsAttribute) getAttribute(ExceptionsAttribute.NAME);
-
-        initRefKind();
-    }
-
-    private Method(Method method, CodeAttribute split) {
-        super(method.getRawSignature(), method.getName());
-        this.declaringKlass = method.declaringKlass;
-        this.methodVersion = new MethodVersion(method.getRuntimeConstantPool(), method.getLinkedMethod(), split);
-
-        try {
-            this.parsedSignature = getSignatures().parsed(this.getRawSignature());
-        } catch (IllegalArgumentException | ClassFormatError e) {
-            CompilerDirectives.transferToInterpreterAndInvalidate();
-            Meta meta = getMeta();
-            throw meta.throwExceptionWithMessage(meta.java_lang_ClassFormatError, e.getMessage());
-        }
-        // Proxy the method, so that we have the same callTarget if it is not yet initialized.
-        // Allows for not duplicating the codeAttribute
-        this.proxy = method.proxy == null ? method : method.proxy;
-        this.poisonPill = method.poisonPill;
-        this.isLeaf = method.isLeaf;
-        this.exceptionsAttribute = (ExceptionsAttribute) getAttribute(ExceptionsAttribute.NAME);
-
-        initRefKind();
-    }
-
-    Method(ObjectKlass declaringKlass, LinkedMethod linkedMethod, RuntimeConstantPool pool) {
-        this(declaringKlass, linkedMethod, linkedMethod.getRawSignature(), pool);
-    }
-
-    Method(ObjectKlass declaringKlass, LinkedMethod linkedMethod, Symbol<Signature> rawSignature, RuntimeConstantPool pool) {
-        super(rawSignature, linkedMethod.getName());
-        this.methodVersion = new MethodVersion(pool, linkedMethod, (CodeAttribute) linkedMethod.getAttribute(CodeAttribute.NAME));
-        this.declaringKlass = declaringKlass;
-
-        try {
-            this.parsedSignature = getSignatures().parsed(this.getRawSignature());
-        } catch (IllegalArgumentException | ClassFormatError e) {
-            CompilerDirectives.transferToInterpreterAndInvalidate();
-            Meta meta = getMeta();
-            throw meta.throwExceptionWithMessage(meta.java_lang_ClassFormatError, e.getMessage());
-        }
-
-        this.exceptionsAttribute = (ExceptionsAttribute) linkedMethod.getAttribute(ExceptionsAttribute.NAME);
-
-        initRefKind();
-        this.proxy = null;
-        this.isLeaf = Truffle.getRuntime().createAssumption();
+    public ClassHierarchyAssumption getLeafAssumption(ClassHierarchyOracle.ClassHierarchyAccessor accessor) {
+        Objects.requireNonNull(accessor);
+        return isLeaf;
     }
 
     public int getRefKind() {
-        return refKind;
-    }
-
-    public void initRefKind() {
-        if (isStatic()) {
-            this.refKind = REF_invokeStatic;
-        } else if (isPrivate() || isConstructor()) {
-            this.refKind = REF_invokeSpecial;
-        } else if (declaringKlass.isInterface()) {
-            this.refKind = REF_invokeInterface;
-        } else {
-            assert !declaringKlass.isPrimitive();
-            this.refKind = REF_invokeVirtual;
-        }
+        return getMethodVersion().getRefKind();
     }
 
     public Attribute getAttribute(Symbol<Name> attrName) {
@@ -272,10 +276,7 @@ public final class Method extends Member<Signature> implements TruffleObject, Co
 
     @TruffleBoundary
     public int bciToLineNumber(int atBCI) {
-        if (atBCI < 0) {
-            return atBCI;
-        }
-        return getCodeAttribute().bciToLineNumber(atBCI);
+        return getMethodVersion().bciToLineNumber(atBCI);
     }
 
     @Override
@@ -283,24 +284,8 @@ public final class Method extends Member<Signature> implements TruffleObject, Co
         return declaringKlass.getContext();
     }
 
-    public BootstrapMethodsAttribute getBootstrapMethods() {
-        return (BootstrapMethodsAttribute) getAttribute(BootstrapMethodsAttribute.NAME);
-    }
-
-    public byte[] getCode() {
-        return getCodeAttribute().getCode();
-    }
-
     public byte[] getOriginalCode() {
         return getCodeAttribute().getOriginalCode();
-    }
-
-    public int getMaxLocals() {
-        return getCodeAttribute().getMaxLocals();
-    }
-
-    public int getMaxStackSize() {
-        return getCodeAttribute().getMaxStack();
     }
 
     public ExceptionHandler[] getExceptionHandlers() {
@@ -310,7 +295,11 @@ public final class Method extends Member<Signature> implements TruffleObject, Co
     public int[] getSOEHandlerInfo() {
         ArrayList<Integer> toArray = new ArrayList<>();
         for (ExceptionHandler handler : getExceptionHandlers()) {
-            if (handler.getCatchType() == Type.java_lang_StackOverflowError) {
+            if (handler.isCatchAll() //
+                            || handler.getCatchType() == Types.java_lang_StackOverflowError //
+                            || handler.getCatchType() == Types.java_lang_VirtualMachineError //
+                            || handler.getCatchType() == Types.java_lang_Error //
+                            || handler.getCatchType() == Types.java_lang_Throwable) {
                 toArray.add(handler.getStartBCI());
                 toArray.add(handler.getEndBCI());
                 toArray.add(handler.getHandlerBCI());
@@ -328,8 +317,8 @@ public final class Method extends Member<Signature> implements TruffleObject, Co
     }
 
     public static NativeSignature buildJniNativeSignature(Symbol<Type>[] signature) {
-        NativeType returnType = NativeAccess.kindToNativeType(Signatures.returnKind(signature));
-        int argCount = Signatures.parameterCount(signature, false);
+        NativeType returnType = NativeAccess.kindToNativeType(SignatureSymbols.returnKind(signature));
+        int argCount = SignatureSymbols.parameterCount(signature);
 
         // Prepend JNIEnv* and class|receiver.
         NativeType[] parameterTypes = new NativeType[argCount + 2];
@@ -341,15 +330,10 @@ public final class Method extends Member<Signature> implements TruffleObject, Co
         parameterTypes[1] = NativeType.OBJECT;
 
         for (int i = 0; i < argCount; ++i) {
-            parameterTypes[i + 2] = NativeAccess.kindToNativeType(Signatures.parameterKind(signature, i));
+            parameterTypes[i + 2] = NativeAccess.kindToNativeType(SignatureSymbols.parameterKind(signature, i));
         }
 
         return NativeSignature.create(returnType, parameterTypes);
-    }
-
-    public TruffleObject lookupAndBind(@Pointer TruffleObject library, String mangledName) {
-        NativeSignature signature = buildJniNativeSignature(getParsedSignature());
-        return getNativeAccess().lookupAndBindSymbol(library, mangledName, signature);
     }
 
     private TruffleObject bind(@Pointer TruffleObject symbol) {
@@ -365,8 +349,13 @@ public final class Method extends Member<Signature> implements TruffleObject, Co
         return getMethodVersion().getCallTarget();
     }
 
-    public CallTarget getCallTargetNoInit() {
-        return getMethodVersion().getCallTargetNoInit();
+    /**
+     * Exposed to Interop API, to ensure that VM calls to guest classes properly initialize guest
+     * classes prior to the calls.
+     */
+    public CallTarget getCallTargetForceInit() {
+        getDeclaringKlass().safeInitialize();
+        return getCallTarget();
     }
 
     /**
@@ -380,49 +369,7 @@ public final class Method extends Member<Signature> implements TruffleObject, Co
     }
 
     public boolean usesMonitors() {
-        if (usesMonitors != -1) {
-            return usesMonitors != 0;
-        } else {
-            CompilerDirectives.transferToInterpreterAndInvalidate();
-            if (isSynchronized()) {
-                return (usesMonitors = 1) != 0;
-            }
-            if (getCodeAttribute() != null) {
-                BytecodeStream bs = new BytecodeStream(getOriginalCode());
-                int bci = 0;
-                while (bci < bs.endBCI()) {
-                    int opcode = bs.currentBC(bci);
-                    if (opcode == MONITORENTER || opcode == MONITOREXIT) {
-                        return (usesMonitors = 1) != 0;
-                    }
-                    bci = bs.nextBCI(bci);
-                }
-                return (usesMonitors = 0) != 0;
-            }
-            return false;
-        }
-    }
-
-    public static FrameDescriptor initFrameDescriptor(int slotCount) {
-        FrameDescriptor descriptor = new FrameDescriptor();
-        for (int i = 0; i < slotCount; ++i) {
-            descriptor.addFrameSlot(i, FrameSlotKind.Long);
-        }
-        return descriptor;
-    }
-
-    private void checkPoisonPill(Meta meta) {
-        if (poisonPill) {
-            // Conflicting Maximally-specific non-abstract interface methods.
-            if (getJavaVersion().java9OrLater() && getContext().SpecCompliancyMode == EspressoOptions.SpecCompliancyMode.HOTSPOT) {
-                /*
-                 * Supposed to be IncompatibleClassChangeError (see jvms-6.5.invokeinterface), but
-                 * HotSpot throws AbstractMethodError.
-                 */
-                throw meta.throwExceptionWithMessage(meta.java_lang_AbstractMethodError, "Conflicting default methods: " + getName());
-            }
-            throw meta.throwExceptionWithMessage(meta.java_lang_IncompatibleClassChangeError, "Conflicting default methods: " + getName());
-        }
+        return getMethodVersion().usesMonitors();
     }
 
     private CallTarget lookupLibJavaCallTarget() {
@@ -432,9 +379,10 @@ public final class Method extends Member<Signature> implements TruffleObject, Co
             for (boolean withSignature : new boolean[]{false, true}) {
                 String mangledName = Mangle.mangleMethod(this, withSignature);
                 // Look in libjava
-                TruffleObject nativeMethod = lookupAndBind(getVM().getJavaLibrary(), mangledName);
+                NativeSignature signature = buildJniNativeSignature(getParsedSignature());
+                TruffleObject nativeMethod = getNativeAccess().lookupAndBindSymbol(getVM().getJavaLibrary(), mangledName, signature, false, true);
                 if (nativeMethod != null) {
-                    return Truffle.getRuntime().createCallTarget(EspressoRootNode.create(null, new NativeMethodNode(nativeMethod, getMethodVersion())));
+                    return EspressoRootNode.createNative(getContext().getJNI(), getMethodVersion(), nativeMethod).getCallTarget();
                 }
             }
         }
@@ -442,42 +390,44 @@ public final class Method extends Member<Signature> implements TruffleObject, Co
     }
 
     private CallTarget lookupAgents() {
+        if (!getContext().getEspressoEnv().EnableNativeAgents) {
+            return null;
+        }
         // Look in agents
         for (boolean withSignature : new boolean[]{false, true}) {
             String mangledName = Mangle.mangleMethod(this, withSignature);
-            TruffleObject nativeMethod = getContext().bindToAgent(this, mangledName);
-            if (nativeMethod != null) {
-                return Truffle.getRuntime().createCallTarget(EspressoRootNode.create(null, new NativeMethodNode(nativeMethod, getMethodVersion())));
+            TruffleObject symbol = getContext().lookupAgentSymbol(mangledName);
+            if (symbol != null) {
+                TruffleObject nativeMethod = bind(symbol);
+                return EspressoRootNode.createNative(getContext().getJNI(symbol), getMethodVersion(), nativeMethod).getCallTarget();
             }
         }
         return null;
     }
 
     private CallTarget lookupJniCallTarget() {
-        CallTarget target;
-        Method findNative = getMeta().java_lang_ClassLoader_findNative;
-        // Lookup the short name first, otherwise lookup the long name (with
-        // signature).
-        target = lookupJniCallTarget(findNative, false);
+        Meta meta = getMeta();
+        // Lookup the short name first, otherwise lookup the long name (with signature).
+        CallTarget target = lookupJniCallTarget(meta, false);
         if (target == null) {
-            target = lookupJniCallTarget(findNative, true);
+            target = lookupJniCallTarget(meta, true);
         }
         return target;
     }
 
-    private CallTarget lookupJniCallTarget(Method findNative, boolean fullSignature) {
+    private CallTarget lookupJniCallTarget(Meta meta, boolean fullSignature) {
         String mangledName = Mangle.mangleMethod(this, fullSignature);
-        long handle = (long) findNative.invokeWithConversions(null, getDeclaringKlass().getDefiningClassLoader(), mangledName);
+        long handle = (long) meta.java_lang_ClassLoader_findNative.invokeDirectStatic(getDeclaringKlass().getDefiningClassLoader(), meta.toGuestString(mangledName));
         if (handle == 0) { // not found
             return null;
         }
         TruffleObject symbol = getVM().getFunction(handle);
         TruffleObject nativeMethod = bind(symbol);
-        return Truffle.getRuntime().createCallTarget(EspressoRootNode.create(null, new NativeMethodNode(nativeMethod, this.getMethodVersion())));
+        return EspressoRootNode.createNative(getContext().getJNI(symbol), getMethodVersion(), nativeMethod).getCallTarget();
     }
 
     public boolean isConstructor() {
-        return Name._init_.equals(getName());
+        return Names._init_.equals(getName());
     }
 
     public boolean isDefault() {
@@ -500,27 +450,7 @@ public final class Method extends Member<Signature> implements TruffleObject, Co
     }
 
     public ObjectKlass[] getCheckedExceptions() {
-        if (checkedExceptions == null) {
-            CompilerDirectives.transferToInterpreterAndInvalidate();
-            createCheckedExceptions();
-        }
-        return checkedExceptions;
-    }
-
-    private synchronized void createCheckedExceptions() {
-        if (checkedExceptions == null) {
-            if (exceptionsAttribute == null) {
-                checkedExceptions = ObjectKlass.EMPTY_ARRAY;
-                return;
-            }
-            final int[] entries = exceptionsAttribute.getCheckedExceptionsCPI();
-            ObjectKlass[] tmpchecked = new ObjectKlass[entries.length];
-            for (int i = 0; i < entries.length; ++i) {
-                // TODO(peterssen): Resolve and cache CP entries.
-                tmpchecked[i] = (ObjectKlass) (getDeclaringKlass().getConstantPool()).resolvedKlassAt(getDeclaringKlass(), entries[i]);
-            }
-            checkedExceptions = tmpchecked;
-        }
+        return getMethodVersion().getCheckedExceptions();
     }
 
     /**
@@ -546,7 +476,7 @@ public final class Method extends Member<Signature> implements TruffleObject, Co
      * Determines if this method is {@link java.lang.Object#Object()}.
      */
     public boolean isJavaLangObjectInit() {
-        return getDeclaringKlass().isJavaLangObject() && Name._init_.equals(getName());
+        return getDeclaringKlass().isJavaLangObject() && Names._init_.equals(getName());
     }
 
     // region Meta.Method
@@ -559,25 +489,32 @@ public final class Method extends Member<Signature> implements TruffleObject, Co
      */
     @TruffleBoundary
     public Object invokeWithConversions(Object self, Object... args) {
-        getContext().getJNI().clearPendingException();
-        assert args.length == Signatures.parameterCount(getParsedSignature(), false);
-        // assert !isStatic() || ((StaticObject) self).isStatic();
+        EspressoThreadLocalState tls = getLanguage().getThreadLocalState();
+        // Impossible to call from guest code, so what is above is illegal for continuations.
+        tls.blockContinuationSuspension();
+        try {
+            getLanguage().clearPendingException();
+            assert args.length == SignatureSymbols.parameterCount(getParsedSignature());
+            // assert !isStatic() || ((StaticObject) self).isStatic();
 
-        final Object[] filteredArgs;
-        if (isStatic()) {
-            // clinit done when obtaining call target
-            filteredArgs = new Object[args.length];
-            for (int i = 0; i < filteredArgs.length; ++i) {
-                filteredArgs[i] = getMeta().toGuestBoxed(args[i]);
+            final Object[] filteredArgs;
+            if (isStatic()) {
+                getDeclaringKlass().safeInitialize();
+                filteredArgs = new Object[args.length];
+                for (int i = 0; i < filteredArgs.length; ++i) {
+                    filteredArgs[i] = getMeta().toGuestBoxed(args[i]);
+                }
+            } else {
+                filteredArgs = new Object[args.length + 1];
+                filteredArgs[0] = getMeta().toGuestBoxed(self);
+                for (int i = 1; i < filteredArgs.length; ++i) {
+                    filteredArgs[i] = getMeta().toGuestBoxed(args[i - 1]);
+                }
             }
-        } else {
-            filteredArgs = new Object[args.length + 1];
-            filteredArgs[0] = getMeta().toGuestBoxed(self);
-            for (int i = 1; i < filteredArgs.length; ++i) {
-                filteredArgs[i] = getMeta().toGuestBoxed(args[i - 1]);
-            }
+            return getMeta().toHostBoxed(getCallTarget().call(filteredArgs));
+        } finally {
+            tls.unblockContinuationSuspension();
         }
-        return getMeta().toHostBoxed(getCallTarget().call(filteredArgs));
     }
 
     /**
@@ -587,50 +524,125 @@ public final class Method extends Member<Signature> implements TruffleObject, Co
      * e.g. Host (boxed) Integer represents int, guest Integer doesn't.
      */
     @TruffleBoundary
-    public Object invokeDirect(Object self, Object... args) {
-        getContext().getJNI().clearPendingException();
-        if (isStatic()) {
-            assert args.length == Signatures.parameterCount(getParsedSignature(), false);
-            // clinit performed on obtaining call target
+    public Object invokeDirect(Object... args) {
+        EspressoThreadLocalState tls = getLanguage().getThreadLocalState();
+        // Impossible to call from guest code, so what is above is illegal for continuations.
+        tls.blockContinuationSuspension();
+        try {
+            getLanguage().clearPendingException();
+            assert !isStatic();
+            assert args.length == SignatureSymbols.parameterCount(getParsedSignature()) + 1;
+            assert getDeclaringKlass().isAssignableFrom(((StaticObject) args[0]).getKlass());
             return getCallTarget().call(args);
-        } else {
-            assert args.length + 1 /* self */ == Signatures.parameterCount(getParsedSignature(), !isStatic());
-            Object[] fullArgs = new Object[args.length + 1];
-            System.arraycopy(args, 0, fullArgs, 1, args.length);
-            fullArgs[0] = self;
-            return getCallTarget().call(fullArgs);
+        } finally {
+            tls.unblockContinuationSuspension();
         }
     }
 
+    public static Object call(ResolvedCall<Klass, Method, Field> resolved, Object... args) {
+        return switch (resolved.getCallKind()) {
+            case STATIC ->
+                resolved.getResolvedMethod().invokeDirectStatic(args);
+            case DIRECT ->
+                resolved.getResolvedMethod().invokeDirect(args);
+            case VTABLE_LOOKUP ->
+                resolved.getResolvedMethod().invokeDirectVirtual(args);
+            case ITABLE_LOOKUP ->
+                resolved.getResolvedMethod().invokeDirectInterface(args);
+        };
+    }
+
+    @TruffleBoundary
+    public Object invokeDirectStatic(Object... args) {
+        EspressoThreadLocalState tls = getLanguage().getThreadLocalState();
+        // Impossible to call from guest code, so what is above is illegal for continuations.
+        tls.blockContinuationSuspension();
+        try {
+            getLanguage().clearPendingException();
+            assert isStatic();
+            assert args.length == SignatureSymbols.parameterCount(getParsedSignature());
+            getDeclaringKlass().safeInitialize();
+            return getCallTarget().call(args);
+        } finally {
+            tls.unblockContinuationSuspension();
+        }
+    }
+
+    @TruffleBoundary
+    public Object invokeDirectVirtual(Object... args) {
+        assert getVTableIndex() >= 0;
+        StaticObject self = (StaticObject) args[0];
+        return self.getKlass().vtableLookup(getVTableIndex()).invokeDirect(args);
+    }
+
+    @TruffleBoundary
+    public Object invokeDirectInterface(Object... args) {
+        assert getITableIndex() >= 0;
+        StaticObject self = (StaticObject) args[0];
+        return ((ObjectKlass) self.getKlass()).itableLookup(getDeclaringKlass(), getITableIndex()).invokeDirect(args);
+    }
+
+    @TruffleBoundary
+    public Object invokeDirectSpecial(Object... args) {
+        assert isFinalFlagSet() || getDeclaringKlass().isFinalFlagSet() || isPrivate() || isConstructor();
+        return invokeDirect(args);
+    }
+
     public boolean isClassInitializer() {
-        return Name._clinit_.equals(getName()) && isStatic();
+        return Names._clinit_.equals(getName()) && isStatic();
     }
 
     @Override
     public int getModifiers() {
-        return getLinkedMethod().getFlags();
+        return rawFlags;
+    }
+
+    public boolean isCallerSensitive() {
+        return (getModifiers() & ACC_CALLER_SENSITIVE) != 0;
+    }
+
+    /**
+     * The {@code @ForceInline} annotation only takes effect for methods or constructors of classes
+     * loaded by the boot loader. Annotations on methods or constructors of classes loaded outside
+     * of the boot loader are ignored.
+     */
+    public boolean isForceInline() {
+        return (getModifiers() & ACC_FORCE_INLINE) != 0;
+    }
+
+    public boolean isDontInline() {
+        // Respect in truffle compilations when that's possible (GR-57507)
+        return (getModifiers() & ACC_DONT_INLINE) != 0;
+    }
+
+    public boolean isHidden() {
+        return (getModifiers() & ACC_HIDDEN) != 0;
+    }
+
+    public boolean isScoped() {
+        return (getModifiers() & ACC_SCOPED) != 0;
     }
 
     public int getMethodModifiers() {
-        return getLinkedMethod().getFlags() & Constants.JVM_RECOGNIZED_METHOD_MODIFIERS;
+        return getMethodVersion().getModifiers() & Constants.JVM_RECOGNIZED_METHOD_MODIFIERS;
     }
 
     @Override
     public String toString() {
-        return "EspressoMethod<" + getDeclaringKlass().getType() + "." + getName() + getRawSignature() + ">";
+        return getMethodVersion().toString();
     }
 
     public JavaKind getReturnKind() {
-        return Signatures.returnKind(getParsedSignature());
+        return SignatureSymbols.returnKind(getParsedSignature());
     }
 
     public Klass[] resolveParameterKlasses() {
         // TODO(peterssen): Use resolved signature.
         final Symbol<Type>[] signature = getParsedSignature();
-        int paramCount = Signatures.parameterCount(signature, false);
+        int paramCount = SignatureSymbols.parameterCount(signature);
         Klass[] paramsKlasses = paramCount > 0 ? new Klass[paramCount] : Klass.EMPTY_ARRAY;
         for (int i = 0; i < paramCount; ++i) {
-            Symbol<Type> paramType = Signatures.parameterType(signature, i);
+            Symbol<Type> paramType = SignatureSymbols.parameterType(signature, i);
             paramsKlasses[i] = getMeta().resolveSymbolOrFail(paramType,
                             getDeclaringKlass().getDefiningClassLoader(),
                             getDeclaringKlass().protectionDomain());
@@ -638,42 +650,141 @@ public final class Method extends Member<Signature> implements TruffleObject, Co
         return paramsKlasses;
     }
 
+    public EspressoType[] getGenericParameterTypes() {
+        if (typeArguments == null) {
+            if (CompilerDirectives.isPartialEvaluationConstant(this)) {
+                CompilerDirectives.transferToInterpreterAndInvalidate();
+            }
+            resolveMethodTypes();
+        }
+        return typeArguments;
+    }
+
+    public EspressoType getGenericReturnType() {
+        if (returnType == null) {
+            if (CompilerDirectives.isPartialEvaluationConstant(this)) {
+                CompilerDirectives.transferToInterpreterAndInvalidate();
+            }
+            resolveMethodTypes();
+        }
+        return returnType;
+    }
+
+    private void resolveMethodTypes() {
+        EspressoType[] result = new EspressoType[getParameterCount()];
+        String sig = getGenericSignatureAsString();
+
+        if (sig.isEmpty() || !getContext().isGenericTypeHintsEnabled()) {
+            typeArguments = resolveParameterKlasses();
+            returnType = resolveReturnKlass();
+            return;
+        }
+        MethodTypeSignature typeSignature = SignatureParser.make().parseMethodSig(sig);
+        TypeSignature[] parameterTypes = typeSignature.getParameterTypes();
+        for (int i = 0; i < parameterTypes.length; i++) {
+            result[i] = getGenericEspressoType(parameterTypes[i]);
+        }
+        returnType = getGenericEspressoType(typeSignature.getReturnType());
+        typeArguments = result;
+    }
+
+    @TruffleBoundary
+    private EspressoType getGenericEspressoType(ReturnType type) {
+        CoreReflectionFactory factory = CoreReflectionFactory.make(methodVersion.getDeclaringKlass());
+        Reifier reifier = Reifier.make(factory);
+        type.accept(reifier);
+        EspressoType espressoType = reifier.getResult();
+        if (espressoType == null) {
+            return getMeta().java_lang_Object;
+        }
+        return espressoType;
+    }
+
     public Klass resolveReturnKlass() {
         // TODO(peterssen): Use resolved signature.
-        Symbol<Type> returnType = Signatures.returnType(getParsedSignature());
-        return getMeta().resolveSymbolOrFail(returnType,
+        return getMeta().resolveSymbolOrFail(SignatureSymbols.returnType(getParsedSignature()),
                         getDeclaringKlass().getDefiningClassLoader(),
                         getDeclaringKlass().protectionDomain());
     }
 
+    @Idempotent
     public int getParameterCount() {
-        return Signatures.parameterCount(getParsedSignature(), false);
+        return SignatureSymbols.parameterCount(getParsedSignature());
+    }
+
+    public int getArgumentCount() {
+        return getParameterCount() + (isStatic() ? 0 : 1);
     }
 
     public static Method getHostReflectiveMethodRoot(StaticObject seed, Meta meta) {
         assert seed.getKlass().getMeta().java_lang_reflect_Method.isAssignableFrom(seed.getKlass());
         StaticObject curMethod = seed;
-        Method target = null;
-        while (target == null) {
-            target = (Method) meta.HIDDEN_METHOD_KEY.getHiddenObject(curMethod);
-            if (target == null) {
-                curMethod = meta.java_lang_reflect_Method_root.getObject(curMethod);
+        do {
+            Method target = (Method) meta.HIDDEN_METHOD_KEY.getHiddenObject(curMethod);
+            if (target != null) {
+                return target;
             }
-        }
-        return target;
+            curMethod = meta.java_lang_reflect_Method_root.getObject(curMethod);
+        } while (StaticObject.notNull(curMethod));
+        CompilerDirectives.transferToInterpreterAndInvalidate();
+        throw EspressoError.shouldNotReachHere("Could not find HIDDEN_METHOD_KEY");
     }
 
     public static Method getHostReflectiveConstructorRoot(StaticObject seed, Meta meta) {
         assert seed.getKlass().getMeta().java_lang_reflect_Constructor.isAssignableFrom(seed.getKlass());
         StaticObject curMethod = seed;
-        Method target = null;
-        while (target == null) {
-            target = (Method) meta.HIDDEN_CONSTRUCTOR_KEY.getHiddenObject(curMethod);
-            if (target == null) {
-                curMethod = meta.java_lang_reflect_Constructor_root.getObject(curMethod);
+        StaticObject rootMethod;
+        do {
+            Method target = (Method) meta.HIDDEN_CONSTRUCTOR_KEY.getHiddenObject(curMethod);
+            if (target != null) {
+                return target;
             }
+            rootMethod = curMethod;
+            curMethod = meta.java_lang_reflect_Constructor_root.getObject(curMethod);
+        } while ((StaticObject.notNull(curMethod)));
+        CompilerDirectives.transferToInterpreter();
+        // the root Constructor was not created by makeConstructor
+        // this can happen in ReflectionFactory#generateConstructor
+        // use the reflection data to find the constructor.
+        // the best would be to use the slot, but we don't have a redefinition-stable int that
+        // identifies the constructor.
+        Klass holder = meta.java_lang_reflect_Constructor_clazz.getObject(rootMethod).getMirrorKlass(meta);
+        Symbol<Signature> signature = rebuildConstructorSignature(meta, rootMethod);
+        assert signature != null;
+        Method method = holder.lookupDeclaredMethod(Names._init_, signature, Klass.LookupMode.INSTANCE_ONLY);
+        assert method != null;
+        // remember the mapping for the next query
+        meta.HIDDEN_CONSTRUCTOR_KEY.setHiddenObject(rootMethod, method);
+        return method;
+    }
+
+    private static Symbol<Signature> rebuildConstructorSignature(Meta meta, StaticObject rootMethod) {
+        StaticObject ptypes = meta.java_lang_reflect_Constructor_parameterTypes.getObject(rootMethod);
+        return meta.getSignatures().lookupValidSignature(getSignatureFromGuestDescription(ptypes, meta._void.mirror(), meta));
+    }
+
+    public static ByteSequence getSignatureFromGuestDescription(@JavaType(Class[].class) StaticObject ptypes,
+                    @JavaType(Class.class) StaticObject rtype, Meta meta) {
+        Symbol<Type> returnType = rtype.getMirrorKlass(meta).getType();
+        StaticObject[] parameterTypes = ptypes.unwrap(meta.getLanguage());
+        int len = 2;
+        for (StaticObject parameterType : parameterTypes) {
+            len += parameterType.getMirrorKlass(meta).getType().length();
         }
-        return target;
+        len += returnType.length();
+        byte[] bytes = new byte[len];
+        int pos = 0;
+        bytes[pos++] = '(';
+        for (StaticObject parameterType : parameterTypes) {
+            Symbol<Type> paramType = parameterType.getMirrorKlass(meta).getType();
+            paramType.writeTo(bytes, pos);
+            pos += paramType.length();
+        }
+        bytes[pos++] = ')';
+        returnType.writeTo(bytes, pos);
+        pos += returnType.length();
+        assert pos == bytes.length;
+        return ByteSequence.wrap(bytes);
     }
 
     // Polymorphic signature method 'creation'
@@ -690,19 +801,18 @@ public final class Method extends Member<Signature> implements TruffleObject, Co
         // * It has a single formal parameter of type Object[].
         // * It has the ACC_VARARGS and ACC_NATIVE flags set.
         // * ONLY JAVA <= 8: It has a return type of Object.
-        if (!(Type.java_lang_invoke_MethodHandle.equals(getDeclaringKlass().getType()) ||
-                        Type.java_lang_invoke_VarHandle.equals(getDeclaringKlass().getType()))) {
+        if (!Meta.isSignaturePolymorphicHolderType(getDeclaringKlass().getType())) {
             return false;
         }
         Symbol<Type>[] signature = getParsedSignature();
-        if (Signatures.parameterCount(signature, false) != 1) {
+        if (SignatureSymbols.parameterCount(signature) != 1) {
             return false;
         }
-        if (Signatures.parameterType(signature, 0) != Type.java_lang_Object_array) {
+        if (SignatureSymbols.parameterType(signature, 0) != Types.java_lang_Object_array) {
             return false;
         }
         if (getJavaVersion().java8OrEarlier()) {
-            if (Signatures.returnType(signature) != Type.java_lang_Object) {
+            if (SignatureSymbols.returnType(signature) != Types.java_lang_Object) {
                 return false;
             }
         }
@@ -712,29 +822,23 @@ public final class Method extends Member<Signature> implements TruffleObject, Co
     }
 
     void setVTableIndex(int i) {
-        setVTableIndex(i, false);
+        getMethodVersion().setVTableIndex(i);
     }
 
     void setVTableIndex(int i, boolean isRedefinition) {
-        assert (vtableIndex == -1 || vtableIndex == i || isRedefinition);
-        assert itableIndex == -1;
-        CompilerAsserts.neverPartOfCompilation();
-        this.vtableIndex = i;
+        getMethodVersion().setVTableIndex(i, isRedefinition);
     }
 
     public int getVTableIndex() {
-        return vtableIndex;
+        return getMethodVersion().getVTableIndex();
     }
 
     void setITableIndex(int i) {
-        assert (itableIndex == -1 || itableIndex == i);
-        assert vtableIndex == -1;
-        CompilerAsserts.neverPartOfCompilation();
-        this.itableIndex = i;
+        getMethodVersion().setITableIndex(i);
     }
 
     public int getITableIndex() {
-        return itableIndex;
+        return getMethodVersion().getITableIndex();
     }
 
     public boolean hasCode() {
@@ -746,27 +850,19 @@ public final class Method extends Member<Signature> implements TruffleObject, Co
     }
 
     public void setPoisonPill() {
-        this.poisonPill = true;
-    }
-
-    public String getSourceFile() {
-        // we have to do this atomically in regards to class redefinition
-        ObjectKlass.KlassVersion klassVersion = declaringKlass.getKlassVersion();
-
-        SourceFileAttribute sfa = (SourceFileAttribute) klassVersion.getAttribute(Name.SourceFile);
-
-        if (sfa == null) {
-            return "unknown source";
-        }
-        return klassVersion.getConstantPool().utf8At(sfa.getSourceFileIndex()).toString();
+        getMethodVersion().poisonPill = true;
     }
 
     public boolean hasSourceFileAttribute() {
-        return declaringKlass.getAttribute(Name.SourceFile) != null;
+        return declaringKlass.getAttribute(Names.SourceFile) != null;
     }
 
     public String report(int curBCI) {
-        return "at " + MetaUtil.internalNameToJava(getDeclaringKlass().getType().toString(), true, false) + "." + getName() + "(" + getSourceFile() + ":" + bciToLineNumber(curBCI) + ")";
+        String sourceFile = getDeclaringKlass().getSourceFile();
+        if (sourceFile == null) {
+            sourceFile = "unknown source";
+        }
+        return "at " + MetaUtil.internalNameToJava(getDeclaringKlass().getType().toString(), true, false) + "." + getName() + "(" + sourceFile + ":" + bciToLineNumber(curBCI) + ")";
     }
 
     public String report() {
@@ -782,11 +878,9 @@ public final class Method extends Member<Signature> implements TruffleObject, Co
     }
 
     public boolean isInlinableGetter() {
-        if (getSubstitutions().get(this) == null) {
+        if (!getSubstitutions().hasSubstitutionFor(this) && !isDontInline()) {
             if (getParameterCount() == 0 && !isAbstract() && !isNative() && !isSynchronized()) {
-                if (isFinalFlagSet() || declaringKlass.isFinalFlagSet() || leafAssumption() || isStatic()) {
-                    return hasGetterBytecodes();
-                }
+                return hasGetterBytecodes();
             }
         }
         return false;
@@ -807,11 +901,9 @@ public final class Method extends Member<Signature> implements TruffleObject, Co
     }
 
     public boolean isInlinableSetter() {
-        if (getSubstitutions().get(this) == null) {
+        if (!getSubstitutions().hasSubstitutionFor(this) && !isDontInline()) {
             if (getParameterCount() == 1 && !isAbstract() && !isNative() && !isSynchronized()) {
-                if (isFinalFlagSet() || declaringKlass.isFinalFlagSet() || leafAssumption() || isStatic()) {
-                    return hasSetterBytecodes();
-                }
+                return hasSetterBytecodes();
             }
         }
         return false;
@@ -831,14 +923,6 @@ public final class Method extends Member<Signature> implements TruffleObject, Co
         return false;
     }
 
-    public boolean leafAssumption() {
-        return isLeaf.isValid();
-    }
-
-    public void invalidateLeaf() {
-        isLeaf.invalidate();
-    }
-
     public void unregisterNative() {
         assert isNative();
         if (getMethodVersion().callTarget != null) {
@@ -848,32 +932,12 @@ public final class Method extends Member<Signature> implements TruffleObject, Co
     }
 
     @SuppressWarnings("unused")
-    void printBytecodes(PrintStream out) {
-        new BytecodeStream(getOriginalCode()).printBytecode(declaringKlass, out);
-    }
-
-    public LineNumberTableAttribute getLineNumberTable() {
-        CodeAttribute attribute = getCodeAttribute();
-        if (attribute != null) {
-            return attribute.getLineNumberTableAttribute();
-        }
-        return LineNumberTableAttribute.EMPTY;
+    public void printBytecodes(PrintStream out) {
+        BytecodePrinter.printBytecode(declaringKlass, out, getOriginalCode());
     }
 
     public LocalVariableTable getLocalVariableTable() {
-        CodeAttribute attribute = getCodeAttribute();
-        if (attribute != null) {
-            return attribute.getLocalvariableTable();
-        }
-        return LocalVariableTable.EMPTY;
-    }
-
-    public LocalVariableTable getLocalVariableTypeTable() {
-        CodeAttribute attribute = getCodeAttribute();
-        if (attribute != null) {
-            return attribute.getLocalvariableTypeTable();
-        }
-        return LocalVariableTable.EMPTY;
+        return getMethodVersion().getLocalVariableTable();
     }
 
     /**
@@ -881,16 +945,14 @@ public final class Method extends Member<Signature> implements TruffleObject, Co
      */
 
     public Source getSource() {
-        Source localSource = this.source;
-        if (localSource == null) {
-            this.source = localSource = getContext().findOrCreateSource(this);
-        }
-        return localSource;
+        return getDeclaringKlass().getSource();
     }
 
-    public void checkLoadingConstraints(StaticObject loader1, StaticObject loader2) {
+    @TruffleBoundary
+    @Override
+    public void checkLoadingConstraints(StaticObject loader1, StaticObject loader2, Function<String, RuntimeException> errorHandler) {
         for (Symbol<Type> type : getParsedSignature()) {
-            getContext().getRegistries().checkLoadingConstraint(type, loader1, loader2);
+            getContext().getRegistries().checkLoadingConstraint(type, loader1, loader2, errorHandler);
         }
     }
 
@@ -898,7 +960,7 @@ public final class Method extends Member<Signature> implements TruffleObject, Co
         ExceptionHandler[] handlers = getExceptionHandlers();
         ExceptionHandler resolved = null;
         for (ExceptionHandler toCheck : handlers) {
-            if (bci >= toCheck.getStartBCI() && bci < toCheck.getEndBCI()) {
+            if (toCheck.covers(bci)) {
                 Klass catchType = null;
                 if (!toCheck.isCatchAll()) {
                     catchType = getRuntimeConstantPool().resolvedKlassAt(getDeclaringKlass(), toCheck.catchTypeCPI());
@@ -920,29 +982,39 @@ public final class Method extends Member<Signature> implements TruffleObject, Co
     // Spawns a placeholder method for MH intrinsics
     public Method createIntrinsic(Symbol<Signature> polymorphicRawSignature) {
         assert isPolySignatureIntrinsic();
-        return new Method(declaringKlass, getLinkedMethod(), polymorphicRawSignature, getRuntimeConstantPool());
+        int flags;
+        MethodHandleIntrinsics.PolySigIntrinsics iid = MethodHandleIntrinsics.getId(this);
+        if (iid == MethodHandleIntrinsics.PolySigIntrinsics.InvokeGeneric) {
+            flags = getModifiers() & ~ACC_VARARGS;
+        } else {
+            flags = ACC_NATIVE | ACC_SYNTHETIC | ACC_FINAL;
+            if (iid.isStaticPolymorphicSignature()) {
+                flags |= ACC_STATIC;
+            }
+        }
+        assert Modifier.isNative(flags);
+        return new Method(declaringKlass.getKlassVersion(), getLinkedMethod(), polymorphicRawSignature, getRuntimeConstantPool(), flags);
     }
 
-    public MethodHandleIntrinsicNode spawnIntrinsicNode(Klass accessingKlass, Symbol<Name> mname, Symbol<Signature> signature) {
+    public MethodHandleIntrinsicNode spawnIntrinsicNode(MethodHandleInvoker invoker) {
         assert isPolySignatureIntrinsic();
-        return getContext().getMethodHandleIntrinsics().createIntrinsicNode(this, accessingKlass, mname, signature);
+        return MethodHandleIntrinsics.createIntrinsicNode(getMeta(), this, invoker);
     }
 
     public Method forceSplit() {
-        Method result = new Method(this, getCodeAttribute().forceSplit());
-        FrameDescriptor frameDescriptor = new FrameDescriptor();
-        EspressoRootNode root = EspressoRootNode.create(frameDescriptor, new BytecodeNode(result.getMethodVersion(), frameDescriptor));
-        result.getMethodVersion().callTarget = Truffle.getRuntime().createCallTarget(root);
+        Method result = new Method(this, getCodeAttribute());
+        EspressoRootNode root = EspressoRootNode.createForBytecodes(result.getMethodVersion());
+        result.getMethodVersion().callTarget = root.getCallTarget();
         return result;
     }
 
     // region jdwp-specific
     public long getBCIFromLine(int line) {
-        return getLineNumberTable().getBCI(line);
+        return getMethodVersion().getBCIFromLine(line);
     }
 
     public boolean hasLine(int lineNumber) {
-        return getLineNumberTable().getBCI(lineNumber) != -1;
+        return getMethodVersion().hasLine(lineNumber);
     }
 
     public String getNameAsString() {
@@ -958,139 +1030,151 @@ public final class Method extends Member<Signature> implements TruffleObject, Co
         return getRawSignature().toString();
     }
 
-    public boolean isMethodNative() {
-        return isNative();
-    }
-
-    public KlassRef[] getParameters() {
-        return resolveParameterKlasses();
-    }
-
-    public Object invokeMethod(Object callee, Object[] args) {
-        if (isConstructor()) {
-            Object theCallee = InterpreterToVM.newObject(getDeclaringKlass(), false);
-            invokeWithConversions(theCallee, args);
-            return theCallee;
-        }
-        return invokeWithConversions(callee, args);
-    }
-
-    public boolean isLastLine(long codeIndex) {
-        LineNumberTableAttribute table = getLineNumberTable();
-        int lastLine = table.getLastLine();
-        int lineAt = table.getLineNumber((int) codeIndex);
-        return lastLine == lineAt;
-    }
-
-    public int getFirstLine() {
-        return getLineNumberTable().getFirstLine();
-    }
-
-    public int getLastLine() {
-        return getLineNumberTable().getLastLine();
-    }
-
     public String getGenericSignatureAsString() {
         if (genericSignature == null) {
+            if (CompilerDirectives.isPartialEvaluationConstant(this)) {
+                CompilerDirectives.transferToInterpreterAndInvalidate();
+            }
             SignatureAttribute attr = (SignatureAttribute) getLinkedMethod().getAttribute(SignatureAttribute.NAME);
             if (attr == null) {
                 genericSignature = ""; // if no generics, the generic signature is empty
             } else {
-                genericSignature = getRuntimeConstantPool().symbolAt(attr.getSignatureIndex()).toString();
+                genericSignature = getRuntimeConstantPool().symbolAtUnsafe(attr.getSignatureIndex()).toString();
             }
         }
         return genericSignature;
     }
 
-    private final Field.StableBoolean hasActiveBreakpoints = new Field.StableBoolean(false);
-
-    private MethodBreakpoint[] infos = new MethodBreakpoint[0];
-
-    public boolean hasActiveBreakpoint() {
-        return hasActiveBreakpoints.get();
+    public boolean hasActiveHook() {
+        return hasActiveHook.get();
     }
 
-    public MethodBreakpoint[] getMethodBreakpointInfos() {
-        return infos;
+    public synchronized MethodHook[] getMethodHooks() {
+        return Arrays.copyOf(hooks, hooks.length);
     }
 
-    public void addMethodBreakpointInfo(MethodBreakpoint info) {
-        hasActiveBreakpoints.set(true);
-        if (infos.length == 0) {
-            infos = new MethodBreakpoint[]{info};
-            return;
+    public synchronized void addMethodHook(MethodHook info) {
+        hasActiveHook.set(true);
+        hooks = Arrays.copyOf(hooks, hooks.length + 1);
+        hooks[hooks.length - 1] = info;
+    }
+
+    private void expectActiveHooks() {
+        if (hooks.length == 0) {
+            throw new RuntimeException("Method: " + getNameAsString() + " expected to contain method hook");
         }
-
-        infos = Arrays.copyOf(infos, infos.length + 1);
-        infos[infos.length - 1] = info;
     }
 
-    public void removeMethodBreakpointInfo(int requestId) {
+    public synchronized void removeActiveHook(int requestId) {
+        expectActiveHooks();
+        boolean removed = false;
         // shrink the array to avoid null values
-        if (infos.length == 0) {
-            throw new RuntimeException("Method: " + getNameAsString() + " should contain method breakpoint info");
-        } else if (infos.length == 1) {
-            infos = new MethodBreakpoint[0];
-            hasActiveBreakpoints.set(false);
+        if (hooks.length == 1) {
+            // make sure it's the right hook
+            if (hooks[0].getRequestId() == requestId) {
+                hooks = MethodHook.EMPTY;
+                hasActiveHook.set(false);
+                removed = true;
+            }
         } else {
             int removeIndex = -1;
-            for (int i = 0; i < infos.length; i++) {
-                if (infos[i].getRequestId() == requestId) {
+            for (int i = 0; i < hooks.length; i++) {
+                if (hooks[i].getRequestId() == requestId) {
                     removeIndex = i;
                     break;
                 }
             }
-            MethodBreakpoint[] temp = new MethodBreakpoint[infos.length - 1];
-            for (int i = 0; i < temp.length; i++) {
-                temp[i] = i < removeIndex ? infos[i] : infos[i + 1];
+            if (removeIndex != -1) {
+                MethodHook[] temp = new MethodHook[hooks.length - 1];
+                for (int i = 0; i < temp.length; i++) {
+                    temp[i] = i < removeIndex ? hooks[i] : hooks[i + 1];
+                }
+                hooks = temp;
+                removed = true;
             }
-            infos = temp;
+        }
+        if (!removed) {
+            throw new RuntimeException("Method: " + getNameAsString() + " should contain method hook");
         }
     }
 
-    public SharedRedefinitionContent redefine(ParserMethod newMethod, ParserKlass newKlass, Ids<Object> ids) {
-        // invalidate old version
+    public synchronized void removeActiveHook(MethodHook hook) {
+        expectActiveHooks();
+        boolean removed = false;
+        // shrink the array to avoid null values
+        if (hooks.length == 1) {
+            // make sure it's the right hook
+            if (hooks[0] == hook) {
+                hooks = MethodHook.EMPTY;
+                hasActiveHook.set(false);
+                removed = true;
+            }
+        } else {
+            int removeIndex = -1;
+            for (int i = 0; i < hooks.length; i++) {
+                if (hooks[i] == hook) {
+                    removeIndex = i;
+                    break;
+                }
+            }
+            if (removeIndex != -1) {
+                MethodHook[] temp = new MethodHook[hooks.length - 1];
+                for (int i = 0; i < temp.length; i++) {
+                    temp[i] = i < removeIndex ? hooks[i] : hooks[i + 1];
+                }
+                hooks = temp;
+                removed = true;
+            }
+        }
+        if (!removed) {
+            throw new RuntimeException("Method: " + getNameAsString() + " should contain method hook");
+        }
+    }
+
+    public synchronized void disposeHooks() {
+        hasActiveHook.set(false);
+        hooks = MethodHook.EMPTY;
+    }
+
+    public SharedRedefinitionContent redefine(ObjectKlass.KlassVersion klassVersion, ParserMethod newMethod, ParserKlass newKlass, Ids<Object> ids) {
         // install the new method version immediately
         LinkedMethod newLinkedMethod = new LinkedMethod(newMethod);
-        RuntimeConstantPool runtimePool = new RuntimeConstantPool(getContext(), newKlass.getConstantPool(), getDeclaringKlass().getDefiningClassLoader());
-        CodeAttribute newCodeAttribute = (CodeAttribute) newMethod.getAttribute(Name.Code);
+        RuntimeConstantPool runtimePool = new RuntimeConstantPool(newKlass.getConstantPool(), klassVersion.getKlass());
+        CodeAttribute newCodeAttribute = (CodeAttribute) newMethod.getAttribute(Names.Code);
         MethodVersion oldVersion = methodVersion;
-        methodVersion = new MethodVersion(runtimePool, newLinkedMethod, newCodeAttribute);
-        oldVersion.getAssumption().invalidate();
+        methodVersion = oldVersion.replace(klassVersion, runtimePool, newLinkedMethod, newCodeAttribute);
         ids.replaceObject(oldVersion, methodVersion);
-        return new SharedRedefinitionContent(newLinkedMethod, runtimePool, newCodeAttribute);
+        return new SharedRedefinitionContent(methodVersion, newLinkedMethod, runtimePool, newCodeAttribute);
     }
 
-    public void redefine(SharedRedefinitionContent content, Ids<Object> ids) {
-        // invalidate old version
+    public void redefine(ObjectKlass.KlassVersion klassVersion, SharedRedefinitionContent content, Ids<Object> ids) {
         // install the new method version immediately
         MethodVersion oldVersion = methodVersion;
-        methodVersion = new MethodVersion(content.getPool(), content.getLinkedMethod(), content.codeAttribute);
-        oldVersion.getAssumption().invalidate();
+        methodVersion = oldVersion.replace(klassVersion, content.getPool(), content.getLinkedMethod(), content.codeAttribute);
         ids.replaceObject(oldVersion, methodVersion);
     }
 
-    void onSubclassMethodChanged(Ids<Object> ids) {
+    public MethodVersion swapMethodVersion(ObjectKlass.KlassVersion klassVersion, Ids<Object> ids) {
         MethodVersion oldVersion = methodVersion;
         CodeAttribute codeAttribute = oldVersion.getCodeAttribute();
         // create a copy of the code attribute using the original
         // code of the old version. An obsolete method could be
         // running quickened bytecode and we can't safely patch
         // the bytecodes back to the original.
-        CodeAttribute newCodeAttribute = new CodeAttribute(codeAttribute);
-        methodVersion = new MethodVersion(oldVersion.pool, oldVersion.linkedMethod, newCodeAttribute);
-        oldVersion.getAssumption().invalidate();
+        CodeAttribute newCodeAttribute = codeAttribute != null ? new CodeAttribute(codeAttribute) : null;
+        methodVersion = oldVersion.replace(klassVersion, oldVersion.pool, oldVersion.linkedMethod, newCodeAttribute);
         ids.replaceObject(oldVersion, methodVersion);
+        return methodVersion;
     }
 
     public MethodVersion getMethodVersion() {
-        // block execution during class redefinition
-        ClassRedefinition.check();
-
         MethodVersion version = methodVersion;
-        if (!version.getAssumption().isValid()) {
+        if (!version.getRedefineAssumption().isValid()) {
             CompilerDirectives.transferToInterpreterAndInvalidate();
-            if (isRemovedByRedefition()) {
+            // we block until class redefinition is done
+            // unless we're the redefine thread
+            getContext().getClassRedefinition().check();
+            if (isRemovedByRedefinition()) {
                 // for a removed method, we return the latest known
                 // method version in case active frames try to
                 // retrieve information for obsolete methods
@@ -1098,43 +1182,395 @@ public final class Method extends Member<Signature> implements TruffleObject, Co
             }
             do {
                 version = methodVersion;
-            } while (!version.getAssumption().isValid());
+            } while (!version.getRedefineAssumption().isValid());
         }
         return version;
     }
 
     public void removedByRedefinition() {
-        removedByRedefinition.invalidate();
+        removedByRedefinition = true;
     }
 
-    public boolean isRemovedByRedefition() {
-        return !removedByRedefinition.isValid();
+    public boolean isRemovedByRedefinition() {
+        return removedByRedefinition;
     }
 
-    public final class MethodVersion implements MethodRef {
-        private final Assumption assumption;
+    @TruffleBoundary
+    public StaticObject makeMirror(Meta meta) {
+        if (isConstructor()) {
+            return makeConstructorMirror(meta);
+        } else {
+            return makeMethodMirror(meta);
+        }
+    }
+
+    @TruffleBoundary
+    public StaticObject makeConstructorMirror(Meta meta) {
+        assert isConstructor();
+        Attribute rawRuntimeVisibleAnnotations = getAttribute(Names.RuntimeVisibleAnnotations);
+        StaticObject runtimeVisibleAnnotations = rawRuntimeVisibleAnnotations != null
+                        ? StaticObject.wrap(rawRuntimeVisibleAnnotations.getData(), meta)
+                        : StaticObject.NULL;
+
+        Attribute rawRuntimeVisibleParameterAnnotations = getAttribute(Names.RuntimeVisibleParameterAnnotations);
+        StaticObject runtimeVisibleParameterAnnotations = rawRuntimeVisibleParameterAnnotations != null
+                        ? StaticObject.wrap(rawRuntimeVisibleParameterAnnotations.getData(), meta)
+                        : StaticObject.NULL;
+
+        Attribute rawRuntimeVisibleTypeAnnotations = getAttribute(Names.RuntimeVisibleTypeAnnotations);
+        StaticObject runtimeVisibleTypeAnnotations = rawRuntimeVisibleTypeAnnotations != null
+                        ? StaticObject.wrap(rawRuntimeVisibleTypeAnnotations.getData(), meta)
+                        : StaticObject.NULL;
+
+        final Klass[] rawParameterKlasses = resolveParameterKlasses();
+        StaticObject parameterTypes = meta.java_lang_Class.allocateReferenceArray(
+                        getParameterCount(),
+                        new IntFunction<StaticObject>() {
+                            @Override
+                            public StaticObject apply(int j) {
+                                return rawParameterKlasses[j].mirror();
+                            }
+                        });
+
+        final Klass[] rawCheckedExceptions = getCheckedExceptions();
+        StaticObject checkedExceptions = meta.java_lang_Class.allocateReferenceArray(rawCheckedExceptions.length, new IntFunction<StaticObject>() {
+            @Override
+            public StaticObject apply(int j) {
+                return rawCheckedExceptions[j].mirror();
+            }
+        });
+
+        StaticObject guestGenericSignature = StaticObject.NULL;
+        String genericSignatureString = getGenericSignatureAsString();
+        if (genericSignatureString != null && !genericSignatureString.isEmpty()) {
+            guestGenericSignature = meta.toGuestString(genericSignatureString);
+        }
+
+        StaticObject instance = meta.java_lang_reflect_Constructor.allocateInstance(getContext());
+        meta.java_lang_reflect_Constructor_init.invokeDirectSpecial(
+                        /* this */ instance,
+                        /* declaringKlass */ getDeclaringKlass().mirror(),
+                        /* parameterTypes */ parameterTypes,
+                        /* checkedExceptions */ checkedExceptions,
+                        /* modifiers */ getMethodModifiers(),
+                        /* slot */ 0, // unused
+                        /* signature */ guestGenericSignature,
+                        /* annotations */ runtimeVisibleAnnotations,
+                        /* parameterAnnotations */ runtimeVisibleParameterAnnotations);
+
+        meta.HIDDEN_CONSTRUCTOR_KEY.setHiddenObject(instance, this);
+        meta.HIDDEN_CONSTRUCTOR_RUNTIME_VISIBLE_TYPE_ANNOTATIONS.setHiddenObject(instance, runtimeVisibleTypeAnnotations);
+
+        return instance;
+    }
+
+    @TruffleBoundary
+    public StaticObject makeMethodMirror(Meta meta) {
+        assert !isConstructor();
+        Attribute rawRuntimeVisibleAnnotations = getAttribute(Names.RuntimeVisibleAnnotations);
+        StaticObject runtimeVisibleAnnotations = rawRuntimeVisibleAnnotations != null
+                        ? StaticObject.wrap(rawRuntimeVisibleAnnotations.getData(), meta)
+                        : StaticObject.NULL;
+
+        Attribute rawRuntimeVisibleParameterAnnotations = getAttribute(Names.RuntimeVisibleParameterAnnotations);
+        StaticObject runtimeVisibleParameterAnnotations = rawRuntimeVisibleParameterAnnotations != null
+                        ? StaticObject.wrap(rawRuntimeVisibleParameterAnnotations.getData(), meta)
+                        : StaticObject.NULL;
+
+        Attribute rawRuntimeVisibleTypeAnnotations = getAttribute(Names.RuntimeVisibleTypeAnnotations);
+        StaticObject runtimeVisibleTypeAnnotations = rawRuntimeVisibleTypeAnnotations != null
+                        ? StaticObject.wrap(rawRuntimeVisibleTypeAnnotations.getData(), meta)
+                        : StaticObject.NULL;
+
+        Attribute rawAnnotationDefault = getAttribute(Names.AnnotationDefault);
+        StaticObject annotationDefault = rawAnnotationDefault != null
+                        ? StaticObject.wrap(rawAnnotationDefault.getData(), meta)
+                        : StaticObject.NULL;
+        final Klass[] rawParameterKlasses = resolveParameterKlasses();
+        StaticObject parameterTypes = meta.java_lang_Class.allocateReferenceArray(
+                        getParameterCount(),
+                        new IntFunction<StaticObject>() {
+                            @Override
+                            public StaticObject apply(int j) {
+                                return rawParameterKlasses[j].mirror();
+                            }
+                        });
+
+        final Klass[] rawCheckedExceptions = getCheckedExceptions();
+        StaticObject guestCheckedExceptions = meta.java_lang_Class.allocateReferenceArray(rawCheckedExceptions.length, new IntFunction<StaticObject>() {
+            @Override
+            public StaticObject apply(int j) {
+                return rawCheckedExceptions[j].mirror();
+            }
+        });
+
+        SignatureAttribute signatureAttribute = (SignatureAttribute) getAttribute(Names.Signature);
+        StaticObject guestGenericSignature = StaticObject.NULL;
+        if (signatureAttribute != null) {
+            String sig = getConstantPool().symbolAtUnsafe(signatureAttribute.getSignatureIndex(), "signature").toString();
+            guestGenericSignature = meta.toGuestString(sig);
+        }
+
+        StaticObject instance = meta.java_lang_reflect_Method.allocateInstance(meta.getContext());
+
+        meta.java_lang_reflect_Method_init.invokeDirectSpecial(
+                        /* this */ instance,
+                        /* declaringClass */ getDeclaringKlass().mirror(),
+                        /* name */ getContext().getStrings().intern(getName()),
+                        /* parameterTypes */ parameterTypes,
+                        /* returnType */ resolveReturnKlass().mirror(),
+                        /* checkedExceptions */ guestCheckedExceptions,
+                        /* modifiers */ getMethodModifiers(),
+                        /* slot */ getVTableIndex(),
+                        /* signature */ guestGenericSignature,
+                        /* annotations */ runtimeVisibleAnnotations,
+                        /* parameterAnnotations */ runtimeVisibleParameterAnnotations,
+                        /* annotationDefault */ annotationDefault);
+        meta.HIDDEN_METHOD_KEY.setHiddenObject(instance, this);
+        meta.HIDDEN_METHOD_RUNTIME_VISIBLE_TYPE_ANNOTATIONS.setHiddenObject(instance, runtimeVisibleTypeAnnotations);
+        return instance;
+    }
+
+    // region MethodAccess impl
+
+    @Override
+    public Symbol<Signature> getSymbolicSignature() {
+        return getRawSignature();
+    }
+
+    @Override
+    public Symbol<Type>[] getParsedSymbolicSignature(SymbolPool symbolPool) {
+        return getParsedSignature();
+    }
+
+    @Override
+    @Idempotent
+    // Re-implement here for indempotent annotation. Some of our nodes benefit from it.
+    public boolean isAbstract() {
+        return super.isAbstract();
+    }
+
+    @Override
+    public boolean shouldSkipLoadingConstraints() {
+        return isPolySignatureIntrinsic();
+    }
+
+    // endregion MethodAccess impl
+
+    private static final class Continuum {
+        Continuum(LivenessAnalysis livenessAnalysis) {
+            this.livenessAnalysis = livenessAnalysis;
+        }
+
+        private record ContinuumData(int bci, CallTarget continuable, EspressoFrameDescriptor frameDescriptor) {
+        }
+
+        private static final ContinuumData[] EMPTY_DATA = new ContinuumData[0];
+
+        // Force Liveness Analysis for all method in a continuation frame record.
+        private final LivenessAnalysis livenessAnalysis;
+        @CompilationFinal(dimensions = 1) //
+        private volatile ContinuumData[] continuumData = EMPTY_DATA;
+
+        @ExplodeLoop
+        private ContinuumData getData(MethodVersion mv, int bci) {
+            ContinuumData[] localData = continuumData;
+            for (ContinuumData data : localData) {
+                if (data.bci() == bci) {
+                    return data;
+                }
+            }
+            CompilerDirectives.transferToInterpreterAndInvalidate();
+            synchronized (this) {
+                localData = continuumData;
+                for (ContinuumData data : localData) {
+                    if (data.bci() == bci) {
+                        return data;
+                    }
+                }
+                int prevSize = continuumData.length;
+                localData = Arrays.copyOf(continuumData, prevSize + 1);
+                EspressoFrameDescriptor fd = FrameAnalysis.apply(mv, bci, livenessAnalysis);
+                CallTarget ct = EspressoRootNode.createContinuable(mv, bci, fd).getCallTarget();
+                ContinuumData data = new ContinuumData(bci, ct, fd);
+                localData[prevSize] = data;
+                this.continuumData = localData;
+                return data;
+            }
+        }
+
+        public EspressoFrameDescriptor getFrameDescriptor(MethodVersion mv, int bci) {
+            return getData(mv, bci).frameDescriptor();
+        }
+
+        public CallTarget getContinuableCallTarget(MethodVersion mv, int bci) {
+            return getData(mv, bci).continuable();
+        }
+    }
+
+    /**
+     * Each time a method is changed via class redefinition it gets a new version, and therefore a
+     * new MethodVersion object.
+     */
+    public final class MethodVersion implements MethodRef, ModifiersProvider {
+        private static final int CODE_FLAGS_READY = 0x1;
+        private static final int CODE_FLAGS_HAS_JSR = 0x2;
+        private static final int CODE_FLAGS_USES_MONITORS = 0x4;
+        private static final int CODE_FLAGS_HAS_INDY = 0x8;
+
+        private final ObjectKlass.KlassVersion klassVersion;
         private final RuntimeConstantPool pool;
         private final LinkedMethod linkedMethod;
         private final CodeAttribute codeAttribute;
-        @CompilationFinal private CallTarget callTarget;
+        private final ExceptionsAttribute exceptionsAttribute;
 
-        MethodVersion(RuntimeConstantPool pool, LinkedMethod linkedMethod, CodeAttribute codeAttribute) {
-            this.assumption = Truffle.getRuntime().createAssumption();
+        @CompilationFinal private CallTarget callTarget;
+        @CompilationFinal private CallTarget callTargetNoSubstitutions;
+        @CompilationFinal private Continuum continuum;
+
+        @CompilationFinal private int vtableIndex = -1;
+        @CompilationFinal private int itableIndex = -1;
+
+        @CompilationFinal private byte refKind;
+        @CompilationFinal private byte codeFlags;
+
+        @CompilationFinal(dimensions = 1) //
+        private ObjectKlass[] checkedExceptions;
+
+        // Multiple maximally-specific interface methods. Fail on call.
+        @CompilationFinal private boolean poisonPill;
+
+        @CompilationFinal private LivenessAnalysis livenessAnalysis;
+
+        private MethodVersion(ObjectKlass.KlassVersion klassVersion, RuntimeConstantPool pool, LinkedMethod linkedMethod, boolean poisonPill,
+                        CodeAttribute codeAttribute) {
+            this.klassVersion = klassVersion;
             this.pool = pool;
             this.linkedMethod = linkedMethod;
             this.codeAttribute = codeAttribute;
+            this.exceptionsAttribute = (ExceptionsAttribute) linkedMethod.getAttribute(ExceptionsAttribute.NAME);
+            this.poisonPill = poisonPill;
+            initRefKind();
         }
 
+        public SourceSection getWholeMethodSourceSection() {
+            Source s = getSource();
+            if (s == null) {
+                return null;
+            }
+
+            LineNumberTableAttribute lineNumberTable = getLineNumberTableAttribute();
+
+            if (lineNumberTable != LineNumberTableAttribute.EMPTY) {
+                List<LineNumberTableAttribute.Entry> entries = lineNumberTable.getEntries();
+                int startLine = Integer.MAX_VALUE;
+                int endLine = 0;
+
+                for (int i = 0; i < entries.size(); i++) {
+                    int line = entries.get(i).getLineNumber();
+                    if (line > endLine) {
+                        endLine = line;
+                    }
+                    if (line < startLine) {
+                        startLine = line;
+                    }
+                }
+
+                if (startLine >= 1 && endLine >= 1 && startLine <= endLine) {
+                    return s.createSection(startLine, -1, endLine, -1);
+                } // (else) Most likely generated bytecodes with dummy LineNumberTable attribute.
+            }
+            return s.createUnavailableSection();
+        }
+
+        public SourceSection getSourceSectionAtBCI(int bci) {
+            Source s = getSource();
+            if (s == null) {
+                return null;
+            }
+            if (codeAttribute == null) {
+                return s.createUnavailableSection();
+            }
+            if (bci < 0 || bci >= codeAttribute.getOriginalCode().length) {
+                return s.createUnavailableSection();
+            }
+            int line = codeAttribute.bciToLineNumber(bci);
+            if (line < 0) {
+                return s.createUnavailableSection();
+            }
+            return s.createSection(line);
+        }
+
+        public void initRefKind() {
+            if (Modifier.isStatic(linkedMethod.getFlags())) {
+                this.refKind = REF_invokeStatic;
+            } else if (Modifier.isPrivate(linkedMethod.getFlags()) || Names._init_.equals(linkedMethod.getName())) {
+                this.refKind = REF_invokeSpecial;
+            } else if (klassVersion.isInterface()) {
+                this.refKind = REF_invokeInterface;
+            } else {
+                assert !declaringKlass.isPrimitive();
+                this.refKind = REF_invokeVirtual;
+            }
+        }
+
+        public MethodVersion replace(ObjectKlass.KlassVersion version, RuntimeConstantPool constantPool, LinkedMethod newLinkedMethod, CodeAttribute newCodeAttribute) {
+            MethodVersion result = new MethodVersion(version, constantPool, newLinkedMethod, false, newCodeAttribute);
+            // make sure the table indices are copied
+            result.vtableIndex = vtableIndex;
+            result.itableIndex = itableIndex;
+            return result;
+        }
+
+        public LinkedMethod getLinkedMethod() {
+            return linkedMethod;
+        }
+
+        @Idempotent
         public Method getMethod() {
             return Method.this;
         }
 
-        public Assumption getAssumption() {
-            return assumption;
+        public Symbol<Name> getName() {
+            return linkedMethod.getName();
+        }
+
+        public Symbol<Signature> getRawSignature() {
+            return getMethod().getRawSignature();
+        }
+
+        public Assumption getRedefineAssumption() {
+            return klassVersion.getAssumption();
         }
 
         public CodeAttribute getCodeAttribute() {
             return codeAttribute;
+        }
+
+        void setVTableIndex(int i) {
+            setVTableIndex(i, false);
+        }
+
+        void setVTableIndex(int i, boolean isRedefinition) {
+            assert (vtableIndex == -1 || vtableIndex == i || isRedefinition);
+            assert itableIndex == -1;
+            CompilerAsserts.neverPartOfCompilation();
+            this.vtableIndex = i;
+        }
+
+        public int getVTableIndex() {
+            return vtableIndex;
+        }
+
+        void setITableIndex(int i) {
+            assert (itableIndex == -1 || itableIndex == i);
+            assert vtableIndex == -1;
+            CompilerAsserts.neverPartOfCompilation();
+            this.itableIndex = i;
+        }
+
+        public int getITableIndex() {
+            return itableIndex;
         }
 
         public ExceptionHandler[] getExceptionHandlers() {
@@ -1145,69 +1581,111 @@ public final class Method extends Member<Signature> implements TruffleObject, Co
             return pool;
         }
 
-        public CallTarget getCallTarget() {
-            return getCallTarget(true);
-        }
-
-        public CallTarget getCallTargetNoInit() {
-            return getCallTarget(false);
-        }
-
+        @SuppressFBWarnings(value = "DC_DOUBLECHECK", //
+                        justification = "Publication uses a release fence, assuming data dependency ordering on the reader side.")
         private CallTarget getCallTargetNoSubstitution() {
             CompilerAsserts.neverPartOfCompilation();
             EspressoError.guarantee(getSubstitutions().hasSubstitutionFor(getMethod()),
                             "Using 'getCallTargetNoSubstitution' should be done only to bypass the substitution mechanism.");
-            return findCallTarget();
+            if (callTargetNoSubstitutions == null) {
+                synchronized (this) {
+                    if (callTargetNoSubstitutions == null) {
+                        CallTarget target = findCallTarget();
+                        VarHandle.releaseFence();
+                        callTargetNoSubstitutions = target;
+                    }
+                }
+            }
+            return callTargetNoSubstitutions;
         }
 
-        private CallTarget getCallTarget(boolean initKlass) {
-            if (callTarget == null) {
-                CompilerDirectives.transferToInterpreterAndInvalidate();
-                Meta meta = getMeta();
-                checkPoisonPill(meta);
-                if (initKlass) {
-                    /*
-                     * Initializing a class costs a lock, do it outside of this method's lock to
-                     * avoid congestion. Note that requesting a call target is immediately followed
-                     * by a call to the method, before advancing BCI. This ensures that we are
-                     * respecting the specs, saying that a class must be initialized before a method
-                     * is called, while saving a call to safeInitialize after a method lookup.
-                     */
-                    declaringKlass.safeInitialize();
+        public CallTarget getCallTarget() {
+            if (CompilerDirectives.injectBranchProbability(CompilerDirectives.SLOWPATH_PROBABILITY, callTarget == null)) {
+                if (CompilerDirectives.isCompilationConstant(this)) {
+                    CompilerDirectives.transferToInterpreterAndInvalidate();
                 }
-                synchronized (this) {
-                    if (callTarget != null) {
-                        return callTarget;
-                    }
-                    if (proxy != null) {
-                        this.callTarget = proxy.getCallTarget();
-                        return callTarget;
-                    }
-
-                    /*
-                     * The substitution factory does the validation e.g. some substitutions only
-                     * apply for classes/methods in the boot or platform class loaders. A warning is
-                     * logged is the validation fails.
-                     */
-                    EspressoRootNode redirectedMethod = getSubstitutions().get(getMethod());
-                    if (redirectedMethod != null) {
-                        callTarget = Truffle.getRuntime().createCallTarget(redirectedMethod);
-                        return callTarget;
-                    }
-
-                    CallTarget target = findCallTarget();
-                    if (target != null) {
-                        callTarget = target;
-                        return callTarget;
-                    }
-                }
+                resolveCallTarget();
             }
             return callTarget;
         }
 
+        @SuppressFBWarnings(value = "DC_DOUBLECHECK", //
+                        justification = "Publication uses a release fence, assuming data dependency ordering on the reader side.")
+        private Continuum getContinuum() {
+            if (continuum == null) {
+                CompilerDirectives.transferToInterpreterAndInvalidate();
+                // Compute LA out of lock.
+                LivenessAnalysis la = getLivenessAnalysis();
+                if (la.isEmpty()) {
+                    /*
+                     * Ensure we compute and use a full liveness analysis for all method in the
+                     * continuation records, so that the frame capture prunes as much unneeded data
+                     * as possible in order to make the records slimmer.
+                     */
+                    la = LivenessAnalysis.analyze(EspressoOptions.LivenessAnalysisMode.ALL, this);
+                }
+                synchronized (this) {
+                    if (continuum == null) {
+                        Continuum c = new Continuum(la);
+                        VarHandle.releaseFence();
+                        continuum = c;
+                    }
+                }
+            }
+            return continuum;
+        }
+
+        /**
+         * Obtains a {@link com.oracle.truffle.espresso.meta.Meta.ContinuumSupport continuation}
+         * call target that can be used for rewinding a continuation.
+         */
+        public CallTarget getContinuableCallTarget(int bci) {
+            return getContinuum().getContinuableCallTarget(this, bci);
+        }
+
+        /**
+         * Obtains a {@link EspressoFrameDescriptor} describing the shape of the Espresso execution
+         * frame at this BCI.
+         */
+        public EspressoFrameDescriptor getFrameDescriptor(int bci) {
+            return getContinuum().getFrameDescriptor(this, bci);
+        }
+
+        @TruffleBoundary
+        private void resolveCallTarget() {
+            Meta meta = getMeta();
+            checkPoisonPill(meta);
+            synchronized (this) {
+                if (callTarget != null) {
+                    return;
+                }
+                CallTarget target;
+                if (proxy != Method.this) {
+                    target = proxy.getCallTarget();
+                } else {
+                    /*
+                     * The substitution factory does the validation e.g. some substitutions only
+                     * apply for classes/methods in the boot or platform class loaders. A warning is
+                     * logged if the validation fails.
+                     */
+                    EspressoRootNode redirectedMethod = getSubstitutions().get(getMethod());
+                    if (redirectedMethod != null) {
+                        target = redirectedMethod.getCallTarget();
+                    } else {
+                        assert callTargetNoSubstitutions == null;
+                        target = findCallTarget();
+                    }
+                }
+                if (target != null) {
+                    VarHandle.releaseFence();
+                    callTarget = target;
+                }
+            }
+        }
+
         private CallTarget findCallTarget() {
             CallTarget target;
-            if (getMethod().isNative()) {
+            if (isNative()) {
                 // Bind native method.
                 target = lookupLibJavaCallTarget();
                 if (target == null) {
@@ -1229,11 +1707,11 @@ public final class Method extends Member<Signature> implements TruffleObject, Co
                      * The method was obtained through a regular lookup (since it is in the declared
                      * methods). Delegate it to a polysignature method lookup.
                      */
-                    target = declaringKlass.lookupPolysigMethod(getName(), getRawSignature()).getCallTarget();
+                    target = declaringKlass.lookupPolysigMethod(getName(), getRawSignature(), Klass.LookupMode.ALL).getCallTarget();
                 }
 
                 if (target == null) {
-                    getContext().getLogger().log(Level.WARNING, "Failed to link native method: {0}", getMethod().toString());
+                    getContext().getLogger().log(Level.WARNING, "Failed to link native method: {0}", toString());
                     Meta meta = getMeta();
                     throw meta.throwException(meta.java_lang_UnsatisfiedLinkError);
                 }
@@ -1243,15 +1721,24 @@ public final class Method extends Member<Signature> implements TruffleObject, Co
                     throw meta.throwExceptionWithMessage(meta.java_lang_AbstractMethodError,
                                     "Calling abstract method: " + getMethod().getDeclaringKlass().getType() + "." + getName() + " -> " + getRawSignature());
                 }
-                FrameDescriptor frameDescriptor = new FrameDescriptor();
-                EspressoRootNode rootNode = EspressoRootNode.create(frameDescriptor, new BytecodeNode(this, frameDescriptor));
-                target = Truffle.getRuntime().createCallTarget(rootNode);
+                EspressoRootNode rootNode = EspressoRootNode.createForBytecodes(this);
+                target = rootNode.getCallTarget();
             }
             return target;
         }
 
-        public int getCodeSize() {
-            return codeAttribute.getCode() != null ? codeAttribute.getCode().length : 0;
+        private void checkPoisonPill(Meta meta) {
+            if (poisonPill) {
+                // Conflicting Maximally-specific non-abstract interface methods.
+                if (getJavaVersion().java9OrLater() && getSpecComplianceMode() == EspressoOptions.SpecComplianceMode.HOTSPOT) {
+                    /*
+                     * Supposed to be IncompatibleClassChangeError (see jvms-6.5.invokeinterface),
+                     * but HotSpot throws AbstractMethodError.
+                     */
+                    throw meta.throwExceptionWithMessage(meta.java_lang_AbstractMethodError, "Conflicting default methods: " + getName());
+                }
+                throw meta.throwExceptionWithMessage(meta.java_lang_IncompatibleClassChangeError, "Conflicting default methods: " + getName());
+            }
         }
 
         public LineNumberTableAttribute getLineNumberTableAttribute() {
@@ -1264,7 +1751,7 @@ public final class Method extends Member<Signature> implements TruffleObject, Co
 
         @Override
         public long getBCIFromLine(int line) {
-            return getMethod().getBCIFromLine(line);
+            return getLineNumberTable().getBCI(line);
         }
 
         @Override
@@ -1274,17 +1761,17 @@ public final class Method extends Member<Signature> implements TruffleObject, Co
 
         @Override
         public boolean hasLine(int lineNumber) {
-            return getMethod().hasLine(lineNumber);
+            return getLineNumberTable().getBCI(lineNumber) != -1;
         }
 
         @Override
         public String getSourceFile() {
-            return getMethod().getSourceFile();
+            return getDeclaringKlass().getSourceFile();
         }
 
         @Override
         public String getNameAsString() {
-            return getMethod().getNameAsString();
+            return getName().toString();
         }
 
         @Override
@@ -1304,12 +1791,22 @@ public final class Method extends Member<Signature> implements TruffleObject, Co
 
         @Override
         public int bciToLineNumber(int bci) {
-            return getMethod().bciToLineNumber(bci);
+            if (bci < 0) {
+                return bci;
+            }
+            if (isNative()) {
+                return EspressoStackElement.NATIVE_BCI;
+            }
+            if (codeAttribute == null) {
+                assert isAbstract();
+                return EspressoStackElement.UNKNOWN_BCI;
+            }
+            return codeAttribute.bciToLineNumber(bci);
         }
 
         @Override
         public boolean isMethodNative() {
-            return getMethod().isMethodNative();
+            return isNative();
         }
 
         @Override
@@ -1318,38 +1815,62 @@ public final class Method extends Member<Signature> implements TruffleObject, Co
         }
 
         @Override
-        public KlassRef[] getParameters() {
-            return getMethod().getParameters();
+        public LocalVariableTable getLocalVariableTable() {
+            if (codeAttribute != null) {
+                return codeAttribute.getLocalvariableTable();
+            }
+            return LocalVariableTable.EMPTY_LVT;
         }
 
         @Override
-        public LocalVariableTableRef getLocalVariableTable() {
-            return getMethod().getLocalVariableTable();
+        public LocalVariableTable getLocalVariableTypeTable() {
+            if (codeAttribute != null) {
+                return codeAttribute.getLocalvariableTypeTable();
+            }
+            return LocalVariableTable.EMPTY_LVTT;
         }
 
         @Override
-        public LocalVariableTableRef getLocalVariableTypeTable() {
-            return getMethod().getLocalVariableTypeTable();
+        public LineNumberTableAttribute getLineNumberTable() {
+            return getLineNumberTableAttribute();
         }
 
         @Override
-        public boolean hasVariableTable() {
-            return getLocalVariableTable() != LocalVariableTable.EMPTY;
+        public Object invokeMethodVirtual(Object... args) {
+            checkRemovedByRedefinition();
+            return invokeDirectVirtual(args);
         }
 
         @Override
-        public LineNumberTableRef getLineNumberTable() {
-            return getMethod().getLineNumberTable();
+        public Object invokeMethodStatic(Object... args) {
+            checkRemovedByRedefinition();
+            return invokeDirectStatic(args);
         }
 
         @Override
-        public Object invokeMethod(Object callee, Object[] args) {
-            if (getMethod().isRemovedByRedefition()) {
+        public Object invokeMethodSpecial(Object... args) {
+            checkRemovedByRedefinition();
+            return invokeDirectSpecial(args);
+        }
+
+        @Override
+        public Object invokeMethodInterface(Object... args) {
+            checkRemovedByRedefinition();
+            return invokeDirectInterface(args);
+        }
+
+        @Override
+        public Object invokeMethodNonVirtual(Object... args) {
+            checkRemovedByRedefinition();
+            return invokeDirect(args);
+        }
+
+        private void checkRemovedByRedefinition() {
+            if (getMethod().isRemovedByRedefinition()) {
                 Meta meta = getMeta();
                 throw meta.throwExceptionWithMessage(meta.java_lang_NoSuchMethodError,
-                                meta.toGuestString(getMethod().getDeclaringKlass().getNameAsString() + "." + getMethod().getName() + getMethod().getRawSignature()));
+                                meta.toGuestString(getMethod().getDeclaringKlass().getNameAsString() + "." + getName() + getRawSignature()));
             }
-            return getMethod().invokeMethod(callee, args);
         }
 
         @Override
@@ -1359,53 +1880,71 @@ public final class Method extends Member<Signature> implements TruffleObject, Co
 
         @Override
         public boolean isLastLine(long codeIndex) {
-            return getMethod().isLastLine(codeIndex);
+            LineNumberTableAttribute table = getLineNumberTable();
+            int lastLine = table.getLastLine();
+            int lineAt = table.getLineNumber((int) codeIndex);
+            return lastLine == lineAt;
         }
 
         @Override
-        public KlassRef getDeclaringKlass() {
+        public KlassRef getDeclaringKlassRef() {
             return getMethod().getDeclaringKlass();
         }
 
         @Override
-        public int getFirstLine() {
-            return getMethod().getFirstLine();
-        }
-
-        @Override
         public int getLastLine() {
-            return getMethod().getLastLine();
+            return getLineNumberTable().getLastLine();
         }
 
         @Override
-        public MethodBreakpoint[] getMethodBreakpointInfos() {
-            return getMethod().getMethodBreakpointInfos();
+        public MethodHook[] getMethodHooks() {
+            return getMethod().getMethodHooks();
         }
 
         @Override
-        public void addMethodBreakpointInfo(MethodBreakpoint info) {
-            getMethod().addMethodBreakpointInfo(info);
+        public void addMethodHook(MethodHook info) {
+            getMethod().addMethodHook(info);
         }
 
         @Override
-        public void removeMethodBreakpointInfo(int requestId) {
-            getMethod().removeMethodBreakpointInfo(requestId);
+        public void removedMethodHook(int requestId) {
+            getMethod().removeActiveHook(requestId);
         }
 
         @Override
-        public boolean hasActiveBreakpoint() {
-            return getMethod().hasActiveBreakpoint();
+        public void removedMethodHook(MethodHook hook) {
+            getMethod().removeActiveHook(hook);
+        }
+
+        @Override
+        public void disposeHooks() {
+            getMethod().disposeHooks();
+        }
+
+        @Override
+        public boolean hasActiveHook() {
+            return getMethod().hasActiveHook();
         }
 
         @Override
         public boolean isObsolete() {
-            return !assumption.isValid();
+            return !klassVersion.getAssumption().isValid();
+        }
+
+        @Override
+        public boolean isConstructor() {
+            return getMethod().isConstructor();
+        }
+
+        @Override
+        public boolean isClassInitializer() {
+            return getMethod().isClassInitializer();
         }
 
         @Override
         public long getLastBCI() {
             int bci = 0;
-            BytecodeStream bs = new BytecodeStream(getCodeAttribute().getCode());
+            BytecodeStream bs = new BytecodeStream(getOriginalCode());
             int end = bs.endBCI();
 
             while (bci < end) {
@@ -1421,20 +1960,142 @@ public final class Method extends Member<Signature> implements TruffleObject, Co
 
         @Override
         public String toString() {
-            return getMethod().toString();
+            return "EspressoMethod<" + getDeclaringKlass().getType() + "." + getName() + getRawSignature() + ">";
+        }
+
+        public boolean usesMonitors() {
+            // Whether we need to use an additional frame slot for monitor unlock on kill.
+            return isSynchronized() || (getCodeFlags() & CODE_FLAGS_USES_MONITORS) != 0;
+        }
+
+        /**
+         * Returns true if this method uses the JSR/RET bytecodes.
+         */
+        public boolean hasJsr() {
+            return (getCodeFlags() & CODE_FLAGS_HAS_JSR) != 0;
+        }
+
+        public boolean usesIndy() {
+            return (getCodeFlags() & CODE_FLAGS_HAS_INDY) != 0;
+        }
+
+        private byte getCodeFlags() {
+            byte localFlags = codeFlags;
+            if (localFlags == 0) {
+                CompilerDirectives.transferToInterpreterAndInvalidate();
+                if (codeAttribute == null) {
+                    localFlags = CODE_FLAGS_READY;
+                } else {
+                    localFlags = computeFlags(codeAttribute.getOriginalCode());
+                }
+                assert localFlags != 0;
+                codeFlags = localFlags;
+            }
+            return localFlags;
+        }
+
+        private static byte computeFlags(byte[] code) {
+            BytecodeStream bs = new BytecodeStream(code);
+            int bci = 0;
+            int flags = CODE_FLAGS_READY;
+            while (bci < bs.endBCI()) {
+                int opcode = bs.opcode(bci);
+                switch (opcode) {
+                    case JSR, JSR_W, RET ->
+                        flags |= CODE_FLAGS_HAS_JSR;
+                    case MONITORENTER, MONITOREXIT ->
+                        flags |= CODE_FLAGS_USES_MONITORS;
+                    case INVOKEDYNAMIC ->
+                        flags |= CODE_FLAGS_HAS_INDY;
+                }
+                bci = bs.nextBCI(bci);
+            }
+            return (byte) flags;
+        }
+
+        public int getRefKind() {
+            return refKind;
+        }
+
+        public ObjectKlass[] getCheckedExceptions() {
+            if (checkedExceptions == null) {
+                CompilerDirectives.transferToInterpreterAndInvalidate();
+                createCheckedExceptions();
+            }
+            return checkedExceptions;
+        }
+
+        private synchronized void createCheckedExceptions() {
+            if (checkedExceptions == null) {
+                if (exceptionsAttribute == null) {
+                    checkedExceptions = ObjectKlass.EMPTY_ARRAY;
+                    return;
+                }
+                final int[] entries = exceptionsAttribute.getCheckedExceptionsCPI();
+                ObjectKlass[] tmpchecked = new ObjectKlass[entries.length];
+                for (int i = 0; i < entries.length; ++i) {
+                    // TODO(peterssen): Resolve and cache CP entries.
+                    tmpchecked[i] = (ObjectKlass) pool.resolvedKlassAt(declaringKlass, entries[i]);
+                }
+                checkedExceptions = tmpchecked;
+            }
+        }
+
+        @SuppressFBWarnings(value = "DC_DOUBLECHECK", //
+                        justification = "fields of LivenessAnalysis are final.")
+        public LivenessAnalysis getLivenessAnalysis() {
+            CompilerAsserts.neverPartOfCompilation();
+            LivenessAnalysis result = this.livenessAnalysis;
+            if (result == null) {
+                synchronized (this) {
+                    result = this.livenessAnalysis;
+                    if (result == null) {
+                        this.livenessAnalysis = result = LivenessAnalysis.analyze(getLanguage().getLivenessAnalysisMode(), this);
+                    }
+                }
+            }
+            return result;
+        }
+
+        public ObjectKlass.KlassVersion getKlassVersion() {
+            return klassVersion;
+        }
+
+        public ObjectKlass getDeclaringKlass() {
+            return declaringKlass;
+        }
+
+        public void checkLoadingConstraints(StaticObject loader1, StaticObject loader2) {
+            getMethod().checkLoadingConstraints(loader1, loader2, m -> {
+                throw getContext().throwError(ErrorType.LinkageError, m);
+            });
+        }
+
+        public int getMaxLocals() {
+            return codeAttribute.getMaxLocals();
+        }
+
+        public int getMaxStackSize() {
+            return codeAttribute.getMaxStack();
         }
     }
 
     static class SharedRedefinitionContent {
 
+        private final MethodVersion version;
         private final LinkedMethod linkedMethod;
         private final RuntimeConstantPool pool;
         private final CodeAttribute codeAttribute;
 
-        SharedRedefinitionContent(LinkedMethod linkedMethod, RuntimeConstantPool pool, CodeAttribute codeAttribute) {
+        SharedRedefinitionContent(MethodVersion version, LinkedMethod linkedMethod, RuntimeConstantPool pool, CodeAttribute codeAttribute) {
+            this.version = version;
             this.linkedMethod = linkedMethod;
             this.pool = pool;
             this.codeAttribute = codeAttribute;
+        }
+
+        public MethodVersion getMethodVersion() {
+            return version;
         }
 
         public LinkedMethod getLinkedMethod() {
@@ -1450,4 +2111,5 @@ public final class Method extends Member<Signature> implements TruffleObject, Co
         }
     }
     // endregion jdwp-specific
+
 }

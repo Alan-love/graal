@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014, 2017, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2024, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,139 +24,62 @@
  */
 package com.oracle.svm.core.genscavenge;
 
-import org.graalvm.nativeimage.Platform;
-import org.graalvm.nativeimage.Platforms;
+import static jdk.graal.compiler.nodes.extended.BranchProbabilityNode.EXTREMELY_SLOW_PATH_PROBABILITY;
+import static jdk.graal.compiler.nodes.extended.BranchProbabilityNode.probability;
+
+import org.graalvm.word.Pointer;
 import org.graalvm.word.UnsignedWord;
 
-import com.oracle.svm.core.MemoryWalker;
-import com.oracle.svm.core.annotate.AlwaysInline;
-import com.oracle.svm.core.annotate.Uninterruptible;
+import com.oracle.svm.core.Uninterruptible;
 import com.oracle.svm.core.genscavenge.GCImpl.ChunkReleaser;
-import com.oracle.svm.core.heap.ObjectVisitor;
-import com.oracle.svm.core.log.Log;
+import com.oracle.svm.core.genscavenge.remset.RememberedSet;
+import com.oracle.svm.core.thread.VMOperation;
+import com.oracle.svm.core.util.VMError;
 
-/**
- * An OldGeneration has two Spaces, {@link #fromSpace} for existing objects, and {@link #toSpace}
- * for newly-allocated or promoted objects.
- */
-public final class OldGeneration extends Generation {
-    /* This Spaces are final and are flipped by transferring chunks from one to the other. */
-    private final Space fromSpace;
-    private final Space toSpace;
-
-    private final GreyObjectsWalker toGreyObjectsWalker = new GreyObjectsWalker();
-
-    @Platforms(Platform.HOSTED_ONLY.class)
+public abstract class OldGeneration extends Generation {
     OldGeneration(String name) {
         super(name);
-        int age = HeapPolicy.getMaxSurvivorSpaces() + 1;
-        this.fromSpace = new Space("oldFromSpace", true, age);
-        this.toSpace = new Space("oldToSpace", false, age);
     }
 
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    void tearDown() {
-        fromSpace.tearDown();
-        toSpace.tearDown();
-    }
+    abstract void beginPromotion(boolean incrementalGc);
 
-    @Override
-    public boolean walkObjects(ObjectVisitor visitor) {
-        return getFromSpace().walkObjects(visitor) && getToSpace().walkObjects(visitor);
-    }
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    abstract void blackenDirtyCardRoots(GreyToBlackObjectVisitor visitor);
 
-    /** Promote an Object to ToSpace if it is not already in ToSpace. */
-    @AlwaysInline("GC performance")
-    @Override
-    public Object promoteObject(Object original, UnsignedWord header) {
-        if (ObjectHeaderImpl.isAlignedHeader(header)) {
-            AlignedHeapChunk.AlignedHeader chunk = AlignedHeapChunk.getEnclosingChunk(original);
-            Space originalSpace = HeapChunk.getSpace(chunk);
-            if (originalSpace.isFromSpace()) {
-                return promoteAlignedObject(original, originalSpace);
-            }
-        } else {
-            assert ObjectHeaderImpl.isUnalignedHeader(header);
-            UnalignedHeapChunk.UnalignedHeader chunk = UnalignedHeapChunk.getEnclosingChunk(original);
-            Space originalSpace = HeapChunk.getSpace(chunk);
-            if (originalSpace.isFromSpace()) {
-                promoteUnalignedChunk(chunk, originalSpace);
-            }
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    abstract boolean scanGreyObjects(boolean incrementalGc);
+
+    abstract void sweepAndCompact(Timers timers, ChunkReleaser chunkReleaser);
+
+    abstract void releaseSpaces(ChunkReleaser chunkReleaser);
+
+    abstract void swapSpaces();
+
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    abstract UnsignedWord getChunkBytes();
+
+    abstract UnsignedWord computeObjectBytes();
+
+    abstract boolean isInSpace(Pointer ptr);
+
+    abstract void appendChunk(AlignedHeapChunk.AlignedHeader hdr);
+
+    abstract boolean verifyRememberedSets();
+
+    abstract boolean verifySpaces();
+
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    abstract void tearDown();
+
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    AlignedHeapChunk.AlignedHeader requestAlignedChunk() {
+        assert VMOperation.isGCInProgress() : "Should only be called from the collector.";
+        AlignedHeapChunk.AlignedHeader chunk = HeapImpl.getChunkProvider().produceAlignedChunk();
+        if (probability(EXTREMELY_SLOW_PATH_PROBABILITY, chunk.isNull())) {
+            throw VMError.shouldNotReachHere("OldGeneration.requestAlignedChunk: failure to allocate aligned chunk");
         }
-        return original;
-    }
-
-    @AlwaysInline("GC performance")
-    public Object promoteAlignedObject(Object original, Space originalSpace) {
-        return getToSpace().promoteAlignedObject(original, originalSpace);
-    }
-
-    @AlwaysInline("GC performance")
-    public void promoteUnalignedChunk(UnalignedHeapChunk.UnalignedHeader chunk, Space originalSpace) {
-        getToSpace().promoteUnalignedHeapChunk(chunk, originalSpace);
-    }
-
-    public void promoteObjectChunk(Object obj) {
-        getToSpace().promoteObjectChunk(obj);
-    }
-
-    void releaseSpaces(ChunkReleaser chunkReleaser) {
-        getFromSpace().releaseChunks(chunkReleaser);
-    }
-
-    void prepareForPromotion() {
-        toGreyObjectsWalker.setScanStart(getToSpace());
-    }
-
-    boolean scanGreyObjects() {
-        if (!toGreyObjectsWalker.haveGreyObjects()) {
-            return false;
-        }
-        toGreyObjectsWalker.walkGreyObjects();
-        return true;
-    }
-
-    @Override
-    public Log report(Log log, boolean traceHeapChunks) {
-        log.string("[Old generation: ").indent(true);
-        getFromSpace().report(log, traceHeapChunks).newline();
-        getToSpace().report(log, traceHeapChunks).newline();
-        log.redent(false).string("]");
-        return log;
-    }
-
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    Space getFromSpace() {
-        return fromSpace;
-    }
-
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    Space getToSpace() {
-        return toSpace;
-    }
-
-    void swapSpaces() {
-        assert getFromSpace().isEmpty() : "fromSpace should be empty.";
-        getFromSpace().absorb(getToSpace());
-    }
-
-    /* Extract all the HeapChunks from FromSpace and append them to ToSpace. */
-    void emptyFromSpaceIntoToSpace() {
-        getToSpace().absorb(getFromSpace());
-    }
-
-    boolean walkHeapChunks(MemoryWalker.Visitor visitor) {
-        return getFromSpace().walkHeapChunks(visitor) && getToSpace().walkHeapChunks(visitor);
-    }
-
-    /**
-     * This value is only updated during a GC. Be careful when calling this method during a GC as it
-     * might wrongly include chunks that will be freed at the end of the GC.
-     */
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    UnsignedWord getChunkBytes() {
-        UnsignedWord fromBytes = getFromSpace().getChunkBytes();
-        UnsignedWord toBytes = getToSpace().getChunkBytes();
-        return fromBytes.add(toBytes);
+        RememberedSet.get().enableRememberedSetForChunk(chunk);
+        return chunk;
     }
 }

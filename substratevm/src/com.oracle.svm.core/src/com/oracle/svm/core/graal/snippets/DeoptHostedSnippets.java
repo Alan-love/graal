@@ -29,32 +29,30 @@ import static com.oracle.svm.core.util.VMError.shouldNotReachHere;
 
 import java.util.Map;
 
-import org.graalvm.compiler.api.replacements.Snippet;
-import org.graalvm.compiler.api.replacements.Snippet.ConstantParameter;
-import org.graalvm.compiler.api.replacements.SnippetReflectionProvider;
-import org.graalvm.compiler.debug.DebugHandlersFactory;
-import org.graalvm.compiler.graph.Node;
-import org.graalvm.compiler.nodes.DeoptimizeNode;
-import org.graalvm.compiler.nodes.StructuredGraph;
-import org.graalvm.compiler.nodes.spi.LoweringTool;
-import org.graalvm.compiler.nodes.spi.LoweringTool.LoweringStage;
-import org.graalvm.compiler.options.OptionValues;
-import org.graalvm.compiler.phases.util.Providers;
-import org.graalvm.compiler.replacements.SnippetTemplate;
-import org.graalvm.compiler.replacements.SnippetTemplate.Arguments;
-import org.graalvm.compiler.replacements.SnippetTemplate.SnippetInfo;
-import org.graalvm.compiler.replacements.Snippets;
 import org.graalvm.nativeimage.ImageSingletons;
 
 import com.oracle.svm.core.deopt.DeoptimizationRuntime;
 import com.oracle.svm.core.deopt.DeoptimizationSupport;
 import com.oracle.svm.core.deopt.Deoptimizer;
-import com.oracle.svm.core.graal.nodes.UnreachableNode;
 import com.oracle.svm.core.heap.RestrictHeapAccessCallees;
 import com.oracle.svm.core.snippets.ImplicitExceptions;
 import com.oracle.svm.core.snippets.SnippetRuntime;
 import com.oracle.svm.core.util.VMError;
 
+import jdk.graal.compiler.api.replacements.Snippet;
+import jdk.graal.compiler.api.replacements.Snippet.ConstantParameter;
+import jdk.graal.compiler.graph.Node;
+import jdk.graal.compiler.nodes.DeoptimizeNode;
+import jdk.graal.compiler.nodes.StructuredGraph;
+import jdk.graal.compiler.nodes.UnreachableNode;
+import jdk.graal.compiler.nodes.spi.LoweringTool;
+import jdk.graal.compiler.nodes.spi.LoweringTool.LoweringStage;
+import jdk.graal.compiler.options.OptionValues;
+import jdk.graal.compiler.phases.util.Providers;
+import jdk.graal.compiler.replacements.SnippetTemplate;
+import jdk.graal.compiler.replacements.SnippetTemplate.Arguments;
+import jdk.graal.compiler.replacements.SnippetTemplate.SnippetInfo;
+import jdk.graal.compiler.replacements.Snippets;
 import jdk.vm.ci.meta.DeoptimizationAction;
 import jdk.vm.ci.meta.DeoptimizationReason;
 import jdk.vm.ci.meta.ResolvedJavaMethod;
@@ -62,7 +60,7 @@ import jdk.vm.ci.meta.SpeculationLog;
 
 public final class DeoptHostedSnippets extends SubstrateTemplates implements Snippets {
 
-    @Snippet
+    @Snippet(allowMissingProbabilities = true)
     protected static void deoptSnippet(@ConstantParameter DeoptimizationReason reason, @ConstantParameter Boolean mustNotAllocate, String message) {
         /*
          * The snippet cannot (yet) simplify a switch of an Enum, so we use an if-cascade here.
@@ -78,7 +76,7 @@ public final class DeoptHostedSnippets extends SubstrateTemplates implements Sni
             if (mustNotAllocate) {
                 runtimeCall(ImplicitExceptions.THROW_CACHED_OUT_OF_BOUNDS_EXCEPTION);
             } else {
-                runtimeCall(ImplicitExceptions.THROW_NEW_OUT_OF_BOUNDS_EXCEPTION);
+                runtimeCall(ImplicitExceptions.THROW_NEW_INTRINSIC_OUT_OF_BOUNDS_EXCEPTION);
             }
         } else if (reason == DeoptimizationReason.ClassCastException) {
             if (mustNotAllocate) {
@@ -120,14 +118,16 @@ public final class DeoptHostedSnippets extends SubstrateTemplates implements Sni
     }
 
     @SuppressWarnings("unused")
-    public static void registerLowerings(OptionValues options, Iterable<DebugHandlersFactory> factories, Providers providers, SnippetReflectionProvider snippetReflection,
-                    Map<Class<? extends Node>, NodeLoweringProvider<?>> lowerings) {
-        new DeoptHostedSnippets(options, factories, providers, snippetReflection, lowerings);
+    public static void registerLowerings(OptionValues options, Providers providers, Map<Class<? extends Node>, NodeLoweringProvider<?>> lowerings) {
+        new DeoptHostedSnippets(options, providers, lowerings);
     }
 
-    private DeoptHostedSnippets(OptionValues options, Iterable<DebugHandlersFactory> factories, Providers providers, SnippetReflectionProvider snippetReflection,
-                    Map<Class<? extends Node>, NodeLoweringProvider<?>> lowerings) {
-        super(options, factories, providers, snippetReflection);
+    private final SnippetInfo deopt;
+
+    private DeoptHostedSnippets(OptionValues options, Providers providers, Map<Class<? extends Node>, NodeLoweringProvider<?>> lowerings) {
+        super(options, providers);
+
+        this.deopt = snippet(providers, DeoptHostedSnippets.class, "deoptSnippet");
 
         lowerings.put(DeoptimizeNode.class, new DeoptimizeLowering());
     }
@@ -155,9 +155,6 @@ public final class DeoptHostedSnippets extends SubstrateTemplates implements Sni
     }
 
     protected class DeoptimizeLowering implements NodeLoweringProvider<DeoptimizeNode> {
-
-        private final SnippetInfo deopt = snippet(DeoptHostedSnippets.class, "deoptSnippet");
-
         @Override
         public void lower(DeoptimizeNode node, LoweringTool tool) {
             LoweringStage loweringStage = tool.getLoweringStage();
@@ -216,10 +213,10 @@ public final class DeoptHostedSnippets extends SubstrateTemplates implements Sni
 
             StructuredGraph graph = node.graph();
             Arguments args = new Arguments(deopt, graph.getGuardsStage(), loweringStage);
-            args.addConst("reason", node.getReason());
-            args.addConst("mustNotAllocate", mustNotAllocate(graph.method()));
+            args.add("reason", node.getReason());
+            args.add("mustNotAllocate", mustNotAllocate(graph.method()));
             args.add("message", message);
-            template(node, args).instantiate(providers.getMetaAccess(), node, SnippetTemplate.DEFAULT_REPLACER, args);
+            template(tool, node, args).instantiate(tool.getMetaAccess(), node, SnippetTemplate.DEFAULT_REPLACER, args);
         }
     }
 }

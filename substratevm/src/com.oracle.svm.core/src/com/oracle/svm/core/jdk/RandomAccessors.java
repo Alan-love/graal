@@ -27,6 +27,8 @@ package com.oracle.svm.core.jdk;
 
 import java.util.concurrent.atomic.AtomicLong;
 
+import com.oracle.svm.core.util.TimeUtils;
+
 /**
  * RandomAccessors initializes a seeder at run time, on first access. The mechanism is used by both
  * SplittableRandomAccessors and ThreadLocalRandomAccessors since they share the same seeder
@@ -39,6 +41,7 @@ public abstract class RandomAccessors {
      * the SecureRandom code is only reachable and included in the image when requested by the
      * application.
      */
+    @SuppressWarnings("deprecation") // deprecated starting JDK 17 at least with ECJ
     private static final boolean SECURE_SEED = java.security.AccessController.doPrivileged(
                     new java.security.PrivilegedAction<Boolean>() {
                         @Override
@@ -57,14 +60,6 @@ public abstract class RandomAccessors {
         return result;
     }
 
-    // Checkstyle: allow synchronization
-    /**
-     * It is important that this synchronization is on an instance method and not on a static
-     * method. A static synchronized method will lock the java.lang.Class object and SVM currently
-     * uses a secondary storage map for locking on classes. Syncronizing on a class object can lead
-     * to recursive locking problems when this particular code is called from the constructor of
-     * JavaVMOperation.
-     */
     private synchronized AtomicLong initialize() {
         AtomicLong result = seeder;
         if (result != null) {
@@ -83,7 +78,7 @@ public abstract class RandomAccessors {
                 seed = (seed << 8) | (seedBytes[i] & 0xffL);
             }
         } else {
-            seed = mix64(System.currentTimeMillis()) ^ mix64(System.nanoTime());
+            seed = mix64(TimeUtils.currentTimeMillis()) ^ mix64(System.nanoTime());
         }
 
         result = new AtomicLong(seed);
@@ -91,7 +86,6 @@ public abstract class RandomAccessors {
         return result;
 
     }
-    // Checkstyle: disallow synchronization
 
     abstract long mix64(long l);
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2017, 2021, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -28,6 +28,7 @@ import java.io.PrintWriter;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashSet;
@@ -35,9 +36,6 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Objects;
 import java.util.regex.Pattern;
-
-import com.oracle.truffle.tools.utils.json.JSONArray;
-import com.oracle.truffle.tools.utils.json.JSONObject;
 
 import com.oracle.truffle.api.InstrumentInfo;
 import com.oracle.truffle.api.debug.DebugException;
@@ -63,8 +61,12 @@ import com.oracle.truffle.tools.chromeinspector.types.InternalPropertyDescriptor
 import com.oracle.truffle.tools.chromeinspector.types.Location;
 import com.oracle.truffle.tools.chromeinspector.types.PropertyDescriptor;
 import com.oracle.truffle.tools.chromeinspector.types.RemoteObject;
+import com.oracle.truffle.tools.chromeinspector.types.RemoteObject.TypeMark;
+import com.oracle.truffle.tools.chromeinspector.types.TypeInfo;
 
 import org.graalvm.collections.Pair;
+import org.graalvm.shadowed.org.json.JSONArray;
+import org.graalvm.shadowed.org.json.JSONObject;
 
 public final class InspectorRuntime extends RuntimeDomain {
 
@@ -113,6 +115,7 @@ public final class InspectorRuntime extends RuntimeDomain {
     private InspectorExecutionContext.Listener contextListener;
     private ScriptsHandler slh;
     private Enabler enabler;
+    private List<ConsoleOutputListener> outputListeners;
 
     public InspectorRuntime(InspectorExecutionContext context) {
         this.context = context;
@@ -128,8 +131,20 @@ public final class InspectorRuntime extends RuntimeDomain {
         enabler = context.getEnv().lookup(instrumentInfo, Enabler.class);
         enabler.enable();
         OutputHandler oh = context.getEnv().lookup(instrumentInfo, OutputHandler.Provider.class).getOutputHandler();
-        oh.setOutListener(new ConsoleOutputListener("log"));
-        oh.setErrListener(new ConsoleOutputListener("error"));
+        ConsoleOutputListener outL = new ConsoleOutputListener("log");
+        ConsoleOutputListener errL = new ConsoleOutputListener("error");
+        oh.setOutListener(outL);
+        oh.setErrListener(errL);
+        outputListeners = Arrays.asList(new ConsoleOutputListener[]{outL, errL});
+    }
+
+    @Override
+    public void notifyClosing() {
+        if (outputListeners != null) {
+            for (ConsoleOutputListener listener : outputListeners) {
+                listener.flush();
+            }
+        }
     }
 
     @Override
@@ -198,7 +213,7 @@ public final class InspectorRuntime extends RuntimeDomain {
 
                     @Override
                     public Boolean processException(DebugException ex) {
-                        fillExceptionDetails(ret, ex, false);
+                        fillExceptionDetails(ret, ex);
                         return false;
                     }
                 });
@@ -211,13 +226,11 @@ public final class InspectorRuntime extends RuntimeDomain {
             exceptionText[0] = "<Not suspended>";
         }
         if (parsed && persistScript) {
-            int id = slh.assureLoaded(source);
-            if (id != -1) {
-                ret.put("scriptId", Integer.toString(id));
-            }
+            int id = slh.assureLoaded(source).getId();
+            ret.put("scriptId", Integer.toString(id));
         }
         if (exceptionText[0] != null) {
-            fillExceptionDetails(ret, exceptionText[0], false);
+            fillExceptionDetails(ret, exceptionText[0]);
         }
         return new Params(ret);
     }
@@ -238,7 +251,7 @@ public final class InspectorRuntime extends RuntimeDomain {
                         suspendedInfo.lastEvaluatedValue.set(null);
                         LanguageInfo languageInfo = context.getSuspendedInfo().getSuspendedEvent().getTopStackFrame().getLanguage();
                         if (languageInfo == null || !languageInfo.isInteractive()) {
-                            fillExceptionDetails(json, InspectorDebugger.getEvalNonInteractiveMessage(), generatePreview);
+                            fillExceptionDetails(json, InspectorDebugger.getEvalNonInteractiveMessage());
                             return null;
                         }
                         JSONObject result;
@@ -266,15 +279,15 @@ public final class InspectorRuntime extends RuntimeDomain {
 
                     @Override
                     public Void processException(DebugException ex) {
-                        fillExceptionDetails(json, ex, generatePreview);
+                        fillExceptionDetails(json, ex);
                         return null;
                     }
                 });
             } catch (NoSuspendedThreadException ex) {
-                fillExceptionDetails(json, ex.getLocalizedMessage(), generatePreview);
+                fillExceptionDetails(json, ex.getLocalizedMessage());
             }
         } else {
-            fillExceptionDetails(json, "<Not suspended>", generatePreview);
+            fillExceptionDetails(json, "<Not suspended>");
         }
         return new Params(json);
     }
@@ -295,7 +308,25 @@ public final class InspectorRuntime extends RuntimeDomain {
                     context.executeInSuspendThread(new SuspendThreadExecutable<Void>() {
                         @Override
                         public Void executeCommand() throws CommandProcessException {
-                            Collection<DebugValue> properties = value.getProperties();
+                            TypeMark typeMark = object.getTypeMark();
+                            if (typeMark != null) {
+                                switch (typeMark) {
+                                    case MAP_ENTRIES:
+                                        putMapEntries(json, value, indexRange, generatePreview, objectGroup);
+                                        break;
+                                    case MAP_ENTRY:
+                                        putMapEntry(json, value, generatePreview, objectGroup);
+                                        break;
+                                    default:
+                                        throw new CommandProcessException("Unknown type mark " + typeMark);
+                                }
+                                return null;
+                            }
+
+                            Collection<DebugValue> properties = null;
+                            if (!value.hasHashEntries()) {
+                                properties = value.getProperties();
+                            }
                             if (properties == null) {
                                 properties = Collections.emptyList();
                             } else if (indexRange != null && indexRange.isNamed()) {
@@ -317,7 +348,7 @@ public final class InspectorRuntime extends RuntimeDomain {
 
                         @Override
                         public Void processException(DebugException ex) {
-                            fillExceptionDetails(json, ex, generatePreview);
+                            fillExceptionDetails(json, ex);
                             return null;
                         }
                     });
@@ -340,7 +371,7 @@ public final class InspectorRuntime extends RuntimeDomain {
 
                         @Override
                         public Void processException(DebugException ex) {
-                            fillExceptionDetails(json, ex, generatePreview);
+                            fillExceptionDetails(json, ex);
                             return null;
                         }
                     });
@@ -351,6 +382,46 @@ public final class InspectorRuntime extends RuntimeDomain {
             }
         }
         return new Params(json);
+    }
+
+    private void putMapEntries(JSONObject json, DebugValue value, RemoteObject.IndexRange indexRange, boolean generatePreview, String objectGroup) {
+        int start = 0;
+        int end = Integer.MAX_VALUE;
+        if (indexRange != null && !indexRange.isNamed()) {
+            start = indexRange.start();
+            end = indexRange.end();
+        }
+        JSONArray result = new JSONArray();
+        for (int index = 0; value.hasIteratorNextElement() && index < end; index++) {
+            DebugValue next = value.getIteratorNextElement();
+            if (index < start) {
+                continue;
+            }
+            String name = Integer.toString(index);
+            JSONObject jsonEntry = createPropertyJSON(next, name, generatePreview, objectGroup, TypeMark.MAP_ENTRY);
+            result.put(jsonEntry);
+        }
+        json.put("result", result);
+    }
+
+    private void putMapEntry(JSONObject json, DebugValue entry, boolean generatePreview, String objectGroup) {
+        List<DebugValue> entryArray = entry.getArray();
+        DebugValue key = entryArray.get(0);
+        DebugValue value = entryArray.get(1);
+        JSONArray result = new JSONArray();
+        result.put(createMapEntryElement("key", key, generatePreview, objectGroup));
+        result.put(createMapEntryElement("value", value, generatePreview, objectGroup));
+        json.put("result", result);
+    }
+
+    private JSONObject createMapEntryElement(String name, DebugValue v, boolean generatePreview, String objectGroup) {
+        RemoteObject rv = new RemoteObject(v, false, generatePreview, context, (TypeMark) null);
+        context.getRemoteObjectsHandler().register(rv, objectGroup);
+        JSONObject json = new JSONObject();
+        json.put("name", name);
+        json.put("value", rv.toJSON());
+        json.put("writable", v.isWritable());
+        return json;
     }
 
     private void putResultProperties(JSONObject json, DebugValue value, Collection<DebugValue> properties, Collection<DebugValue> arrayElements, boolean generatePreview, String objectGroup) {
@@ -412,8 +483,13 @@ public final class InspectorRuntime extends RuntimeDomain {
                 // Add __proto__ when in JavaScript:
                 DebugValue prototype = value.getProperty("__proto__");
                 if (prototype != null && !prototype.isNull()) {
-                    result.put(createPropertyJSON(prototype, null, generatePreview, true, false, objectGroup));
+                    result.put(createPropertyJSON(prototype, null, generatePreview, true, false, objectGroup, false, null));
                 }
+            }
+            if (value != null && value.hasHashEntries()) {
+                DebugValue entries = value.getHashEntriesIterator();
+                JSONObject map2 = createPropertyJSON(entries, "[[Entries]]", false, false, true, objectGroup, true, TypeMark.MAP_ENTRIES);
+                internals.put(map2);
             }
         } catch (DebugException ex) {
             // From property iterators, etc.
@@ -450,7 +526,7 @@ public final class InspectorRuntime extends RuntimeDomain {
         json.put("result", result);
         json.put("internalProperties", internals);
         if (exception != null) {
-            fillExceptionDetails(json, exception, generatePreview);
+            fillExceptionDetails(json, exception);
             if (exception.isInternalError()) {
                 PrintWriter err = context.getErr();
                 if (err != null) {
@@ -483,7 +559,7 @@ public final class InspectorRuntime extends RuntimeDomain {
                         public Void executeCommand() throws CommandProcessException {
                             JSONObject result;
                             if (functionNoWS.startsWith(FUNCTION_COMPLETION)) {
-                                result = createCodecompletion(value, scope, generatePreview, context, true);
+                                result = createCodecompletion(value, scope, context, true);
                             } else if (functionNoWS.equals(FUNCTION_SET_PROPERTY)) {
                                 // Set of an array element, or object property
                                 if (arguments == null || arguments.length() < 2) {
@@ -491,7 +567,7 @@ public final class InspectorRuntime extends RuntimeDomain {
                                 }
                                 Object property = ((JSONObject) arguments.get(0)).get("value");
                                 CallArgument newValue = CallArgument.get((JSONObject) arguments.get(1));
-                                setPropertyValue(value, scope, property, newValue, suspendedInfo.lastEvaluatedValue.getAndSet(null));
+                                setPropertyValue(value, scope, property, object.getTypeMark(), newValue, suspendedInfo.lastEvaluatedValue.getAndSet(null));
                                 result = new JSONObject();
                             } else if (functionNoWS.equals(FUNCTION_GET_ARRAY_NUM_PROPS)) {
                                 if (!value.isArray()) {
@@ -674,7 +750,7 @@ public final class InspectorRuntime extends RuntimeDomain {
 
                         @Override
                         public Void processException(DebugException ex) {
-                            fillExceptionDetails(json, ex, generatePreview);
+                            fillExceptionDetails(json, ex);
                             return null;
                         }
 
@@ -713,7 +789,8 @@ public final class InspectorRuntime extends RuntimeDomain {
         context.getRemoteObjectsHandler().releaseObjectGroup(objectGroup);
     }
 
-    private void setPropertyValue(DebugValue object, DebugScope scope, Object property, CallArgument newValue, Pair<DebugValue, Object> evaluatedValue) throws CommandProcessException {
+    private void setPropertyValue(DebugValue object, DebugScope scope, Object property, RemoteObject.TypeMark typeMark, CallArgument newValue, Pair<DebugValue, Object> evaluatedValue)
+                    throws CommandProcessException {
         DebugValue propValue;
         Number index = null;
         if (object != null && object.isArray()) {
@@ -736,7 +813,25 @@ public final class InspectorRuntime extends RuntimeDomain {
             propValue = array.get(i);
         } else {
             if (object != null) {
-                propValue = object.getProperty(property.toString());
+                if (typeMark != null) {
+                    int entryIndex;
+                    switch (typeMark) {
+                        case MAP_ENTRY:
+                            if ("key".equals(property)) {
+                                entryIndex = 0;
+                            } else if ("value".equals(property)) {
+                                entryIndex = 1;
+                            } else {
+                                throw new CommandProcessException("Unknown entry: " + property);
+                            }
+                            break;
+                        default:
+                            throw new CommandProcessException("Unsupported type: " + typeMark);
+                    }
+                    propValue = object.getArray().get(entryIndex);
+                } else {
+                    propValue = object.getProperty(property.toString());
+                }
             } else {
                 propValue = scope.getDeclaredValue(property.toString());
             }
@@ -751,7 +846,7 @@ public final class InspectorRuntime extends RuntimeDomain {
         }
     }
 
-    static JSONObject createCodecompletion(DebugValue value, DebugScope scope, boolean generatePreview, InspectorExecutionContext context, boolean resultItems) {
+    static JSONObject createCodecompletion(DebugValue value, DebugScope scope, InspectorExecutionContext context, boolean resultItems) {
         JSONObject result = new JSONObject();
         Iterable<DebugValue> properties = null;
         try {
@@ -761,7 +856,7 @@ public final class InspectorRuntime extends RuntimeDomain {
                 properties = scope.getDeclaredValues();
             }
         } catch (DebugException ex) {
-            fillExceptionDetails(result, ex, context, generatePreview);
+            fillExceptionDetails(result, ex, context);
             if (ex.isInternalError()) {
                 PrintWriter err = context.getErr();
                 if (err != null) {
@@ -789,18 +884,18 @@ public final class InspectorRuntime extends RuntimeDomain {
         return result;
     }
 
-    private void fillExceptionDetails(JSONObject obj, DebugException ex, boolean generatePreview) {
-        fillExceptionDetails(obj, ex, context, generatePreview);
+    private void fillExceptionDetails(JSONObject obj, DebugException ex) {
+        fillExceptionDetails(obj, ex, context);
     }
 
-    static void fillExceptionDetails(JSONObject obj, DebugException ex, InspectorExecutionContext context, boolean generatePreview) {
+    static void fillExceptionDetails(JSONObject obj, DebugException ex, InspectorExecutionContext context) {
         ExceptionDetails exceptionDetails = new ExceptionDetails(ex);
-        obj.put("exceptionDetails", exceptionDetails.createJSON(context, generatePreview));
+        obj.put("exceptionDetails", exceptionDetails.createJSON(context));
     }
 
-    private void fillExceptionDetails(JSONObject obj, String errorMessage, boolean generatePreview) {
+    private void fillExceptionDetails(JSONObject obj, String errorMessage) {
         ExceptionDetails exceptionDetails = new ExceptionDetails(errorMessage);
-        obj.put("exceptionDetails", exceptionDetails.createJSON(context, generatePreview));
+        obj.put("exceptionDetails", exceptionDetails.createJSON(context));
     }
 
     @Override
@@ -823,18 +918,23 @@ public final class InspectorRuntime extends RuntimeDomain {
     }
 
     private JSONObject createPropertyJSON(DebugValue v, String defaultName, boolean generatePreview, String objectGroup) {
-        return createPropertyJSON(v, defaultName, generatePreview, false, true, objectGroup);
+        return createPropertyJSON(v, defaultName, generatePreview, false, true, objectGroup, false, null);
     }
 
-    private JSONObject createPropertyJSON(DebugValue v, String defaultName, boolean generatePreview, boolean readEagerly, boolean enumerable, String objectGroup) {
+    private JSONObject createPropertyJSON(DebugValue v, String defaultName, boolean generatePreview, String objectGroup, TypeMark typeMark) {
+        return createPropertyJSON(v, defaultName, generatePreview, false, true, objectGroup, false, typeMark);
+    }
+
+    private JSONObject createPropertyJSON(DebugValue v, String defaultName, boolean generatePreview, boolean readEagerly, boolean enumerable, String objectGroup, boolean forceInternal,
+                    TypeMark typeMark) {
         PropertyDescriptor pd;
-        RemoteObject rv = new RemoteObject(v, readEagerly, generatePreview, context);
+        RemoteObject rv = new RemoteObject(v, readEagerly, generatePreview, context, typeMark);
         context.getRemoteObjectsHandler().register(rv, objectGroup);
         String name = v.getName();
         if (name == null && defaultName != null) {
             name = defaultName;
         }
-        if (!v.isInternal()) {
+        if (!(forceInternal || v.isInternal())) {
             RemoteObject getter;
             RemoteObject setter;
             if (readEagerly) {
@@ -855,21 +955,21 @@ public final class InspectorRuntime extends RuntimeDomain {
         if (!v.hasReadSideEffects()) {
             return null;
         }
-        return RemoteObject.createSimpleObject("function", "Function", "");
+        return RemoteObject.createSimpleObject(TypeInfo.TYPE.FUNCTION, "Function", "");
     }
 
     private static RemoteObject findSetter(DebugValue v) {
         if (!v.hasWriteSideEffects()) {
             return null;
         }
-        return RemoteObject.createSimpleObject("function", "Function", "");
+        return RemoteObject.createSimpleObject(TypeInfo.TYPE.FUNCTION, "Function", "");
     }
 
     private static String eliminateWhiteSpaces(String str) {
         return WHITESPACES_PATTERN.matcher(str).replaceAll("");
     }
 
-    private class ContextListener implements InspectorExecutionContext.Listener {
+    private final class ContextListener implements InspectorExecutionContext.Listener {
 
         @Override
         public void contextCreated(long id, String name) {
@@ -912,5 +1012,12 @@ public final class InspectorRuntime extends RuntimeDomain {
             } while (output.length() > 0);
         }
 
+        void flush() {
+            String text = output.toString();
+            if (!text.isEmpty()) {
+                output.delete(0, text.length());
+                notifyConsoleAPICalled(type, text);
+            }
+        }
     }
 }

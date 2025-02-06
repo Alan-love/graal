@@ -20,8 +20,10 @@
  * or visit www.oracle.com if you need additional information or have any
  * questions.
  */
+#include "nespresso.h"
+
+#include <mokapot.h>
 #include <jni.h>
-#include <trufflenfi.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>
@@ -44,145 +46,6 @@ extern void *truffle_release_handle(void *handle);
 
 #define EXPAND(...) __VA_ARGS__
 #define EXPAND2(...) EXPAND(EXPAND(__VA_ARGS__))
-
-#define JNI_FUNCTION_LIST(V) \
-V(GetVersion) \
-V(DefineClass) \
-V(FindClass) \
-V(FromReflectedMethod) \
-V(FromReflectedField) \
-V(ToReflectedMethod) \
-V(GetSuperclass) \
-V(IsAssignableFrom) \
-V(ToReflectedField) \
-V(Throw) \
-V(ThrowNew) \
-V(ExceptionOccurred) \
-V(ExceptionDescribe) \
-V(ExceptionClear) \
-V(FatalError) \
-V(PushLocalFrame) \
-V(PopLocalFrame) \
-V(DeleteLocalRef) \
-V(NewLocalRef) \
-V(EnsureLocalCapacity) \
-V(AllocObject) \
-V(GetObjectClass) \
-V(IsInstanceOf) \
-V(GetMethodID) \
-V(GetFieldID) \
-V(GetObjectField) \
-V(GetBooleanField) \
-V(GetByteField) \
-V(GetCharField) \
-V(GetShortField) \
-V(GetIntField) \
-V(GetLongField) \
-V(GetFloatField) \
-V(GetDoubleField) \
-V(SetObjectField) \
-V(SetBooleanField) \
-V(SetByteField) \
-V(SetCharField) \
-V(SetShortField) \
-V(SetIntField) \
-V(SetLongField) \
-V(SetFloatField) \
-V(SetDoubleField) \
-V(GetStaticMethodID) \
-V(GetStaticFieldID) \
-V(GetStaticObjectField) \
-V(GetStaticBooleanField) \
-V(GetStaticByteField) \
-V(GetStaticCharField) \
-V(GetStaticShortField) \
-V(GetStaticIntField) \
-V(GetStaticLongField) \
-V(GetStaticFloatField) \
-V(GetStaticDoubleField) \
-V(SetStaticObjectField) \
-V(SetStaticBooleanField) \
-V(SetStaticByteField) \
-V(SetStaticCharField) \
-V(SetStaticShortField) \
-V(SetStaticIntField) \
-V(SetStaticLongField) \
-V(SetStaticFloatField) \
-V(SetStaticDoubleField) \
-V(NewString) \
-V(GetStringLength) \
-V(GetStringChars) \
-V(ReleaseStringChars) \
-V(NewStringUTF) \
-V(GetStringUTFLength) \
-V(GetStringUTFChars) \
-V(ReleaseStringUTFChars) \
-V(GetArrayLength) \
-V(NewObjectArray) \
-V(GetObjectArrayElement) \
-V(SetObjectArrayElement) \
-V(NewBooleanArray) \
-V(NewByteArray) \
-V(NewCharArray) \
-V(NewShortArray) \
-V(NewIntArray) \
-V(NewLongArray) \
-V(NewFloatArray) \
-V(NewDoubleArray) \
-V(GetBooleanArrayElements) \
-V(GetByteArrayElements) \
-V(GetCharArrayElements) \
-V(GetShortArrayElements) \
-V(GetIntArrayElements) \
-V(GetLongArrayElements) \
-V(GetFloatArrayElements) \
-V(GetDoubleArrayElements) \
-V(ReleaseBooleanArrayElements) \
-V(ReleaseByteArrayElements) \
-V(ReleaseCharArrayElements) \
-V(ReleaseShortArrayElements) \
-V(ReleaseIntArrayElements) \
-V(ReleaseLongArrayElements) \
-V(ReleaseFloatArrayElements) \
-V(ReleaseDoubleArrayElements) \
-V(GetBooleanArrayRegion) \
-V(GetByteArrayRegion) \
-V(GetCharArrayRegion) \
-V(GetShortArrayRegion) \
-V(GetIntArrayRegion) \
-V(GetLongArrayRegion) \
-V(GetFloatArrayRegion) \
-V(GetDoubleArrayRegion) \
-V(SetBooleanArrayRegion) \
-V(SetByteArrayRegion) \
-V(SetCharArrayRegion) \
-V(SetShortArrayRegion) \
-V(SetIntArrayRegion) \
-V(SetLongArrayRegion) \
-V(SetFloatArrayRegion) \
-V(SetDoubleArrayRegion) \
-V(UnregisterNatives) \
-V(MonitorEnter) \
-V(MonitorExit) \
-V(GetJavaVM) \
-V(GetStringRegion) \
-V(GetStringUTFRegion) \
-V(GetPrimitiveArrayCritical) \
-V(ReleasePrimitiveArrayCritical) \
-V(GetStringCritical) \
-V(ReleaseStringCritical) \
-V(ExceptionCheck) \
-V(GetDirectBufferAddress) \
-V(GetDirectBufferCapacity) \
-V(GetObjectRefType) \
-V(IsSameObject) \
-V(NewGlobalRef) \
-V(DeleteGlobalRef) \
-V(NewWeakGlobalRef) \
-V(DeleteWeakGlobalRef) \
-V(NewDirectByteBuffer) \
-V(GetModule)
-
 
 #define TYPE_LIST2(V)  \
   V(jobject, Object)   \
@@ -235,10 +98,6 @@ V(GetModule)
 #define VAR(returnType) CONCAT_(VAR_, returnType)
 #define DECL(returnType) CONCAT_(DECL_, returnType)
 
-struct Varargs {
-    const struct VarargsInterface* functions;
-};
-
 struct VarargsInterface {
   jboolean (*pop_boolean)(struct Varargs*);
   jbyte (*pop_byte)(struct Varargs*);
@@ -266,7 +125,7 @@ struct VarargsA {
 
 static jboolean valist_pop_boolean(struct Varargs* varargs) {
     struct VarargsV* v = (struct VarargsV*) varargs;
-    return (jboolean) (va_arg(v->args, jint) == 0 ? JNI_FALSE : JNI_TRUE);
+    return va_arg(v->args, jint) == 0 ? JNI_FALSE : JNI_TRUE;
 }
 
 static jbyte valist_pop_byte(struct Varargs* varargs) {
@@ -286,7 +145,7 @@ static jshort valist_pop_short(struct Varargs* varargs) {
 
 static jint valist_pop_int(struct Varargs* varargs) {
     struct VarargsV* v = (struct VarargsV*) varargs;
-    return (jint) va_arg(v->args, jint);
+    return va_arg(v->args, jint);
 }
 
 static jfloat valist_pop_float(struct Varargs* varargs) {
@@ -296,22 +155,22 @@ static jfloat valist_pop_float(struct Varargs* varargs) {
 
 static jdouble valist_pop_double(struct Varargs* varargs) {
     struct VarargsV* v = (struct VarargsV*) varargs;
-    return (jdouble) va_arg(v->args, jdouble);
+    return va_arg(v->args, jdouble);
 }
 
 static jlong valist_pop_long(struct Varargs* varargs) {
     struct VarargsV* v = (struct VarargsV*) varargs;
-    return (jlong) va_arg(v->args, jlong);
+    return va_arg(v->args, jlong);
 }
 
 static jobject valist_pop_object(struct Varargs* varargs) {
     struct VarargsV* v = (struct VarargsV*) varargs;
-    return (jobject) va_arg(v->args, jobject);
+    return va_arg(v->args, jobject);
 }
 
 static void* valist_pop_word(struct Varargs* varargs) {
     struct VarargsV* v = (struct VarargsV*) varargs;
-    return (void*) va_arg(v->args, void*);
+    return va_arg(v->args, void*);
 }
 
 // jvalue* varargs impl
@@ -551,7 +410,8 @@ TYPE_LIST2(CALL_NON_VIRTUAL_METHOD_BRIDGE)
   V(NewObject) \
   V(NewObjectA) \
   V(NewObjectV) \
-  V(RegisterNatives)
+  V(RegisterNatives) \
+  V(GetJavaVM)
 
 
 jobject NewObjectV(JNIEnv *env, jclass clazz, jmethodID methodID, va_list args) {
@@ -592,18 +452,45 @@ jint RegisterNatives(JNIEnv *env, jclass clazz, const JNINativeMethod *methods, 
   return ret;
 }
 
-static void unset_function_error() {
-  fprintf(stderr, "Call to uninitialized JNI function slot\n");
-  exit(-1);
+jint GetJavaVM(JNIEnv *env, JavaVM **vmPtr) {
+  MokapotEnv* moka_env = NULL;
+  JavaVM* vm = NULL;
+  if (vmPtr == NULL) {
+    return JNI_ERR;
+  }
+  if (env == NULL) {
+    fprintf(stderr, "GetJavaVM: Passed JNIEnv* is NULL" OS_NEWLINE_STR);
+    return JNI_ERR;
+  }
+
+  moka_env = (MokapotEnv*) (*env)->reserved1;
+  if (moka_env == NULL) {
+    fprintf(stderr, "GetJavaVM: Passed JNIEnv* has no MokapotEnv* associated" OS_NEWLINE_STR);
+    return JNI_ERR;
+  }
+
+  vm = (*moka_env)->vm;
+
+  // If there's an isolate-aware JavaVM, find it.
+  if ((*vm)->reserved1 == MOKA_AMERICANO) {
+    vm = (JavaVM*) (*vm)->reserved2;
+    // MOKA_AMERICANO JavaVM can only point to a MOKA_LATTE.
+    if ((*vm)->reserved1 != MOKA_LATTE) {
+      fprintf(stderr, "GetJavaVM: not a MOKA_LATTE" OS_NEWLINE_STR);
+      return JNI_ERR;
+    }
+  } else if ((*vm)->reserved1 != MOKA_RISTRETTO) {
+    fprintf(stderr, "GetJavaVM: not a MOKA_RISTRETTO" OS_NEWLINE_STR);
+    return JNI_ERR;
+  }
+
+  *vmPtr = vm;
+  return JNI_OK;
 }
 
-JNIEXPORT void* JNICALL dupClosureRef(TruffleEnv *truffle_env, void* closure) {
-    if (truffle_env != NULL) {
-        (*truffle_env)->newClosureRef(truffle_env, closure);
-    } else {
-        closure = truffle_deref_handle_for_managed(closure);
-    }
-    return closure;
+static void unset_function_error() {
+  fprintf(stderr, "Call to uninitialized JNI function slot" OS_NEWLINE_STR);
+  exit(-1);
 }
 
 JNIEXPORT JNIEnv* JNICALL initializeNativeContext(void* (*fetch_by_name)(const char *)) {
@@ -611,15 +498,16 @@ JNIEXPORT JNIEnv* JNICALL initializeNativeContext(void* (*fetch_by_name)(const c
   struct JNINativeInterface_* jni_impl = malloc(sizeof(*jni_impl));
   struct NespressoEnv* nespresso_env = (struct NespressoEnv*) malloc(sizeof(*nespresso_env));
 
+  jni_impl->reserved0 = nespresso_env;
+  jni_impl->reserved1 = NULL;
+  jni_impl->reserved2 = NULL;
+  jni_impl->reserved3 = NULL;
   int fnCount = sizeof(*jni_impl) / sizeof(void*);
-  int i;
-  for (i = 0; i < fnCount; ++i) {
+  for (int i = 4; i < fnCount; ++i) {
     ((void**)jni_impl)[i] = &unset_function_error;
   }
 
   *env = jni_impl;
-
-  jni_impl->reserved0 = nespresso_env;
 
   // Fetch Java ... varargs methods.
   #define INIT_VARARGS_METHOD__(fn_name) \
@@ -694,8 +582,4 @@ JNIEXPORT void JNICALL freeMemory(void *ptr) {
 
 JNIEXPORT void * JNICALL reallocateMemory(void *ptr, size_t new_size) {
   return realloc(ptr, new_size);
-}
-
-JNIEXPORT jlong JNICALL get_SIZE_MAX() {
-  return (jlong) SIZE_MAX;
 }

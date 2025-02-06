@@ -24,14 +24,21 @@
  */
 package com.oracle.svm.hosted.jdk;
 
-import org.graalvm.compiler.serviceprovider.JavaVersionUtil;
+import java.io.IOException;
+import java.lang.module.ModuleReader;
+import java.lang.module.ResolvedModule;
+import java.util.Optional;
 
-import com.oracle.svm.core.annotate.AutomaticFeature;
-import com.oracle.svm.core.graal.GraalFeature;
+import org.graalvm.nativeimage.hosted.RuntimeResourceAccess;
+
+import com.oracle.svm.core.feature.AutomaticallyRegisteredFeature;
+import com.oracle.svm.core.feature.InternalFeature;
 import com.oracle.svm.core.jdk.JNIRegistrationUtil;
+import com.oracle.svm.core.util.VMError;
+import com.oracle.svm.util.ReflectionUtil;
 
-@AutomaticFeature
-class JDKRegistrations extends JNIRegistrationUtil implements GraalFeature {
+@AutomaticallyRegisteredFeature
+class JDKRegistrations extends JNIRegistrationUtil implements InternalFeature {
 
     /**
      * Registrations of class re-initialization at run time. This is independent whether the JNI
@@ -39,35 +46,66 @@ class JDKRegistrations extends JNIRegistrationUtil implements GraalFeature {
      */
     @Override
     public void duringSetup(DuringSetupAccess a) {
-        rerunClassInit(a, "java.io.RandomAccessFile", "java.lang.ProcessEnvironment", "java.io.File$TempDirectory", "java.nio.file.TempFileHelper", "java.lang.Terminator");
-        if (JavaVersionUtil.JAVA_SPEC <= 8) {
-            if (isPosix()) {
-                rerunClassInit(a, "java.lang.UNIXProcess");
-            }
-        } else {
-            rerunClassInit(a, "java.lang.ProcessImpl", "java.lang.ProcessHandleImpl", "java.lang.ProcessHandleImpl$Info", "java.io.FilePermission");
-        }
+        initializeAtRunTime(a, "java.io.RandomAccessFile", "java.lang.ProcessEnvironment", "java.io.File$TempDirectory", "java.nio.file.TempFileHelper", "java.lang.Terminator");
+        initializeAtRunTime(a, "java.lang.ProcessImpl", "java.lang.ProcessHandleImpl", "java.lang.ProcessHandleImpl$Info", "java.io.FilePermission");
 
-        if (JavaVersionUtil.JAVA_SPEC >= 15) {
-            /*
-             * Holds system and user library paths derived from the `java.library.path` and
-             * `sun.boot.library.path` system properties.
-             */
-            rerunClassInit(a, "jdk.internal.loader.NativeLibraries$LibraryPaths");
-        }
-        if (JavaVersionUtil.JAVA_SPEC >= 16) {
-            /*
-             * Contains lots of state that is only available at run time: loads a native library,
-             * stores a `Random` object and the temporary directory in a static final field.
-             */
-            rerunClassInit(a, "sun.nio.ch.UnixDomainSockets");
-        }
+        /*
+         * The class initializer queries and caches state (like "is a tty") - some state on JDK 17
+         * and even more after JDK 17.
+         */
+        initializeAtRunTime(a, "java.io.Console");
+
+        /*
+         * Holds system and user library paths derived from the `java.library.path` and
+         * `sun.boot.library.path` system properties.
+         */
+        initializeAtRunTime(a, "jdk.internal.loader.NativeLibraries$LibraryPaths");
+        /*
+         * Contains lots of state that is only available at run time: loads a native library, stores
+         * a `Random` object and the temporary directory in a static final field.
+         */
+        initializeAtRunTime(a, "sun.nio.ch.UnixDomainSockets");
+
+        initializeAtRunTime(a, "java.util.concurrent.ThreadLocalRandom$ThreadLocalRandomProxy");
 
         /*
          * Re-initialize the registered shutdown hooks, because any hooks registered during native
          * image construction must not survive into the running image. Both classes have only static
          * members and do not allow instantiation.
          */
-        rerunClassInit(a, "java.lang.ApplicationShutdownHooks", "java.io.DeleteOnExitHook");
+        initializeAtRunTime(a, "java.lang.ApplicationShutdownHooks", "java.io.DeleteOnExitHook");
+
+        /* Trigger initialization of java.net.URLConnection.fileNameMap. */
+        java.net.URLConnection.getFileNameMap();
+    }
+
+    @Override
+    public void beforeAnalysis(BeforeAnalysisAccess access) {
+        registerInfoCmpResources(access);
+
+    }
+
+    private static void registerInfoCmpResources(BeforeAnalysisAccess access) {
+        /*
+         * A JDK reduced via jlink might not have this class, so we must use a reflective class
+         * lookup.
+         */
+        Class<?> infoCmpClazz = ReflectionUtil.lookupClass(true, "jdk.internal.org.jline.utils.InfoCmp");
+
+        if (infoCmpClazz != null) {
+            access.registerReachabilityHandler((a) -> {
+                Module module = infoCmpClazz.getModule();
+                Optional<ResolvedModule> resolvedModule = ModuleLayer.boot().configuration().findModule(module.getName());
+                VMError.guarantee(resolvedModule.isPresent());
+
+                try (ModuleReader reader = resolvedModule.get().reference().open()) {
+                    reader.list().filter(entry -> entry.endsWith(".caps") || entry.endsWith("capabilities.txt"))
+                                    .forEach(entry -> RuntimeResourceAccess.addResource(module, entry));
+                } catch (IOException e) {
+                    throw VMError.shouldNotReachHere(e);
+                }
+
+            }, infoCmpClazz);
+        }
     }
 }

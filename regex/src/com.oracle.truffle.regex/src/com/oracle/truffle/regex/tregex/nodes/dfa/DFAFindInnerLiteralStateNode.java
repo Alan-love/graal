@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2022, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -43,7 +43,7 @@ package com.oracle.truffle.regex.tregex.nodes.dfa;
 import java.util.Arrays;
 
 import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
-import com.oracle.truffle.regex.tregex.nodes.input.InputIndexOfStringNode;
+import com.oracle.truffle.regex.tregex.nodes.input.InputOps;
 import com.oracle.truffle.regex.tregex.parser.ast.InnerLiteral;
 import com.oracle.truffle.regex.tregex.util.json.Json;
 import com.oracle.truffle.regex.tregex.util.json.JsonValue;
@@ -51,14 +51,11 @@ import com.oracle.truffle.regex.tregex.util.json.JsonValue;
 public final class DFAFindInnerLiteralStateNode extends DFAAbstractStateNode {
 
     private final InnerLiteral innerLiteral;
-    @Child private InputIndexOfStringNode indexOfNode = InputIndexOfStringNode.create();
-    @Child private TRegexDFAExecutorNode prefixMatcher;
 
-    public DFAFindInnerLiteralStateNode(short id, short[] successors, InnerLiteral innerLiteral, TRegexDFAExecutorNode prefixMatcher) {
+    public DFAFindInnerLiteralStateNode(short id, short[] successors, InnerLiteral innerLiteral) {
         super(id, successors);
         assert successors.length == 1;
         this.innerLiteral = innerLiteral;
-        this.prefixMatcher = prefixMatcher;
     }
 
     public InnerLiteral getInnerLiteral() {
@@ -67,20 +64,11 @@ public final class DFAFindInnerLiteralStateNode extends DFAAbstractStateNode {
 
     @Override
     public DFAAbstractStateNode createNodeSplitCopy(short copyID) {
-        return new DFAFindInnerLiteralStateNode(copyID, Arrays.copyOf(getSuccessors(), getSuccessors().length), innerLiteral, prefixMatcher);
-    }
-
-    public boolean hasPrefixMatcher() {
-        return prefixMatcher != null;
+        return new DFAFindInnerLiteralStateNode(copyID, Arrays.copyOf(getSuccessors(), getSuccessors().length), innerLiteral);
     }
 
     int executeInnerLiteralSearch(TRegexDFAExecutorLocals locals, TRegexDFAExecutorNode executor) {
-        return indexOfNode.execute(locals.getInput(), locals.getIndex(), executor.getMaxIndex(locals), innerLiteral.getLiteral().content(), innerLiteral.getMaskContent());
-    }
-
-    boolean prefixMatcherMatches(TRegexDFAExecutorLocals locals, boolean compactString) {
-        Object result = prefixMatcher.execute(locals.toInnerLiteralBackwardLocals(), compactString);
-        return prefixMatcher.isSimpleCG() ? result != null : (int) result != TRegexDFAExecutorNode.NO_MATCH;
+        return InputOps.indexOf(locals.getInput(), locals.getIndex(), executor.getMaxIndex(locals), innerLiteral, executor.getEncoding(), executor.getIndexOfStringNode());
     }
 
     @TruffleBoundary

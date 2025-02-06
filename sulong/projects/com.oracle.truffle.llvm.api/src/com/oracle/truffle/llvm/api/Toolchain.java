@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, 2020, Oracle and/or its affiliates.
+ * Copyright (c) 2019, 2024, Oracle and/or its affiliates.
  *
  * All rights reserved.
  *
@@ -30,18 +30,21 @@
 
 package com.oracle.truffle.llvm.api;
 
+import java.util.List;
+
 import com.oracle.truffle.api.TruffleFile;
 import com.oracle.truffle.api.TruffleLanguage;
 import com.oracle.truffle.api.nodes.LanguageInfo;
-
-import java.util.List;
 
 /**
  * A toolchain provides access to a set of tools which are used to translate an input file into a
  * source format that can be executed. Its purpose is to support build systems that are executed by
  * users, for example to compile and install additional libraries.
  *
- * <h4>Example:</h4> {@codesnippet toolchain-example}
+ * <h4>Example:</h4>
+ *
+ * {@snippet file = "com/oracle/truffle/llvm/api/Toolchain.java" region = "toolchain-example"}
+ *
  */
 public interface Toolchain {
 
@@ -54,6 +57,8 @@ public interface Toolchain {
      * <dl>
      * <dt><code>CC</code></dt>
      * <dd>A C compiler with a <code>clang</code>-like command line interface.</dd>
+     * <dt><code>CL</code></dt>
+     * <dd>A C/C++ compiler with a <code>cl</code>-like command line interface.</dd>
      * <dt><code>CXX</code></dt>
      * <dd>A C++ compiler with a <code>clang++</code>-like command line interface.</dd>
      * <dt><code>LD</code></dt>
@@ -114,18 +119,20 @@ abstract class ToolchainExampleSnippet {
      * Example for using the {@link Toolchain} to run {@code make} via a {@link ProcessBuilder}.
      */
     int runMake(TruffleLanguage.Env env) throws Exception {
-        // BEGIN: toolchain-example
+        // @start region = "toolchain-example"
         LanguageInfo llvmInfo = env.getInternalLanguages().get("llvm");
         Toolchain toolchain = env.lookup(llvmInfo, Toolchain.class);
         String id = toolchain.getIdentifier();
         TruffleFile cc = toolchain.getToolPath("CC");
+        TruffleFile cl = toolchain.getToolPath("CL");
         TruffleFile cxx = toolchain.getToolPath("CXX");
         TruffleFile ld = toolchain.getToolPath("LD");
 
-        String[] args = {"make", "CC=" + cc, "CXX=" + cxx, "LD=" + ld, "OUTPUT_DIR=" + id};
+        String[] args = {"make", "CC=" + cc, "CL=" + cl, "CXX=" + cxx,
+                        "LD=" + ld, "OUTPUT_DIR=" + id};
         Process p = env.newProcessBuilder(args).start();
         p.waitFor();
-        // END: toolchain-example
+        // @end region = "toolchain-example"
         return p.exitValue();
     }
 }

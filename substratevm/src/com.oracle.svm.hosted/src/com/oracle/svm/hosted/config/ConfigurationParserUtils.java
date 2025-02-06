@@ -24,73 +24,91 @@
  */
 package com.oracle.svm.hosted.config;
 
-import static com.oracle.svm.core.SubstrateOptions.PrintFlags;
+import static com.oracle.svm.core.configure.ConfigurationFiles.Options.ReachabilityMetadataResources;
+import static com.oracle.svm.core.configure.ConfigurationFiles.Options.TreatAllNameEntriesAsType;
 
-import java.io.FileReader;
 import java.io.IOException;
-import java.io.InputStreamReader;
-import java.io.Reader;
+import java.net.URI;
+import java.net.URISyntaxException;
 import java.net.URL;
-import java.net.URLConnection;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.Paths;
+import java.util.Collections;
 import java.util.Enumeration;
+import java.util.List;
 import java.util.Spliterator;
 import java.util.Spliterators.AbstractSpliterator;
 import java.util.function.Consumer;
 import java.util.stream.Stream;
 import java.util.stream.StreamSupport;
 
+import org.graalvm.nativeimage.impl.ConfigurationCondition;
 import org.graalvm.nativeimage.impl.ReflectionRegistry;
 
+import com.oracle.svm.core.configure.ConfigurationConditionResolver;
+import com.oracle.svm.core.configure.ConfigurationFile;
 import com.oracle.svm.core.configure.ConfigurationFiles;
 import com.oracle.svm.core.configure.ConfigurationParser;
 import com.oracle.svm.core.configure.ReflectionConfigurationParser;
 import com.oracle.svm.core.option.HostedOptionKey;
-import com.oracle.svm.core.option.LocatableMultiOptionValue;
-import com.oracle.svm.core.option.OptionUtils;
-import com.oracle.svm.core.option.SubstrateOptionsParser;
+import com.oracle.svm.core.option.AccumulatingLocatableMultiOptionValue;
 import com.oracle.svm.core.util.UserError;
-import com.oracle.svm.core.util.json.JSONParserException;
 import com.oracle.svm.hosted.ImageClassLoader;
-import com.oracle.svm.hosted.NativeImageOptions;
+import com.oracle.svm.hosted.reflect.proxy.ProxyRegistry;
+
+import jdk.graal.compiler.util.json.JsonParserException;
+import org.graalvm.nativeimage.impl.RuntimeSerializationSupport;
 
 public final class ConfigurationParserUtils {
 
-    public static ReflectionConfigurationParser<Class<?>> create(ReflectionRegistry registry, ImageClassLoader imageClassLoader) {
-        return new ReflectionConfigurationParser<>(new ReflectionRegistryAdapter(registry, imageClassLoader), NativeImageOptions.AllowIncompleteClasspath.getValue());
+    public static ReflectionConfigurationParser<ConfigurationCondition, Class<?>> create(String combinedFileKey, boolean strictMetadata,
+                    ConfigurationConditionResolver<ConfigurationCondition> conditionResolver, ReflectionRegistry registry, ProxyRegistry proxyRegistry,
+                    RuntimeSerializationSupport<ConfigurationCondition> serializationSupport, ImageClassLoader imageClassLoader) {
+        return ReflectionConfigurationParser.create(combinedFileKey, strictMetadata, conditionResolver,
+                        RegistryAdapter.create(registry, proxyRegistry, serializationSupport, imageClassLoader),
+                        ConfigurationFiles.Options.StrictConfiguration.getValue(),
+                        ConfigurationFiles.Options.WarnAboutMissingReflectionOrJNIMetadataElements.getValue(), TreatAllNameEntriesAsType.getValue());
     }
 
     /**
      * Parses configurations in files specified by {@code configFilesOption} and resources specified
      * by {@code configResourcesOption} and registers the parsed elements using
-     * {@link ConfigurationParser#parseAndRegister(Reader)} .
+     * {@link ConfigurationParser#parseAndRegister} .
      *
      * @param featureName name of the feature using the configuration (e.g., "JNI")
      * @param directoryFileName file name for searches via {@link ConfigurationFiles}.
      * @return the total number of successfully parsed configuration files and resources.
      */
     public static int parseAndRegisterConfigurations(ConfigurationParser parser, ImageClassLoader classLoader, String featureName,
-                    HostedOptionKey<LocatableMultiOptionValue.Strings> configFilesOption, HostedOptionKey<LocatableMultiOptionValue.Strings> configResourcesOption, String directoryFileName) {
+                    HostedOptionKey<AccumulatingLocatableMultiOptionValue.Paths> configFilesOption, HostedOptionKey<AccumulatingLocatableMultiOptionValue.Strings> configResourcesOption,
+                    String directoryFileName) {
 
+        List<Path> paths = configFilesOption.getValue().values();
+        List<String> resourceValues = configResourcesOption.getValue().values();
+        return parseAndRegisterConfigurations(parser, classLoader, featureName, directoryFileName, paths, resourceValues);
+    }
+
+    public static int parseAndRegisterConfigurationsFromCombinedFile(ConfigurationParser parser, ImageClassLoader classLoader, String featureName) {
+        return parseAndRegisterConfigurations(parser, classLoader, featureName, ConfigurationFile.REACHABILITY_METADATA.getFileName(), Collections.emptyList(),
+                        ReachabilityMetadataResources.getValue().values());
+    }
+
+    public static int parseAndRegisterConfigurations(ConfigurationParser parser, ImageClassLoader classLoader,
+                    String featureName,
+                    String directoryFileName, List<Path> paths,
+                    List<String> resourceValues) {
         int parsedCount = 0;
-
-        Stream<Path> files = Stream.concat(OptionUtils.flatten(",", configFilesOption.getValue()).stream().map(Paths::get),
+        Stream<Path> files = Stream.concat(paths.stream(),
                         ConfigurationFiles.findConfigurationFiles(directoryFileName).stream());
         parsedCount += files.map(Path::toAbsolutePath).mapToInt(path -> {
             if (!Files.exists(path)) {
                 throw UserError.abort("The %s configuration file \"%s\" does not exist.", featureName, path);
             }
-            try (Reader reader = new FileReader(path.toFile())) {
-                doParseAndRegister(parser, reader, featureName, path, configFilesOption);
-                return 1;
-            } catch (IOException e) {
-                throw UserError.abort("Could not open %s: %s", path, e.getMessage());
-            }
+            doParseAndRegister(parser, featureName, path);
+            return 1;
         }).sum();
 
-        Stream<URL> configResourcesFromOption = OptionUtils.flatten(",", configResourcesOption.getValue()).stream().flatMap(s -> {
+        Stream<URL> configResourcesFromOption = resourceValues.stream().flatMap(s -> {
             Enumeration<URL> urls;
             try {
                 urls = classLoader.findResourcesByName(s);
@@ -113,31 +131,30 @@ public final class ConfigurationParserUtils {
         });
         Stream<URL> resources = Stream.concat(configResourcesFromOption, ConfigurationFiles.findConfigurationResources(directoryFileName, classLoader.getClassLoader()).stream());
         parsedCount += resources.mapToInt(url -> {
-            try {
-                URLConnection urlConnection = url.openConnection();
-                urlConnection.setUseCaches(false);
-                try (Reader reader = new InputStreamReader(urlConnection.getInputStream())) {
-                    doParseAndRegister(parser, reader, featureName, url, configResourcesOption);
-                    return 1;
-                }
-            } catch (IOException e) {
-                throw UserError.abort("Could not open %s: %s", url, e.getMessage());
-            }
+            doParseAndRegister(parser, featureName, url);
+            return 1;
         }).sum();
-
         return parsedCount;
     }
 
-    private static void doParseAndRegister(ConfigurationParser parser, Reader reader, String featureName, Object location, HostedOptionKey<LocatableMultiOptionValue.Strings> option) {
+    private static void doParseAndRegister(ConfigurationParser parser, String featureName, Object location) {
         try {
-            parser.parseAndRegister(reader);
-        } catch (IOException | JSONParserException e) {
+            URI uri;
+            if (location instanceof Path) {
+                uri = ((Path) location).toUri();
+            } else {
+                uri = ((URL) location).toURI();
+            }
+            parser.parseAndRegister(uri);
+        } catch (IOException | URISyntaxException | JsonParserException e) {
             String errorMessage = e.getMessage();
             if (errorMessage == null || errorMessage.isEmpty()) {
                 errorMessage = e.toString();
             }
-            throw UserError.abort("Error parsing %s configuration in %s:%n%s%nVerify that the configuration matches the schema described in the %s output for option %s.",
-                            featureName, location, errorMessage, SubstrateOptionsParser.commandArgument(PrintFlags, "+"), option.getName());
+            throw UserError.abort(
+                            "Error parsing %s configuration in %s:%n%s%nVerify that the configuration matches the corresponding schema at " +
+                                            "https://github.com/oracle/graal/blob/master/docs/reference-manual/native-image/assets/",
+                            featureName, location, errorMessage);
         }
     }
 }

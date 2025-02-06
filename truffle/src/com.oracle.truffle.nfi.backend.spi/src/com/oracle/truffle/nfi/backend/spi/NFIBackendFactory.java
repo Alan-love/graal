@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2019, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -40,6 +40,8 @@
  */
 package com.oracle.truffle.nfi.backend.spi;
 
+import com.oracle.truffle.api.ContextThreadLocal;
+
 /**
  * Service interface for languages that implement a backend for the Truffle NFI.
  */
@@ -51,8 +53,7 @@ public interface NFIBackendFactory {
     String getBackendId();
 
     /**
-     * Create an instance of an {@link NFIBackend}. The NFI backend may keep a reference to the
-     * tools for later use.
+     * Create an instance of an {@link NFIBackend}.
      */
-    NFIBackend createBackend(NFIBackendTools tools);
+    NFIBackend createBackend(ContextThreadLocal<NFIState> state);
 }

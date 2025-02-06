@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2020, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -48,6 +48,7 @@ import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 import static org.junit.Assume.assumeTrue;
 
+import java.lang.invoke.MethodHandles;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
@@ -64,11 +65,9 @@ import org.junit.runners.Parameterized.Parameters;
 import com.oracle.truffle.api.nodes.UnexpectedResultException;
 import com.oracle.truffle.api.object.DynamicObject;
 import com.oracle.truffle.api.object.DynamicObjectLibrary;
-import com.oracle.truffle.api.object.ObjectType;
 import com.oracle.truffle.api.object.Property;
 import com.oracle.truffle.api.object.Shape;
 import com.oracle.truffle.api.test.AbstractParametrizedLibraryTest;
-import com.oracle.truffle.object.DynamicObjectImpl;
 
 @SuppressWarnings("deprecation")
 @RunWith(Parameterized.class)
@@ -83,19 +82,17 @@ public class DynamicObjectLibraryTest extends AbstractParametrizedLibraryTest {
     public static Collection<Object[]> parameters() {
         Collection<Object[]> params = new ArrayList<>();
 
-        Object objectType = newObjectType();
-        com.oracle.truffle.api.object.Layout layout = com.oracle.truffle.api.object.Layout.createLayout();
-        Shape shape = layout.createShape((ObjectType) objectType);
-        Supplier<? extends Object> doSupplier = () -> shape.newInstance();
-        addParams(params, doSupplier);
-
         Shape shapeMin = Shape.newBuilder().build();
         Supplier<? extends DynamicObject> minimalSupplier = () -> new TestDynamicObjectMinimal(shapeMin);
         addParams(params, minimalSupplier);
 
-        Shape shapeDef = Shape.newBuilder().layout(TestDynamicObjectDefault.class).build();
+        Shape shapeDef = Shape.newBuilder().layout(TestDynamicObjectDefault.class, MethodHandles.lookup()).build();
         Supplier<? extends DynamicObject> defaultSupplier = () -> new TestDynamicObjectDefault(shapeDef);
         addParams(params, defaultSupplier);
+
+        Shape shapeDefLegacy = Shape.newBuilder().layout(TestDynamicObjectDefault.class).build();
+        Supplier<? extends DynamicObject> defaultSupplierLegacy = () -> new TestDynamicObjectDefault(shapeDefLegacy);
+        addParams(params, defaultSupplierLegacy);
 
         return params;
     }
@@ -567,7 +564,7 @@ public class DynamicObjectLibraryTest extends AbstractParametrizedLibraryTest {
         lib.resetShape(o1, emptyShape);
         assertSame(emptyShape, o1.getShape());
 
-        assumeTrue("new layout only", isNewLayout(o1));
+        assumeTrue("new layout only", isNewLayout());
         int flags = 0xf;
         DynamicObject o2 = createEmpty();
         Shape newEmptyShape = Shape.newBuilder().shapeFlags(flags).build();
@@ -702,7 +699,7 @@ public class DynamicObjectLibraryTest extends AbstractParametrizedLibraryTest {
         assertEquals(v1, uncachedGet(o1, k1));
 
         setNode1.putWithFlags(o1, k1, v2, flags);
-        if (isNewLayout(o1)) {
+        if (isNewLayout()) {
             assertFalse(o1.getShape().getProperty(k1).getLocation().isConstant());
         }
         assertEquals(flags, o1.getShape().getProperty(k1).getFlags());
@@ -805,7 +802,8 @@ public class DynamicObjectLibraryTest extends AbstractParametrizedLibraryTest {
     }
 
     private static Object newObjectType() {
-        return new com.oracle.truffle.api.object.ObjectType();
+        return new Object() {
+        };
     }
 
     private List<Object> getKeyList(DynamicObject obj) {
@@ -813,7 +811,7 @@ public class DynamicObjectLibraryTest extends AbstractParametrizedLibraryTest {
         return Arrays.asList(objectLibrary.getKeyArray(obj));
     }
 
-    private static boolean isNewLayout(DynamicObject obj) {
-        return !(obj instanceof DynamicObjectImpl);
+    private static boolean isNewLayout() {
+        return true;
     }
 }

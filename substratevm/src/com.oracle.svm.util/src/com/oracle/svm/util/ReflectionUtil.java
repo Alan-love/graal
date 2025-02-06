@@ -24,14 +24,18 @@
  */
 package com.oracle.svm.util;
 
-// Checkstyle: allow reflection
-
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.VarHandle;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
+import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 
 /**
- * This class contains utility methods for commonly used reflection functionality.
+ * This class contains utility methods for commonly used reflection functionality. Note that lookups
+ * will not work on JDK 17 in cases when the field/method is filtered. See
+ * jdk.internal.reflect.Reflection#fieldFilterMap for more information or
+ * com.oracle.svm.hosted.ModuleLayerFeature for an example of a workaround in such cases.
  */
 public final class ReflectionUtil {
 
@@ -50,29 +54,105 @@ public final class ReflectionUtil {
      * declaring class.
      */
     private static void openModule(Class<?> declaringClass) {
-        ModuleSupport.openModuleByClass(declaringClass, ReflectionUtil.class);
+        ModuleSupport.accessModuleByClass(ModuleSupport.Access.OPEN, ReflectionUtil.class, declaringClass);
+    }
+
+    public static Class<?> lookupClass(String className) {
+        return lookupClass(false, className);
+    }
+
+    public static Class<?> lookupClass(boolean optional, String className) {
+        return lookupClass(optional, className, ReflectionUtil.class.getClassLoader());
+    }
+
+    public static Class<?> lookupClass(boolean optional, String className, ClassLoader loader) {
+        try {
+            return Class.forName(className, false, loader);
+        } catch (ClassNotFoundException ex) {
+            if (optional) {
+                return null;
+            }
+            throw new ReflectionUtilError(ex);
+        }
     }
 
     public static Method lookupMethod(Class<?> declaringClass, String methodName, Class<?>... parameterTypes) {
+        return lookupMethod(false, declaringClass, methodName, parameterTypes);
+    }
+
+    public static Method lookupMethod(boolean optional, Class<?> declaringClass, String methodName, Class<?>... parameterTypes) {
         try {
             Method result = declaringClass.getDeclaredMethod(methodName, parameterTypes);
             openModule(declaringClass);
             result.setAccessible(true);
             return result;
+        } catch (ReflectiveOperationException | LinkageError ex) {
+            if (optional) {
+                return null;
+            }
+            throw new ReflectionUtilError(ex);
+        }
+    }
+
+    public static Method lookupPublicMethodInClassHierarchy(Class<?> clazz, String methodName, Class<?>... parameterTypes) {
+        return lookupPublicMethodInClassHierarchy(false, clazz, methodName, parameterTypes);
+    }
+
+    public static Method lookupPublicMethodInClassHierarchy(boolean optional, Class<?> clazz, String methodName, Class<?>... parameterTypes) {
+        try {
+            Method result = clazz.getMethod(methodName, parameterTypes);
+            openModule(result.getDeclaringClass());
+            result.setAccessible(true);
+            return result;
         } catch (ReflectiveOperationException ex) {
+            if (optional) {
+                return null;
+            }
             throw new ReflectionUtilError(ex);
         }
     }
 
     public static <T> Constructor<T> lookupConstructor(Class<T> declaringClass, Class<?>... parameterTypes) {
+        return lookupConstructor(false, declaringClass, parameterTypes);
+    }
+
+    public static <T> Constructor<T> lookupConstructor(boolean optional, Class<T> declaringClass, Class<?>... parameterTypes) {
         try {
             Constructor<T> result = declaringClass.getDeclaredConstructor(parameterTypes);
             openModule(declaringClass);
             result.setAccessible(true);
             return result;
         } catch (ReflectiveOperationException ex) {
+            if (optional) {
+                return null;
+            }
             throw new ReflectionUtilError(ex);
         }
+    }
+
+    /**
+     * Invokes the provided method, and unwraps a possible {@link InvocationTargetException} so that
+     * it appears as if the method had been invoked directly without the use of reflection.
+     */
+    @SuppressWarnings("unchecked")
+    public static <T> T invokeMethod(Method method, Object receiver, Object... arguments) {
+        try {
+            method.setAccessible(true);
+            return (T) method.invoke(receiver, arguments);
+        } catch (InvocationTargetException ex) {
+            Throwable cause = ex.getCause();
+            if (cause != null) {
+                throw rethrow(cause);
+            }
+            throw new ReflectionUtilError(ex);
+        } catch (ReflectiveOperationException ex) {
+            throw new ReflectionUtilError(ex);
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static <E extends Throwable> RuntimeException rethrow(Throwable ex) throws E {
+        throw (E) ex;
     }
 
     public static <T> T newInstance(Class<T> declaringClass) {
@@ -83,13 +163,53 @@ public final class ReflectionUtil {
         }
     }
 
+    public static <T> T newInstance(Constructor<T> constructor, Object... initArgs) {
+        try {
+            return constructor.newInstance(initArgs);
+        } catch (ReflectiveOperationException ex) {
+            throw new ReflectionUtilError(ex);
+        }
+    }
+
+    public static VarHandle unreflectField(Class<?> declaringClass, String fieldName, MethodHandles.Lookup lookup) {
+        try {
+            Field field = ReflectionUtil.lookupField(declaringClass, fieldName);
+            MethodHandles.Lookup privateLookup = MethodHandles.privateLookupIn(declaringClass, lookup);
+            return privateLookup.unreflectVarHandle(field);
+        } catch (IllegalAccessException ex) {
+            throw new ReflectionUtilError(ex);
+        }
+    }
+
     public static Field lookupField(Class<?> declaringClass, String fieldName) {
+        return lookupField(false, declaringClass, fieldName);
+    }
+
+    private static final Method fieldGetDeclaredFields0 = ReflectionUtil.lookupMethod(Class.class, "getDeclaredFields0", boolean.class);
+
+    public static Field lookupField(boolean optional, Class<?> declaringClass, String fieldName) {
         try {
             Field result = declaringClass.getDeclaredField(fieldName);
             openModule(declaringClass);
             result.setAccessible(true);
             return result;
         } catch (ReflectiveOperationException ex) {
+            /* Try to get hidden field */
+            try {
+                Field[] allFields = (Field[]) fieldGetDeclaredFields0.invoke(declaringClass, false);
+                for (Field field : allFields) {
+                    if (field.getName().equals(fieldName)) {
+                        openModule(declaringClass);
+                        field.setAccessible(true);
+                        return field;
+                    }
+                }
+            } catch (ReflectiveOperationException e) {
+                // ignore
+            }
+            if (optional) {
+                return null;
+            }
             throw new ReflectionUtilError(ex);
         }
     }
@@ -105,5 +225,17 @@ public final class ReflectionUtil {
 
     public static <T> T readStaticField(Class<?> declaringClass, String fieldName) {
         return readField(declaringClass, fieldName, null);
+    }
+
+    public static void writeField(Class<?> declaringClass, String fieldName, Object receiver, Object value) {
+        try {
+            lookupField(declaringClass, fieldName).set(receiver, value);
+        } catch (ReflectiveOperationException ex) {
+            throw new ReflectionUtilError(ex);
+        }
+    }
+
+    public static void writeStaticField(Class<?> declaringClass, String fieldName, Object value) {
+        writeField(declaringClass, fieldName, null, value);
     }
 }

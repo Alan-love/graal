@@ -24,58 +24,17 @@
  */
 package com.oracle.svm.hosted.classinitialization;
 
-import java.util.Arrays;
-import java.util.Optional;
-import java.util.function.Consumer;
-
-import org.graalvm.collections.Pair;
-
 /**
  * The initialization kind for a class. The order of the enum values matters, {@link #max} depends
  * on it.
  */
-public enum InitKind {
+enum InitKind {
     /** Class is initialized during image building, so it is already initialized at runtime. */
     BUILD_TIME,
-    /** Class is initialized both at runtime and during image building. */
-    RERUN,
     /** Class should be initialized at runtime and not during image building. */
     RUN_TIME;
 
     InitKind max(InitKind other) {
         return this.ordinal() > other.ordinal() ? this : other;
     }
-
-    InitKind min(InitKind other) {
-        return this.ordinal() < other.ordinal() ? this : other;
-    }
-
-    boolean isRunTime() {
-        return this.equals(RUN_TIME);
-    }
-
-    public static final String SEPARATOR = ":";
-
-    String suffix() {
-        return SEPARATOR + name().toLowerCase();
-    }
-
-    Consumer<String> stringConsumer(ClassInitializationSupport support, String origin) {
-        String prefix = "from ";
-        String reason = origin == null ? prefix + "the command line" : prefix + origin;
-        if (this == RUN_TIME) {
-            return name -> support.initializeAtRunTime(name, reason);
-        } else if (this == RERUN) {
-            return name -> support.rerunInitialization(name, reason);
-        } else {
-            return name -> support.initializeAtBuildTime(name, reason);
-        }
-    }
-
-    static Pair<String, InitKind> strip(String input) {
-        Optional<InitKind> it = Arrays.stream(values()).filter(x -> input.endsWith(x.suffix())).findAny();
-        assert it.isPresent();
-        return Pair.create(input.substring(0, input.length() - it.get().suffix().length()), it.get());
-    }
-
 }

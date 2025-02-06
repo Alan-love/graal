@@ -24,6 +24,9 @@
  */
 package com.oracle.svm.core.deopt;
 
+import jdk.graal.compiler.core.common.CompilationIdentifier;
+
+import com.oracle.svm.core.Uninterruptible;
 import com.oracle.svm.core.code.CodeInfo;
 import com.oracle.svm.core.code.CodeInfoAccess;
 import com.oracle.svm.core.code.RuntimeCodeCache;
@@ -47,9 +50,11 @@ public interface SubstrateInstalledCode {
     String getName();
 
     /** The entry point address of this code if {@linkplain #isValid valid}, or 0 otherwise. */
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     long getEntryPoint();
 
     /** The address of this code if {@linkplain #isAlive alive}, or 0 otherwise. */
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     long getAddress();
 
     /**
@@ -64,11 +69,12 @@ public interface SubstrateInstalledCode {
 
     /**
      * Called during code installation: initialize this instance with the given address where its
-     * instructions are, and the method it was compiled from. Afterwards, {@link #getAddress()} and
-     * {@link #getEntryPoint()} return the given address, and {@link #isValid()} and
-     * {@link #isAlive()} return {@code true}.
+     * instructions are, and the method it was compiled from. The entry point sets the address of
+     * the first instruction to be executed. Afterwards, {@link #getAddress()} returns the given
+     * address, and {@link #isAlive()} returns {@code true}. Also {@link #getEntryPoint()} returns
+     * the given address, and {@link #isValid()} returns true.
      */
-    void setAddress(long address, ResolvedJavaMethod method);
+    void setAddress(long address, long entryPoint, ResolvedJavaMethod method);
 
     /**
      * This method is called during code uninstallation. Consider {@link #invalidate()} instead.
@@ -88,6 +94,7 @@ public interface SubstrateInstalledCode {
     void invalidate();
 
     /** Whether the code represented by this object exists and could have live invocations. */
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     boolean isAlive();
 
     /**
@@ -98,6 +105,12 @@ public interface SubstrateInstalledCode {
     void invalidateWithoutDeoptimization();
 
     SubstrateSpeculationLog getSpeculationLog();
+
+    /**
+     * Sets the identifier of the compilation that resulted in this code, which can be used to
+     * provide additional information in {@link #getName()}.
+     */
+    void setCompilationId(CompilationIdentifier id);
 
     /**
      * Provides access to a {@link SubstrateInstalledCode}.

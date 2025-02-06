@@ -26,15 +26,15 @@ package com.oracle.svm.core.graal.lir;
 
 import java.util.List;
 
-import org.graalvm.compiler.code.CompilationResult;
-import org.graalvm.compiler.lir.LIRFrameState;
-import org.graalvm.compiler.lir.LIRInstruction;
-import org.graalvm.compiler.lir.LIRInstructionClass;
-import org.graalvm.compiler.lir.asm.CompilationResultBuilder;
-
+import com.oracle.svm.core.SubstrateControlFlowIntegrity;
 import com.oracle.svm.core.code.CodeInfoEncoder;
 import com.oracle.svm.core.deopt.DeoptEntryInfopoint;
 
+import jdk.graal.compiler.code.CompilationResult;
+import jdk.graal.compiler.lir.LIRFrameState;
+import jdk.graal.compiler.lir.LIRInstruction;
+import jdk.graal.compiler.lir.LIRInstructionClass;
+import jdk.graal.compiler.lir.asm.CompilationResultBuilder;
 import jdk.vm.ci.code.site.Infopoint;
 
 /**
@@ -63,15 +63,26 @@ public final class DeoptEntryOp extends LIRInstruction {
             int entryOffset = CodeInfoEncoder.getEntryOffset(infopoint);
             if (entryOffset >= 0) {
                 if (entryOffset == crb.asm.position()) {
+                    /* Found prior info point at pc; increment pc to ensure uniqueness. */
                     crb.asm.ensureUniquePC();
                     break;
                 }
             }
         }
         /* Register this location as a deopt infopoint. */
-        compilation.addInfopoint(new DeoptEntryInfopoint(crb.asm.position(), state.debugInfo()));
-        /* Add NOP so that the next infopoint (e.g., an invoke) gets a unique PC. */
-        crb.asm.ensureUniquePC();
+        int position = crb.asm.position();
+        compilation.addInfopoint(new DeoptEntryInfopoint(position, state.debugInfo()));
+        /* Need to register exception edge, if present. */
+        crb.recordExceptionHandlers(position, state);
+        if (SubstrateControlFlowIntegrity.useSoftwareCFI()) {
+            /* Mark this position as a CFI Target. */
+            int initialPos = crb.asm.position();
+            crb.asm.maybeEmitIndirectTargetMarker();
+            assert initialPos != crb.asm.position() : "No target marker emitted. Position: " + initialPos;
+        } else {
+            /* Add NOP so that the next info point (e.g., an invoke) gets a unique PC. */
+            crb.asm.ensureUniquePC();
+        }
     }
 
     @Override

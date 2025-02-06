@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2017, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -42,14 +42,17 @@ package com.oracle.truffle.nfi;
 
 import com.oracle.truffle.api.Assumption;
 import com.oracle.truffle.api.CallTarget;
-import com.oracle.truffle.api.CompilerAsserts;
+import com.oracle.truffle.api.ContextThreadLocal;
 import com.oracle.truffle.api.Truffle;
 import com.oracle.truffle.api.TruffleLanguage;
+import com.oracle.truffle.api.TruffleStackTrace;
 import com.oracle.truffle.api.TruffleLanguage.ContextPolicy;
+import com.oracle.truffle.api.nodes.Node;
 import com.oracle.truffle.api.nodes.RootNode;
 import com.oracle.truffle.nfi.NativeSource.Content;
 import com.oracle.truffle.nfi.NativeSource.ParsedLibrary;
 import com.oracle.truffle.nfi.NativeSource.ParsedSignature;
+import com.oracle.truffle.nfi.backend.spi.NFIState;
 
 @TruffleLanguage.Registration(id = "nfi", name = "TruffleNFI", version = "0.1", characterMimeTypes = NFILanguage.MIME_TYPE, internal = true, contextPolicy = ContextPolicy.SHARED)
 public class NFILanguage extends TruffleLanguage<NFIContext> {
@@ -57,6 +60,28 @@ public class NFILanguage extends TruffleLanguage<NFIContext> {
     public static final String MIME_TYPE = "application/x-native";
 
     private final Assumption singleContextAssumption = Truffle.getRuntime().createAssumption("NFI single context");
+
+    final ContextThreadLocal<NFIState> nfiState = locals.createContextThreadLocal((ctx, thread) -> new NFIState(thread));
+
+    protected void setPendingException(Throwable pendingException) {
+        TruffleStackTrace.fillIn(pendingException);
+        NFIState state = nfiState.get();
+        state.setPendingException(pendingException);
+    }
+
+    @SuppressWarnings({"unchecked", "unused"})
+    private static <T extends Throwable> T silenceException(Class<T> type, Throwable t) throws T {
+        throw (T) t;
+    }
+
+    protected void rethrowPendingException() {
+        NFIState state = nfiState.get();
+        Throwable t = state.getPendingException();
+        state.clearPendingException();
+        if (t != null) {
+            throw silenceException(RuntimeException.class, t);
+        }
+    }
 
     @Override
     protected NFIContext createContext(Env env) {
@@ -75,13 +100,8 @@ public class NFILanguage extends TruffleLanguage<NFIContext> {
         singleContextAssumption.invalidate();
     }
 
-    static NFILanguage getCurrentLanguage() {
-        CompilerAsserts.neverPartOfCompilation("getCurrentLanguage");
-        return getCurrentLanguage(NFILanguage.class);
-    }
-
     static Assumption getSingleContextAssumption() {
-        return getCurrentLanguage().singleContextAssumption;
+        return get(null).singleContextAssumption;
     }
 
     @Override
@@ -98,18 +118,30 @@ public class NFILanguage extends TruffleLanguage<NFIContext> {
 
         Content c = source.getContent();
         assert c != null;
-        if (c instanceof ParsedLibrary) {
-            ParsedLibrary lib = (ParsedLibrary) c;
-            return Truffle.getRuntime().createCallTarget(new NFIRootNode(this, lib, backendId));
+        RootNode root;
+        if (c instanceof ParsedLibrary lib) {
+            root = new NFIRootNode(this, lib, backendId);
         } else {
             ParsedSignature sig = (ParsedSignature) c;
-            RootNode buildSignature = new SignatureRootNode(this, backendId, sig.getBuildSignatureNode());
-            return Truffle.getRuntime().createCallTarget(buildSignature);
+            root = new SignatureRootNode(this, backendId, sig.getBuildSignatureNode());
         }
+        return root.getCallTarget();
     }
 
     @Override
     protected boolean isThreadAccessAllowed(Thread thread, boolean singleThreaded) {
         return true;
+    }
+
+    @Override
+    protected void disposeThread(NFIContext context, Thread thread) {
+        NFIState state = nfiState.get(thread);
+        state.dispose();
+    }
+
+    private static final LanguageReference<NFILanguage> REFERENCE = LanguageReference.create(NFILanguage.class);
+
+    static NFILanguage get(Node node) {
+        return REFERENCE.get(node);
     }
 }

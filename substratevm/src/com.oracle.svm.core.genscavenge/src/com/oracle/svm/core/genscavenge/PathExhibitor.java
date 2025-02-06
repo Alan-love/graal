@@ -27,17 +27,13 @@ package com.oracle.svm.core.genscavenge;
 
 import java.util.ArrayList;
 
-import org.graalvm.compiler.word.Word;
 import org.graalvm.nativeimage.CurrentIsolate;
 import org.graalvm.nativeimage.IsolateThread;
 import org.graalvm.nativeimage.c.function.CodePointer;
 import org.graalvm.word.Pointer;
 import org.graalvm.word.UnsignedWord;
-import org.graalvm.word.WordFactory;
 
-import com.oracle.svm.core.SubstrateOptions;
-import com.oracle.svm.core.annotate.NeverInline;
-import com.oracle.svm.core.annotate.RestrictHeapAccess;
+import com.oracle.svm.core.NeverInline;
 import com.oracle.svm.core.code.CodeInfo;
 import com.oracle.svm.core.code.CodeInfoTable;
 import com.oracle.svm.core.deopt.DeoptimizedFrame;
@@ -45,6 +41,8 @@ import com.oracle.svm.core.heap.Heap;
 import com.oracle.svm.core.heap.ObjectReferenceVisitor;
 import com.oracle.svm.core.heap.ObjectVisitor;
 import com.oracle.svm.core.heap.ReferenceAccess;
+import com.oracle.svm.core.heap.RestrictHeapAccess;
+import com.oracle.svm.core.heap.VMOperationInfos;
 import com.oracle.svm.core.hub.InteriorObjRefWalker;
 import com.oracle.svm.core.log.Log;
 import com.oracle.svm.core.log.StringBuilderLog;
@@ -54,6 +52,8 @@ import com.oracle.svm.core.stack.StackFrameVisitor;
 import com.oracle.svm.core.thread.JavaVMOperation;
 import com.oracle.svm.core.thread.VMOperation;
 import com.oracle.svm.core.thread.VMThreads;
+
+import jdk.graal.compiler.word.Word;
 
 /** Determines paths from roots to objects or heap regions. */
 public final class PathExhibitor {
@@ -87,7 +87,7 @@ public final class PathExhibitor {
         if (edge.isFilled()) {
             path.add(edge.getTo());
             path.add(edge.getFrom());
-            Object fromObj = KnownIntrinsics.convertUnknownValue(edge.getFrom().getObject(), Object.class);
+            Object fromObj = edge.getFrom().getObject();
 
             // Add the rest of the path
             findPathToRoot(fromObj, edge, KnownIntrinsics.readCallerStackPointer());
@@ -123,7 +123,7 @@ public final class PathExhibitor {
                 // No pointer to current object: The path ends here.
                 break;
             }
-            currentTargetObj = KnownIntrinsics.convertUnknownValue(currentElement.getObject(), Object.class);
+            currentTargetObj = currentElement.getObject();
             if (currentTargetObj == null) {
                 // Current element is a root: Add element to path and stop.
                 path.add(currentElement);
@@ -154,16 +154,14 @@ public final class PathExhibitor {
         JavaStackWalker.walkCurrentThread(currentThreadWalkStackPointer, stackFrameVisitor);
         stackFrameVisitor.reset();
 
-        if (SubstrateOptions.MultiThreaded.getValue()) {
-            IsolateThread thread = VMThreads.firstThread();
-            while (!edge.isFilled() && thread.isNonNull()) {
-                if (thread.notEqual(CurrentIsolate.getCurrentThread())) { // walked above
-                    stackFrameVisitor.initialize(target, edge);
-                    JavaStackWalker.walkThread(thread, stackFrameVisitor);
-                    stackFrameVisitor.reset();
-                }
-                thread = VMThreads.nextThread(thread);
+        IsolateThread thread = VMThreads.firstThread();
+        while (!edge.isFilled() && thread.isNonNull()) {
+            if (thread.notEqual(CurrentIsolate.getCurrentThread())) { // walked above
+                stackFrameVisitor.initialize(target, edge);
+                JavaStackWalker.walkThread(thread, stackFrameVisitor);
+                stackFrameVisitor.reset();
             }
+            thread = VMThreads.nextThread(thread);
         }
     }
 
@@ -273,35 +271,40 @@ public final class PathExhibitor {
 
         @Override
         @RestrictHeapAccess(access = RestrictHeapAccess.Access.NO_ALLOCATION, reason = "Must not allocate while visiting stack frames.")
-        public boolean visitFrame(Pointer sp, CodePointer ip, CodeInfo codeInfo, DeoptimizedFrame deoptimizedFrame) {
-            frameSlotVisitor.initialize(ip, deoptimizedFrame, target, result);
-            return CodeInfoTable.visitObjectReferences(sp, ip, codeInfo, deoptimizedFrame, frameSlotVisitor);
+        public boolean visitRegularFrame(Pointer sp, CodePointer ip, CodeInfo codeInfo) {
+            frameSlotVisitor.initialize(ip, target, result);
+            return CodeInfoTable.visitObjectReferences(sp, ip, codeInfo, frameSlotVisitor);
+        }
+
+        @Override
+        @RestrictHeapAccess(access = RestrictHeapAccess.Access.NO_ALLOCATION, reason = "Must not allocate while visiting stack frames.")
+        protected boolean visitDeoptimizedFrame(Pointer originalSP, CodePointer deoptStubIP, DeoptimizedFrame deoptimizedFrame) {
+            /* Support for deoptimized frames is not implemented at the moment. */
+            return true;
         }
     }
 
     private static class FrameSlotVisitor extends AbstractVisitor implements ObjectReferenceVisitor {
         private CodePointer ip;
-        private DeoptimizedFrame deoptFrame;
 
         FrameSlotVisitor() {
         }
 
-        void initialize(CodePointer ipArg, DeoptimizedFrame deoptFrameArg, TargetMatcher targetMatcher, PathEdge edge) {
+        void initialize(CodePointer ipArg, TargetMatcher targetMatcher, PathEdge edge) {
             super.initialize(targetMatcher, edge);
             ip = ipArg;
-            deoptFrame = deoptFrameArg;
         }
 
         @Override
-        public boolean visitObjectReference(Pointer stackSlot, boolean compressed) {
+        public boolean visitObjectReference(Pointer stackSlot, boolean compressed, Object holderObject) {
             Log trace = Log.noopLog();
             if (stackSlot.isNull()) {
                 return true;
             }
             Pointer referentPointer = ReferenceAccess.singleton().readObjectAsUntrackedPointer(stackSlot, compressed);
-            trace.string("  referentPointer: ").hex(referentPointer);
+            trace.string("  referentPointer: ").zhex(referentPointer);
             if (target.matches(referentPointer.toObject())) {
-                result.fill(new StackElement(stackSlot, ip, deoptFrame), new LeafElement(referentPointer.toObject()));
+                result.fill(new StackElement(stackSlot, ip), new LeafElement(referentPointer.toObject()));
                 return false;
             }
             return true;
@@ -320,7 +323,7 @@ public final class PathExhibitor {
         }
 
         @Override
-        public boolean visitObjectReference(Pointer objRef, boolean compressed) {
+        public boolean visitObjectReference(Pointer objRef, boolean compressed, Object holderObject) {
             if (objRef.isNull()) {
                 return true;
             }
@@ -363,7 +366,7 @@ public final class PathExhibitor {
         }
 
         @Override
-        public boolean visitObjectReference(Pointer objRef, boolean compressed) {
+        public boolean visitObjectReference(Pointer objRef, boolean compressed, Object holderObject) {
             if (objRef.isNull()) {
                 return true;
             }
@@ -425,7 +428,7 @@ public final class PathExhibitor {
             Pointer objPointer = Word.objectToUntrackedPointer(base);
             Pointer fieldObjRef = objPointer.add(offset);
             Pointer fieldPointer = fieldObjRef.readWord(0);
-            log.string("  field: ").hex(fieldPointer);
+            log.string("  field: ").zhex(fieldPointer);
             log.string("]");
             return log;
         }
@@ -435,12 +438,10 @@ public final class PathExhibitor {
     public static class StackElement extends PathElement {
         private final Pointer stackSlot;
         private final CodePointer ip;
-        private final CodePointer deoptSourcePC;
         private final Pointer slotValue;
 
-        StackElement(Pointer stackSlot, CodePointer ip, DeoptimizedFrame deoptFrame) {
+        StackElement(Pointer stackSlot, CodePointer ip) {
             this.stackSlot = stackSlot;
-            this.deoptSourcePC = deoptFrame != null ? deoptFrame.getSourcePC() : WordFactory.nullPointer();
             this.ip = ip;
             this.slotValue = stackSlot.readWord(0);
         }
@@ -454,10 +455,9 @@ public final class PathExhibitor {
         @Override
         public Log toLog(Log log) {
             log.string("[stack:");
-            log.string("  slot: ").hex(stackSlot);
-            log.string("  deoptSourcePC: ").hex(deoptSourcePC);
-            log.string("  ip: ").hex(ip);
-            log.string("  value: ").hex(slotValue);
+            log.string("  slot: ").zhex(stackSlot);
+            log.string("  ip: ").zhex(ip);
+            log.string("  value: ").zhex(slotValue);
             log.string("]");
             return log;
         }
@@ -529,7 +529,7 @@ public final class PathExhibitor {
         private final PathEdge result;
 
         FindPathToObjectOperation(PathExhibitor exhibitor, Object object, PathEdge result) {
-            super("FindPathToObjectOperation", SystemEffect.SAFEPOINT);
+            super(VMOperationInfos.get(FindPathToObjectOperation.class, "Find path to object", SystemEffect.SAFEPOINT));
             this.exhibitor = exhibitor;
             this.object = object;
             this.result = result;

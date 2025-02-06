@@ -1,7 +1,5 @@
 #!/usr/bin/env bash
 #
-# ----------------------------------------------------------------------------------------------------
-#
 # Copyright (c) 2018, <year>, Oracle and/or its affiliates. All rights reserved.
 # DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
 #
@@ -25,7 +23,6 @@
 # or visit www.oracle.com if you need additional information or have any
 # questions.
 #
-# ----------------------------------------------------------------------------------------------------
 
 source="${BASH_SOURCE[0]}"
 while [ -h "$source" ] ; do
@@ -63,6 +60,8 @@ process_vm_arg() {
         for e in "${classpath_array[@]}"; do
             absolute_cp+=("$e")
         done
+    elif [[ "$vm_arg" == @* ]]; then
+        jvm_args+=("$vm_arg")
     else
         jvm_args+=("-$vm_arg")
     fi
@@ -102,6 +101,7 @@ cp_or_mp="$(IFS=: ; echo "${absolute_cp[*]}")"
 
 module_launcher="<module_launcher>"
 if [[ "${module_launcher}" == "True" ]]; then
+    main_class='--module <main_module>/<main_class>'
     app_path_arg="--module-path"
     IFS=" " read -ra add_exports <<< "<add_exports>"
     for e in "${add_exports[@]}"; do
@@ -109,10 +109,11 @@ if [[ "${module_launcher}" == "True" ]]; then
     done
 else
     app_path_arg="-cp"
+    main_class='<main_class>'
 fi
 
 if [[ "${VERBOSE_GRAALVM_LAUNCHERS}" == "true" ]]; then
     set -x
 fi
 
-exec "${location}/<jre_bin>/java" <extra_jvm_args> "${jvm_args[@]}" ${app_path_arg} "${cp_or_mp}" '<main_class>' "${launcher_args[@]}"
+exec "${location}/<jre_bin>/java" <extra_jvm_args> "${jvm_args[@]}" ${app_path_arg} "${cp_or_mp}" ${main_class} "${launcher_args[@]}"

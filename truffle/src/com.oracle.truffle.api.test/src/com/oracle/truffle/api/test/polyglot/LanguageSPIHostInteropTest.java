@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -40,11 +40,11 @@
  */
 package com.oracle.truffle.api.test.polyglot;
 
+import static org.hamcrest.MatcherAssert.assertThat;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertSame;
-import static org.junit.Assert.assertThat;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
@@ -55,6 +55,7 @@ import java.util.concurrent.Callable;
 
 import org.hamcrest.CoreMatchers;
 import org.junit.Before;
+import org.junit.BeforeClass;
 import org.junit.Test;
 
 import com.oracle.truffle.api.interop.InteropException;
@@ -62,10 +63,20 @@ import com.oracle.truffle.api.interop.InteropLibrary;
 import com.oracle.truffle.api.interop.TruffleObject;
 import com.oracle.truffle.api.interop.UnsupportedMessageException;
 import com.oracle.truffle.api.test.polyglot.ValueHostInteropTest.Data;
+import com.oracle.truffle.tck.tests.TruffleTestAssumptions;
 
 public class LanguageSPIHostInteropTest extends AbstractPolyglotTest {
 
     private static final InteropLibrary INTEROP = InteropLibrary.getFactory().getUncached();
+
+    @BeforeClass
+    public static void runWithWeakEncapsulationOnly() {
+        TruffleTestAssumptions.assumeWeakEncapsulation();
+    }
+
+    public LanguageSPIHostInteropTest() {
+        needsLanguageEnv = true;
+    }
 
     @Before
     public void before() {
@@ -87,7 +98,7 @@ public class LanguageSPIHostInteropTest extends AbstractPolyglotTest {
         assertThat(value, CoreMatchers.anyOf(CoreMatchers.equalTo("/"), CoreMatchers.equalTo("\\")));
     }
 
-    static class TestClass {
+    public static class TestClass {
     }
 
     @Test

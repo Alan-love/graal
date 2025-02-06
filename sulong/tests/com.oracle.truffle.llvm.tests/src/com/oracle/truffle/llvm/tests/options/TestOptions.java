@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2016, 2021, Oracle and/or its affiliates.
+ * Copyright (c) 2016, 2023, Oracle and/or its affiliates.
  *
  * All rights reserved.
  *
@@ -37,6 +37,7 @@ public final class TestOptions {
     public static final String TEST_AOT_IMAGE = System.getProperty("sulongtest.testAOTImage");
     public static final String TEST_AOT_ARGS = System.getProperty("sulongtest.testAOTArgs");
     public static final String TEST_FILTER = System.getProperty("sulongtest.testFilter");
+    public static final String TEST_NAME_FILTER = System.getProperty("sulongtest.testNameFilter");
     public static final String PROJECT_ROOT = System.getProperty("sulongtest.projectRoot");
     public static final String CONFIG_ROOT = System.getProperty("sulongtest.configRoot");
 
@@ -44,7 +45,7 @@ public final class TestOptions {
      * Gets the path of an mx test distribution. The
      * {@link TestEngineConfig#getDistributionSuffix()} is added to the provided
      * {@code distribution} name.
-     * 
+     *
      * The properties are set in {@code mx_sulong} via (@code mx_unittest.add_config_participant}.
      */
     public static String getTestDistribution(String distribution) {

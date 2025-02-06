@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2020, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -56,17 +56,22 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import org.graalvm.polyglot.Context;
+import org.graalvm.polyglot.Engine;
+import org.graalvm.polyglot.ResourceLimits;
 import org.graalvm.polyglot.Source;
 import org.junit.Assert;
 import org.junit.Assume;
 import org.junit.Before;
 import org.junit.Test;
 
-import com.oracle.truffle.api.Truffle;
-import com.oracle.truffle.api.TruffleOptions;
-import com.oracle.truffle.api.impl.DefaultTruffleRuntime;
+import com.oracle.truffle.api.frame.VirtualFrame;
+import com.oracle.truffle.api.instrumentation.EventContext;
+import com.oracle.truffle.api.instrumentation.ExecutionEventListener;
+import com.oracle.truffle.api.instrumentation.SourceSectionFilter;
+import com.oracle.truffle.api.instrumentation.StandardTags;
 import com.oracle.truffle.api.instrumentation.TruffleInstrument;
 import com.oracle.truffle.api.test.CompileImmediatelyCheck;
+import com.oracle.truffle.tck.tests.TruffleTestAssumptions;
 
 public class RetainedSizeComputationTest {
     @Before
@@ -76,8 +81,8 @@ public class RetainedSizeComputationTest {
 
     @Test
     public void testRetainedSizeSingleThreaded() throws IOException {
-        Assume.assumeFalse(TruffleOptions.AOT);
-        Assume.assumeFalse(Truffle.getRuntime() instanceof DefaultTruffleRuntime);
+        TruffleTestAssumptions.assumeNotAOT();
+        TruffleTestAssumptions.assumeOptimizingRuntime();
         try (Context context = Context.create()) {
             TruffleInstrument.Env instrumentEnv = context.getEngine().getInstruments().get("InstrumentationUpdateInstrument").lookup(TruffleInstrument.Env.class);
             context.initialize(InstrumentationTestLanguage.ID);
@@ -91,6 +96,43 @@ public class RetainedSizeComputationTest {
                 Assert.assertTrue(retainedSize < 16L * 1024L * 1024L);
             } finally {
                 context.leave();
+            }
+        }
+    }
+
+    @Test
+    public void testRetainedSizeWithStatementLimit() {
+        TruffleTestAssumptions.assumeNotAOT();
+        TruffleTestAssumptions.assumeOptimizingRuntime();
+        try (Engine engine = Engine.create()) {
+            Context.newBuilder().engine(engine).build().close();
+            ResourceLimits resourceLimits = ResourceLimits.newBuilder().statementLimit(5, source -> true).build();
+            try (Context context = Context.newBuilder().engine(engine).resourceLimits(resourceLimits).build()) {
+                TruffleInstrument.Env instrumentEnv = context.getEngine().getInstruments().get("InstrumentationUpdateInstrument").lookup(TruffleInstrument.Env.class);
+                context.initialize(InstrumentationTestLanguage.ID);
+                instrumentEnv.getInstrumenter().attachExecutionEventListener(SourceSectionFilter.newBuilder().tagIs(StandardTags.StatementTag.class).build(), new ExecutionEventListener() {
+                    @Override
+                    public void onEnter(EventContext ctx, VirtualFrame frame) {
+
+                    }
+
+                    @Override
+                    public void onReturnValue(EventContext ctx, VirtualFrame frame, Object result) {
+                        long retainedSize = instrumentEnv.calculateContextHeapSize(instrumentEnv.getEnteredContext(), 16L * 1024L * 1024L, new AtomicBoolean(false));
+                        Assert.assertTrue(retainedSize > 0L);
+                        Assert.assertTrue(retainedSize < 16L * 1024L * 1024L);
+                    }
+
+                    @Override
+                    public void onReturnExceptional(EventContext ctx, VirtualFrame frame, Throwable exception) {
+
+                    }
+                });
+                /*
+                 * StatementIncrementNode stores PolyglotContextImpl in frames. The retained size
+                 * computation should stop on PolyglotContextImpl and don't fail.
+                 */
+                context.eval(InstrumentationTestLanguage.ID, "ROOT(STATEMENT)");
             }
         }
     }
@@ -115,10 +157,10 @@ public class RetainedSizeComputationTest {
                 context.leave();
             }
         } catch (UnsupportedOperationException e) {
-            if (!TruffleOptions.AOT && !(Truffle.getRuntime() instanceof DefaultTruffleRuntime)) {
+            if (TruffleTestAssumptions.isNotAOT() && TruffleTestAssumptions.isOptimizingRuntime()) {
                 throw e;
             } else {
-                Assert.assertEquals("Polyglot context heap size calculation is not supported on current Truffle runtime.", e.getMessage());
+                Assert.assertEquals("Polyglot context heap size calculation is not supported on this platform.", e.getMessage());
             }
         }
     }
@@ -134,8 +176,8 @@ public class RetainedSizeComputationTest {
 
     @Test
     public void testRetainedSizeGradual() throws IOException, InterruptedException, ExecutionException {
-        Assume.assumeFalse(TruffleOptions.AOT);
-        Assume.assumeFalse(Truffle.getRuntime() instanceof DefaultTruffleRuntime);
+        TruffleTestAssumptions.assumeNotAOT();
+        TruffleTestAssumptions.assumeOptimizingRuntime();
         ExecutorService executor = Executors.newFixedThreadPool(1);
         List<Long> retainedSizesList = Collections.synchronizedList(new ArrayList<>());
         try (Context context = Context.create()) {
@@ -200,9 +242,11 @@ public class RetainedSizeComputationTest {
                 future.get();
             }
             long previousResult = 0;
+            int cnt = 0;
             for (long calculationResult : retainedSizesList) {
+                cnt++;
                 if (previousResult > 1024L * 1024L) {
-                    Assert.assertTrue(String.format("previousCalculationResult = %d, calculationResult = %d", previousResult, calculationResult),
+                    Assert.assertTrue(String.format("previousCalculationResult = %d, calculationResult = %d, cnt = %d", previousResult, calculationResult, cnt),
                                     previousResult > 16L * 1024 * 1024L || previousResult <= calculationResult);
                 }
                 previousResult = calculationResult;
@@ -216,8 +260,8 @@ public class RetainedSizeComputationTest {
 
     @Test
     public void testRetainedSizeCanceledDuringCalculation() throws IOException, InterruptedException, ExecutionException {
-        Assume.assumeFalse(TruffleOptions.AOT);
-        Assume.assumeFalse(Truffle.getRuntime() instanceof DefaultTruffleRuntime);
+        TruffleTestAssumptions.assumeNotAOT();
+        TruffleTestAssumptions.assumeOptimizingRuntime();
         ExecutorService executor = Executors.newFixedThreadPool(1);
         List<Long> retainedSizesList = Collections.synchronizedList(new ArrayList<>());
         try (Context context = Context.create()) {
@@ -309,8 +353,8 @@ public class RetainedSizeComputationTest {
 
     @Test
     public void testRetainedSizeMultiThreaded() throws IOException, InterruptedException, ExecutionException {
-        Assume.assumeFalse(TruffleOptions.AOT);
-        Assume.assumeFalse(Truffle.getRuntime() instanceof DefaultTruffleRuntime);
+        TruffleTestAssumptions.assumeNotAOT();
+        TruffleTestAssumptions.assumeOptimizingRuntime();
         Random rnd = new Random();
         ExecutorService executor = Executors.newFixedThreadPool(10);
         List<Long> retainedSizesList = Collections.synchronizedList(new ArrayList<>());

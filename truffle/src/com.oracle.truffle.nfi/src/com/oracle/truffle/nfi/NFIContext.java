@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2019, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -40,33 +40,26 @@
  */
 package com.oracle.truffle.nfi;
 
-import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
-import org.graalvm.collections.EconomicMap;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.locks.ReentrantLock;
 
+import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
+import com.oracle.truffle.api.TruffleLanguage.ContextReference;
 import com.oracle.truffle.api.TruffleLanguage.Env;
+import com.oracle.truffle.api.TruffleSafepoint;
+import com.oracle.truffle.api.dsl.Bind;
 import com.oracle.truffle.api.nodes.LanguageInfo;
+import com.oracle.truffle.api.nodes.Node;
 import com.oracle.truffle.nfi.backend.spi.NFIBackend;
 import com.oracle.truffle.nfi.backend.spi.NFIBackendFactory;
-import com.oracle.truffle.nfi.backend.spi.NFIBackendTools;
 
+@Bind.DefaultExpression("get($node)")
 final class NFIContext {
 
-    private static final class NFIBackendToolsImpl extends NFIBackendTools {
-
-        private final String backend;
-
-        NFIBackendToolsImpl(String backend) {
-            this.backend = backend.intern();
-        }
-
-        @Override
-        public Object createBindableSymbol(Object symbol) {
-            return NFISymbol.createBindable(backend, symbol);
-        }
-    }
-
     Env env;
-    final EconomicMap<String, API> apiCache = EconomicMap.create();
+    final ReentrantLock apiCacheLock = new ReentrantLock();
+    final Map<String, API> apiCache = new ConcurrentHashMap<>();
 
     NFIContext(Env env) {
         this.env = env;
@@ -77,18 +70,16 @@ final class NFIContext {
         this.apiCache.clear();
     }
 
-    NFIBackend getBackend(String id) {
-        return getAPI(id).backend;
-    }
-
     @TruffleBoundary
-    API getAPI(String backendId) {
+    API getAPI(String backendId, Node node) {
         API ret = apiCache.get(backendId);
         if (ret != null) {
             return ret;
         }
 
-        synchronized (apiCache) {
+        TruffleSafepoint.setBlockedThreadInterruptible(node, ReentrantLock::lockInterruptibly, apiCacheLock);
+
+        try {
             ret = apiCache.get(backendId);
             if (ret != null) {
                 return ret;
@@ -104,14 +95,22 @@ final class NFIContext {
                     // force initialization of the backend language
                     env.initializeLanguage(language);
 
-                    NFIBackend backend = backendFactory.createBackend(new NFIBackendToolsImpl(backendId));
+                    NFIBackend backend = backendFactory.createBackend(NFILanguage.get(null).nfiState);
                     API api = new API(backendId, backend);
                     apiCache.put(backendFactory.getBackendId(), api);
                     return api;
                 }
             }
+        } finally {
+            apiCacheLock.unlock();
         }
 
-        return null;
+        throw new NFIParserException(String.format("Unknown NFI backend '%s'.", backendId), false);
+    }
+
+    private static final ContextReference<NFIContext> REFERENCE = ContextReference.create(NFILanguage.class);
+
+    static NFIContext get(Node node) {
+        return REFERENCE.get(node);
     }
 }

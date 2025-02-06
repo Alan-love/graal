@@ -24,9 +24,7 @@
  */
 package com.oracle.graal.pointsto.flow;
 
-import org.graalvm.compiler.nodes.ValueNode;
-
-import com.oracle.graal.pointsto.BigBang;
+import com.oracle.graal.pointsto.PointsToAnalysis;
 import com.oracle.graal.pointsto.meta.AnalysisType;
 import com.oracle.graal.pointsto.typestate.TypeState;
 
@@ -38,25 +36,27 @@ import jdk.vm.ci.code.BytecodePosition;
 public class FilterTypeFlow extends TypeFlow<BytecodePosition> {
 
     /**
-     * If the filter is exact we only compare with the {@link #declaredType}, not including its
+     * If the filter is exact we only compare with the {@link #filterType}, not including its
      * instantiated sub-types, otherwise we compare with the entire type hierarchy rooted at
-     * {@link #declaredType}.
+     * {@link #filterType}.
      */
     private final boolean isExact;
     /** True if the filter allows types assignable from the test type, false otherwise. */
     private final boolean isAssignable;
     /** True if the filter allows null, false otherwise. */
     private final boolean includeNull;
+    /**
+     * Track the type to filter against. This is needed since declaredType == filterType only when
+     * isAssignable is set.
+     */
+    private final AnalysisType filterType;
 
-    public FilterTypeFlow(ValueNode node, AnalysisType filterType, boolean isAssignable, boolean includeNull) {
-        this(node, filterType, false, isAssignable, includeNull);
-    }
-
-    public FilterTypeFlow(ValueNode node, AnalysisType filterType, boolean isExact, boolean isAssignable, boolean includeNull) {
-        super(node.getNodeSourcePosition(), filterType);
+    public FilterTypeFlow(BytecodePosition position, AnalysisType filterType, boolean isExact, boolean isAssignable, boolean includeNull) {
+        super(position, isAssignable ? filterType : null);
         this.isExact = isExact;
         this.isAssignable = isAssignable;
         this.includeNull = includeNull;
+        this.filterType = filterType;
     }
 
     public FilterTypeFlow(MethodFlowsGraph methodFlows, FilterTypeFlow original) {
@@ -64,21 +64,16 @@ public class FilterTypeFlow extends TypeFlow<BytecodePosition> {
         this.isExact = original.isExact;
         this.isAssignable = original.isAssignable;
         this.includeNull = original.includeNull;
+        this.filterType = original.filterType;
     }
 
     @Override
-    public TypeFlow<BytecodePosition> copy(BigBang bb, MethodFlowsGraph methodFlows) {
+    public TypeFlow<BytecodePosition> copy(PointsToAnalysis bb, MethodFlowsGraph methodFlows) {
         return new FilterTypeFlow(methodFlows, this);
     }
 
     @Override
-    public TypeState filter(BigBang bb, TypeState update) {
-        if (update.isUnknown()) {
-            // Filtering UnknownTypeState would otherwise return EmptyTypeState.
-            bb.reportIllegalUnknownUse(graphRef.getMethod(), source, "Illegal: Filter of UnknownTypeState objects.");
-            return TypeState.forEmpty();
-        }
-
+    public TypeState filter(PointsToAnalysis bb, TypeState update) {
         TypeState result;
         if (isExact) {
             /*
@@ -86,9 +81,9 @@ public class FilterTypeFlow extends TypeFlow<BytecodePosition> {
              * its entire hierarchy.
              */
             if (isAssignable) {
-                result = TypeState.forIntersection(bb, update, TypeState.forExactType(bb, declaredType, includeNull));
+                result = TypeState.forIntersection(bb, update, TypeState.forExactType(bb, filterType, includeNull));
             } else {
-                result = TypeState.forSubtraction(bb, update, TypeState.forExactType(bb, declaredType, !includeNull));
+                result = TypeState.forSubtraction(bb, update, TypeState.forExactType(bb, filterType, !includeNull));
             }
         } else {
             /*
@@ -97,43 +92,77 @@ public class FilterTypeFlow extends TypeFlow<BytecodePosition> {
              * instantiated sub-types).
              */
             if (isAssignable) {
-                result = TypeState.forIntersection(bb, update, declaredType.getTypeFlow(bb, includeNull).getState());
+                result = TypeState.forIntersection(bb, update, filterType.getAssignableTypes(includeNull));
             } else {
-                result = TypeState.forSubtraction(bb, update, declaredType.getTypeFlow(bb, !includeNull).getState());
+                result = TypeState.forSubtraction(bb, update, filterType.getAssignableTypes(!includeNull));
             }
         }
         return result;
     }
 
     @Override
-    protected void onInputSaturated(BigBang bb, TypeFlow<?> input) {
-        if (isAssignable) {
-            TypeFlow<?> sourceFlow = declaredType.getTypeFlow(bb, includeNull);
+    public void addPredicated(PointsToAnalysis bb, TypeFlow<?> predicatedFlow) {
+        if (isAssignable && isSaturated()) {
+            filterType.getTypeFlow(bb, includeNull).addPredicated(bb, predicatedFlow);
+            return;
+        }
+        super.addPredicated(bb, predicatedFlow);
+    }
 
-            /*
-             * First mark this flow as saturated, then swap it out at its uses/observers with its
-             * declared type flow. Marking this flow as saturated first is important: if there are
-             * any uses or observers *in-flight*, i.e., not yet registered at this point, trying to
-             * swap-out will have no effect on those. However, if this flow is already marked as
-             * saturated when the use or observer *lands*, even if that happens while/after
-             * swapping-out, then the corresponding use or observer will be notified of its input
-             * saturation. Otherwise it may neighter get the saturation signal OR get swapped-out.
-             * 
-             * The downside in the later case is that the input/observer will lose the more precise
-             * type information that swapping-out would have provided and will just use the more
-             * conservative approximation, e.g., the target method declared type for invokes.
-             */
-            setSaturated();
-            swapOut(bb, sourceFlow);
+    @Override
+    protected void onInputSaturated(PointsToAnalysis bb, TypeFlow<?> input) {
+        if (bb.isClosed(filterType)) {
+            if (isAssignable) {
+                /*
+                 * If the filter type is closed stop saturation propagation to dependent flows and
+                 * instead use the upper limit type, i.e., the filter type, as a safe approximation.
+                 */
+                if (!setSaturated()) {
+                    return;
+                }
+                /* Swap this flow out at uses/observers/predicated flows with its filter type. */
+                swapOut(bb, filterType.getTypeFlow(bb, includeNull));
+            } else {
+                /*
+                 * For the non-assignable branch simply propagate the saturation stamp through the
+                 * filter flow.
+                 */
+                super.onInputSaturated(bb, input);
+            }
         } else {
+            /*
+             * /* For open types simply propagate the saturation stamp through the filter flow, just
+             * like for the non-assignable branch. GR-59312 will preserve and propagate the upper
+             * limit type also for open types.
+             */
             super.onInputSaturated(bb, input);
         }
     }
 
     @Override
-    public boolean addState(BigBang bb, TypeState add) {
-        assert this.isClone();
-        return super.addState(bb, add);
+    protected void notifyUseOfSaturation(PointsToAnalysis bb, TypeFlow<?> use) {
+        if (bb.isClosed(filterType)) {
+            if (isAssignable) {
+                swapAtUse(bb, filterType.getTypeFlow(bb, includeNull), use);
+            } else {
+                super.notifyUseOfSaturation(bb, use);
+            }
+        } else {
+            super.notifyUseOfSaturation(bb, use);
+        }
+    }
+
+    @Override
+    protected void notifyObserverOfSaturation(PointsToAnalysis bb, TypeFlow<?> observer) {
+        if (bb.isClosed(filterType)) {
+            if (isAssignable) {
+                swapAtObserver(bb, filterType.getTypeFlow(bb, includeNull), observer);
+            } else {
+                super.notifyObserverOfSaturation(bb, observer);
+            }
+        } else {
+            super.notifyObserverOfSaturation(bb, observer);
+        }
     }
 
     public boolean isExact() {
@@ -150,6 +179,6 @@ public class FilterTypeFlow extends TypeFlow<BytecodePosition> {
 
     @Override
     public String toString() {
-        return "FilterTypeFlow<" + declaredType + ", isAssignable: " + isAssignable + ", includeNull: " + includeNull + ">";
+        return "FilterTypeFlow<" + filterType + ", isAssignable: " + isAssignable + ", includeNull: " + includeNull + ">";
     }
 }

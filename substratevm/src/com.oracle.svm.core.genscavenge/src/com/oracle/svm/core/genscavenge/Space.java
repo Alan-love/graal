@@ -24,44 +24,45 @@
  */
 package com.oracle.svm.core.genscavenge;
 
-import static org.graalvm.compiler.nodes.extended.BranchProbabilityNode.EXTREMELY_SLOW_PATH_PROBABILITY;
-import static org.graalvm.compiler.nodes.extended.BranchProbabilityNode.probability;
+import static jdk.graal.compiler.nodes.extended.BranchProbabilityNode.SLOW_PATH_PROBABILITY;
+import static jdk.graal.compiler.nodes.extended.BranchProbabilityNode.VERY_SLOW_PATH_PROBABILITY;
+import static jdk.graal.compiler.nodes.extended.BranchProbabilityNode.probability;
 
-import org.graalvm.compiler.word.Word;
+import org.graalvm.nativeimage.IsolateThread;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
 import org.graalvm.word.Pointer;
 import org.graalvm.word.UnsignedWord;
-import org.graalvm.word.WordFactory;
 
-import com.oracle.svm.core.MemoryWalker;
-import com.oracle.svm.core.SubstrateOptions;
+import com.oracle.svm.core.AlwaysInline;
+import com.oracle.svm.core.Uninterruptible;
 import com.oracle.svm.core.UnmanagedMemoryUtil;
-import com.oracle.svm.core.annotate.Uninterruptible;
+import com.oracle.svm.core.config.ConfigurationValues;
 import com.oracle.svm.core.genscavenge.GCImpl.ChunkReleaser;
 import com.oracle.svm.core.genscavenge.remset.RememberedSet;
+import com.oracle.svm.core.heap.ObjectHeader;
 import com.oracle.svm.core.heap.ObjectVisitor;
 import com.oracle.svm.core.hub.LayoutEncoding;
+import com.oracle.svm.core.identityhashcode.IdentityHashCodeSupport;
 import com.oracle.svm.core.log.Log;
 import com.oracle.svm.core.thread.VMOperation;
 import com.oracle.svm.core.thread.VMThreads;
-import com.oracle.svm.core.util.VMError;
+
+import jdk.graal.compiler.word.ObjectAccess;
+import jdk.graal.compiler.word.Word;
 
 /**
  * A Space is a collection of HeapChunks.
  *
  * Each Space keeps two collections: one of {@link AlignedHeapChunk} and one of
  * {@link UnalignedHeapChunk}.
- *
- * The Space for the YoungGeneration is special because it keeps Pointers to the "top" and "end" of
- * the current aligned allocation chunk for fast-path allocation without any indirections. The
- * complication is the "top" pointer has to be flushed back to the chunk to make the heap parsable.
  */
 public final class Space {
     private final String name;
-    private final boolean isFromSpace;
+    private final String shortName;
+    private final boolean isToSpace;
     private final int age;
-    private final SpaceAccounting accounting;
+    private final ChunksAccounting accounting;
 
     /* Heads and tails of the HeapChunk lists. */
     private AlignedHeapChunk.AlignedHeader firstAlignedHeapChunk;
@@ -75,12 +76,18 @@ public final class Space {
      * collections so they should not move.
      */
     @Platforms(Platform.HOSTED_ONLY.class)
-    Space(String name, boolean isFromSpace, int age) {
-        this.name = name;
+    Space(String name, String shortName, boolean isToSpace, int age) {
+        this(name, shortName, isToSpace, age, null);
+    }
+
+    @Platforms(Platform.HOSTED_ONLY.class)
+    Space(String name, String shortName, boolean isToSpace, int age, ChunksAccounting parentAccounting) {
         assert name != null : "Space name should not be null.";
-        this.isFromSpace = isFromSpace;
+        this.name = name;
+        this.shortName = shortName;
+        this.isToSpace = isToSpace;
         this.age = age;
-        this.accounting = new SpaceAccounting();
+        this.accounting = new ChunksAccounting(parentAccounting);
     }
 
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
@@ -88,6 +95,12 @@ public final class Space {
         return name;
     }
 
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    public String getShortName() {
+        return shortName;
+    }
+
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     public boolean isEmpty() {
         return (getFirstAlignedHeapChunk().isNull() && getFirstUnalignedHeapChunk().isNull());
     }
@@ -103,29 +116,46 @@ public final class Space {
         return age == 0;
     }
 
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     public boolean isYoungSpace() {
-        return age <= HeapPolicy.getMaxSurvivorSpaces();
+        return age <= HeapParameters.getMaxSurvivorSpaces();
     }
 
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     boolean isSurvivorSpace() {
-        return age > 0 && age <= HeapPolicy.getMaxSurvivorSpaces();
+        return age > 0 && age <= HeapParameters.getMaxSurvivorSpaces();
     }
 
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     public boolean isOldSpace() {
-        return age == (HeapPolicy.getMaxSurvivorSpaces() + 1);
+        return age == (HeapParameters.getMaxSurvivorSpaces() + 1);
     }
 
+    @AlwaysInline("GC performance.")
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    public boolean isCompactingOldSpace() {
+        return SerialGCOptions.useCompactingOldGen() && isOldSpace();
+    }
+
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     int getAge() {
         return age;
     }
 
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     int getNextAgeForPromotion() {
         return age + 1;
     }
 
+    @AlwaysInline("GC performance.")
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     boolean isFromSpace() {
-        return isFromSpace;
+        return !isToSpace && !isCompactingOldSpace();
+    }
+
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    boolean isToSpace() {
+        return isToSpace;
     }
 
     public boolean walkObjects(ObjectVisitor visitor) {
@@ -146,108 +176,86 @@ public final class Space {
         return true;
     }
 
-    /** Report some statistics about this Space. */
-    public Log report(Log log, boolean traceHeapChunks) {
-        log.string("[").string(getName()).string(":").indent(true);
-        accounting.report(log);
-        if (traceHeapChunks) {
-            if (getFirstAlignedHeapChunk().isNonNull()) {
-                log.newline().string("aligned chunks:").redent(true);
-                for (AlignedHeapChunk.AlignedHeader aChunk = getFirstAlignedHeapChunk(); aChunk.isNonNull(); aChunk = HeapChunk.getNext(aChunk)) {
-                    log.newline().hex(aChunk).string(" (").hex(AlignedHeapChunk.getObjectsStart(aChunk)).string("-").hex(HeapChunk.getTopPointer(aChunk)).string(")");
-                }
-                log.redent(false);
+    boolean walkAlignedHeapChunks(AlignedHeapChunk.Visitor visitor) {
+        AlignedHeapChunk.AlignedHeader chunk = getFirstAlignedHeapChunk();
+        while (chunk.isNonNull()) {
+            if (!visitor.visitChunk(chunk)) {
+                return false;
             }
-            if (getFirstUnalignedHeapChunk().isNonNull()) {
-                log.newline().string("unaligned chunks:").redent(true);
-                for (UnalignedHeapChunk.UnalignedHeader uChunk = getFirstUnalignedHeapChunk(); uChunk.isNonNull(); uChunk = HeapChunk.getNext(uChunk)) {
-                    log.newline().hex(uChunk).string(" (").hex(UnalignedHeapChunk.getObjectStart(uChunk)).string("-").hex(HeapChunk.getTopPointer(uChunk)).string(")");
-                }
-                log.redent(false);
-            }
+            chunk = HeapChunk.getNext(chunk);
         }
-        log.redent(false).string("]");
-        return log;
+        return true;
+    }
+
+    public void logUsage(Log log, boolean logIfEmpty) {
+        UnsignedWord chunkBytes;
+        if (isEdenSpace() && !VMOperation.isGCInProgress()) {
+            chunkBytes = HeapImpl.getAccounting().getEdenUsedBytes();
+        } else {
+            chunkBytes = getChunkBytes();
+        }
+
+        if (logIfEmpty || chunkBytes.aboveThan(0)) {
+            log.string(getName()).string(": ").rational(chunkBytes, GCImpl.M, 2).string("M (")
+                            .rational(accounting.getAlignedChunkBytes(), GCImpl.M, 2).string("M in ").signed(accounting.getAlignedChunkCount()).string(" aligned chunks, ")
+                            .rational(accounting.getUnalignedChunkBytes(), GCImpl.M, 2).string("M in ").signed(accounting.getUnalignedChunkCount()).string(" unaligned chunks)").newline();
+        }
+    }
+
+    public void logChunks(Log log) {
+        HeapChunkLogging.logChunks(log, getFirstAlignedHeapChunk(), shortName, isToSpace());
+        HeapChunkLogging.logChunks(log, getFirstUnalignedHeapChunk(), shortName, isToSpace());
     }
 
     /**
      * Allocate memory from an AlignedHeapChunk in this Space.
-     *
-     * This is "slow-path" memory allocation.
      */
+    @AlwaysInline("GC performance")
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     private Pointer allocateMemory(UnsignedWord objectSize) {
-        Log trace = Log.noopLog().string("[Space.allocateMemory:").string("  space: ").string(getName()).string("  size: ").unsigned(objectSize).newline();
-        Pointer result = WordFactory.nullPointer();
-        /* First try allocating in the last chunk. */
+        Pointer result = Word.nullPointer();
+        /* Fast-path: try allocating in the last chunk. */
         AlignedHeapChunk.AlignedHeader oldChunk = getLastAlignedHeapChunk();
-        trace.string("  oldChunk: ").hex(oldChunk);
         if (oldChunk.isNonNull()) {
             result = AlignedHeapChunk.allocateMemory(oldChunk, objectSize);
-            trace.string("  oldChunk provides: ").hex(result);
         }
-        /* If oldChunk did not provide, try allocating a new chunk for the requested memory. */
-        if (result.isNull()) {
-            AlignedHeapChunk.AlignedHeader newChunk = requestAlignedHeapChunk();
-            trace.string("  newChunk: ").hex(newChunk);
-            if (newChunk.isNonNull()) {
-                /* Allocate the Object within the new chunk. */
-                result = AlignedHeapChunk.allocateMemory(newChunk, objectSize);
-                if (isSurvivorSpace()) {
-                    trace.string("  newSurvivorChunk provides: ").hex(result);
-                } else {
-                    trace.string("  newChunk provides: ").hex(result);
-                }
-            }
+        if (result.isNonNull()) {
+            return result;
         }
-        trace.string("  returns: ").hex(result).string("]").newline();
-        return result;
+        /* Slow-path: try allocating a new chunk for the requested memory. */
+        return allocateInNewChunk(objectSize);
     }
 
-    /**
-     * Promote the HeapChunk containing an Object from its original space to this Space.
-     *
-     * This turns all the Objects in the chunk from white to grey: the objects are in this Space,
-     * but have not yet had their interior pointers visited.
-     */
-    void promoteObjectChunk(Object original) {
-        if (ObjectHeaderImpl.isAlignedObject(original)) {
-            AlignedHeapChunk.AlignedHeader aChunk = AlignedHeapChunk.getEnclosingChunk(original);
-            Space originalSpace = HeapChunk.getSpace(aChunk);
-            if (originalSpace.isFromSpace()) {
-                promoteAlignedHeapChunk(aChunk, originalSpace);
-            }
-        } else {
-            assert ObjectHeaderImpl.isUnalignedObject(original);
-            UnalignedHeapChunk.UnalignedHeader uChunk = UnalignedHeapChunk.getEnclosingChunk(original);
-            Space originalSpace = HeapChunk.getSpace(uChunk);
-            if (originalSpace.isFromSpace()) {
-                promoteUnalignedHeapChunk(uChunk, originalSpace);
-            }
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    private Pointer allocateInNewChunk(UnsignedWord objectSize) {
+        AlignedHeapChunk.AlignedHeader newChunk = requestAlignedHeapChunk();
+        if (newChunk.isNonNull()) {
+            return AlignedHeapChunk.allocateMemory(newChunk, objectSize);
         }
+        return Word.nullPointer();
     }
 
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     public void releaseChunks(ChunkReleaser chunkReleaser) {
         chunkReleaser.add(firstAlignedHeapChunk);
         chunkReleaser.add(firstUnalignedHeapChunk);
 
-        firstAlignedHeapChunk = WordFactory.nullPointer();
-        lastAlignedHeapChunk = WordFactory.nullPointer();
-        firstUnalignedHeapChunk = WordFactory.nullPointer();
-        lastUnalignedHeapChunk = WordFactory.nullPointer();
+        firstAlignedHeapChunk = Word.nullPointer();
+        lastAlignedHeapChunk = Word.nullPointer();
+        firstUnalignedHeapChunk = Word.nullPointer();
+        lastUnalignedHeapChunk = Word.nullPointer();
         accounting.reset();
     }
 
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     void appendAlignedHeapChunk(AlignedHeapChunk.AlignedHeader aChunk) {
         /*
-         * This method is used from {@link PosixJavaThreads#detachThread(VMThread)}, so it can not
-         * guarantee that it is inside a VMOperation, only that there is some mutual exclusion.
+         * This method is used while detaching a thread, so it cannot guarantee that it is inside a
+         * VMOperation, only that there is some mutual exclusion.
          */
-        if (SubstrateOptions.MultiThreaded.getValue()) {
-            VMThreads.guaranteeOwnsThreadMutex("Trying to append an aligned heap chunk but no mutual exclusion.");
-        }
+        VMThreads.guaranteeOwnsThreadMutex("Trying to append an aligned heap chunk but no mutual exclusion.", true);
         appendAlignedHeapChunkUninterruptibly(aChunk);
-        accounting.noteAlignedHeapChunk(aChunk);
+        accounting.noteAlignedHeapChunk();
     }
 
     @Uninterruptible(reason = "Must not interact with garbage collections.")
@@ -255,7 +263,7 @@ public final class Space {
         AlignedHeapChunk.AlignedHeader oldLast = getLastAlignedHeapChunk();
         HeapChunk.setSpace(aChunk, this);
         HeapChunk.setPrevious(aChunk, oldLast);
-        HeapChunk.setNext(aChunk, WordFactory.nullPointer());
+        HeapChunk.setNext(aChunk, Word.nullPointer());
         if (oldLast.isNonNull()) {
             HeapChunk.setNext(oldLast, aChunk);
         }
@@ -265,10 +273,11 @@ public final class Space {
         }
     }
 
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     void extractAlignedHeapChunk(AlignedHeapChunk.AlignedHeader aChunk) {
         assert VMOperation.isGCInProgress() : "Should only be called by the collector.";
         extractAlignedHeapChunkUninterruptibly(aChunk);
-        accounting.unnoteAlignedHeapChunk(aChunk);
+        accounting.unnoteAlignedHeapChunk();
     }
 
     @Uninterruptible(reason = "Must not interact with garbage collections.")
@@ -285,20 +294,18 @@ public final class Space {
         } else {
             setLastAlignedHeapChunk(chunkPrev);
         }
-        HeapChunk.setNext(aChunk, WordFactory.nullPointer());
-        HeapChunk.setPrevious(aChunk, WordFactory.nullPointer());
+        HeapChunk.setNext(aChunk, Word.nullPointer());
+        HeapChunk.setPrevious(aChunk, Word.nullPointer());
         HeapChunk.setSpace(aChunk, null);
     }
 
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     void appendUnalignedHeapChunk(UnalignedHeapChunk.UnalignedHeader uChunk) {
         /*
-         * This method is used from {@link PosixJavaThreads#detachThread(VMThread)}, so it can not
-         * guarantee that it is inside a VMOperation, only that there is some mutual exclusion.
+         * This method is used while detaching a thread, so it cannot guarantee that it is inside a
+         * VMOperation, only that there is some mutual exclusion.
          */
-        if (SubstrateOptions.MultiThreaded.getValue()) {
-            VMThreads.guaranteeOwnsThreadMutex("Trying to append an unaligned chunk but no mutual exclusion.");
-        }
+        VMThreads.guaranteeOwnsThreadMutex("Trying to append an unaligned chunk but no mutual exclusion.", true);
         appendUnalignedHeapChunkUninterruptibly(uChunk);
         accounting.noteUnalignedHeapChunk(uChunk);
     }
@@ -308,7 +315,7 @@ public final class Space {
         UnalignedHeapChunk.UnalignedHeader oldLast = getLastUnalignedHeapChunk();
         HeapChunk.setSpace(uChunk, this);
         HeapChunk.setPrevious(uChunk, oldLast);
-        HeapChunk.setNext(uChunk, WordFactory.nullPointer());
+        HeapChunk.setNext(uChunk, Word.nullPointer());
         if (oldLast.isNonNull()) {
             HeapChunk.setNext(oldLast, uChunk);
         }
@@ -318,6 +325,7 @@ public final class Space {
         }
     }
 
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     void extractUnalignedHeapChunk(UnalignedHeapChunk.UnalignedHeader uChunk) {
         assert VMOperation.isGCInProgress() : "Trying to extract an unaligned chunk but not in a VMOperation.";
         extractUnalignedHeapChunkUninterruptibly(uChunk);
@@ -339,8 +347,8 @@ public final class Space {
             setLastUnalignedHeapChunk(chunkPrev);
         }
         /* Reset the fields that the result chunk keeps for Space. */
-        HeapChunk.setNext(uChunk, WordFactory.nullPointer());
-        HeapChunk.setPrevious(uChunk, WordFactory.nullPointer());
+        HeapChunk.setNext(uChunk, Word.nullPointer());
+        HeapChunk.setPrevious(uChunk, Word.nullPointer());
         HeapChunk.setSpace(uChunk, null);
     }
 
@@ -385,27 +393,40 @@ public final class Space {
     }
 
     /** Promote an aligned Object to this Space. */
-    Object promoteAlignedObject(Object original, Space originalSpace) {
+    @AlwaysInline("GC performance")
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    Object copyAlignedObject(Object original, Space originalSpace) {
         assert ObjectHeaderImpl.isAlignedObject(original);
-        assert this != originalSpace && originalSpace.isFromSpace();
+        assert originalSpace.isFromSpace() || (originalSpace == this && isCompactingOldSpace());
 
         Object copy = copyAlignedObject(original);
-        ObjectHeaderImpl.installForwardingPointer(original, copy);
+        if (copy != null) {
+            ObjectHeaderImpl.getObjectHeaderImpl().installForwardingPointer(original, copy);
+        }
         return copy;
     }
 
+    @AlwaysInline("GC performance")
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     private Object copyAlignedObject(Object originalObj) {
         assert VMOperation.isGCInProgress();
         assert ObjectHeaderImpl.isAlignedObject(originalObj);
 
-        UnsignedWord size = LayoutEncoding.getSizeFromObject(originalObj);
-        Pointer copyMemory = allocateMemory(size);
-        if (probability(EXTREMELY_SLOW_PATH_PROBABILITY, copyMemory.isNull())) {
-            Log failureLog = Log.log().string("[! Space.copyAlignedObject:").indent(true);
-            failureLog.string("  failure to allocate ").unsigned(size).string(" bytes").newline();
-            failureLog.string("  object to be promoted: ").object(originalObj).string(" header ").hex(ObjectHeaderImpl.readHeaderFromObject(originalObj)).newline();
-            failureLog.string(" !]").indent(false);
-            throw VMError.shouldNotReachHere("Promotion failure");
+        UnsignedWord originalSize = LayoutEncoding.getSizeFromObjectInlineInGC(originalObj, false);
+        UnsignedWord copySize = originalSize;
+        boolean addIdentityHashField = false;
+        if (ConfigurationValues.getObjectLayout().isIdentityHashFieldOptional()) {
+            Word header = ObjectHeader.readHeaderFromObject(originalObj);
+            if (probability(SLOW_PATH_PROBABILITY, ObjectHeaderImpl.hasIdentityHashFromAddressInline(header))) {
+                addIdentityHashField = true;
+                copySize = LayoutEncoding.getSizeFromObjectInlineInGC(originalObj, true);
+                assert copySize.aboveOrEqual(originalSize);
+            }
+        }
+
+        Pointer copyMemory = allocateMemory(copySize);
+        if (probability(VERY_SLOW_PATH_PROBABILITY, copyMemory.isNull())) {
+            return null;
         }
 
         /*
@@ -414,20 +435,37 @@ public final class Space {
          * later on anyways (the card table is also updated at that point if necessary).
          */
         Pointer originalMemory = Word.objectToUntrackedPointer(originalObj);
-        UnmanagedMemoryUtil.copyLongsForward(originalMemory, copyMemory, size);
+        UnmanagedMemoryUtil.copyLongsForward(originalMemory, copyMemory, originalSize);
 
         Object copy = copyMemory.toObject();
+        if (probability(SLOW_PATH_PROBABILITY, addIdentityHashField)) {
+            // Must do first: ensures correct object size below and in other places
+            int value = IdentityHashCodeSupport.computeHashCodeFromAddress(originalObj);
+            int offset = LayoutEncoding.getIdentityHashOffset(copy);
+            ObjectAccess.writeInt(copy, offset, value, IdentityHashCodeSupport.IDENTITY_HASHCODE_LOCATION);
+            ObjectHeaderImpl.getObjectHeaderImpl().setIdentityHashInField(copy);
+        }
         if (isOldSpace()) {
-            // If the object was promoted to the old gen, we need to take care of the remembered
-            // set bit and the first object table (even when promoting from old to old).
-            AlignedHeapChunk.AlignedHeader copyChunk = AlignedHeapChunk.getEnclosingChunk(copy);
-            RememberedSet.get().enableRememberedSetForObject(copyChunk, copy);
+            if (SerialGCOptions.useCompactingOldGen() && GCImpl.getGCImpl().isCompleteCollection()) {
+                /*
+                 * In a compacting complete collection, the remembered set bit is set already during
+                 * marking and the first object table is built later during compaction.
+                 */
+            } else {
+                /*
+                 * If an object was copied to the old generation, its remembered set bit must be set
+                 * and the first object table must be updated (even when copying from old to old).
+                 */
+                AlignedHeapChunk.AlignedHeader copyChunk = AlignedHeapChunk.getEnclosingChunk(copy);
+                RememberedSet.get().enableRememberedSetForObject(copyChunk, copy, copySize);
+            }
         }
         return copy;
     }
 
     /** Promote an AlignedHeapChunk by moving it to this space. */
-    private void promoteAlignedHeapChunk(AlignedHeapChunk.AlignedHeader chunk, Space originalSpace) {
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    void promoteAlignedHeapChunk(AlignedHeapChunk.AlignedHeader chunk, Space originalSpace) {
         assert this != originalSpace && originalSpace.isFromSpace();
 
         originalSpace.extractAlignedHeapChunk(chunk);
@@ -444,6 +482,7 @@ public final class Space {
     }
 
     /** Promote an UnalignedHeapChunk by moving it to this Space. */
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     void promoteUnalignedHeapChunk(UnalignedHeapChunk.UnalignedHeader chunk, Space originalSpace) {
         assert this != originalSpace && originalSpace.isFromSpace();
 
@@ -460,18 +499,22 @@ public final class Space {
         }
     }
 
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     private AlignedHeapChunk.AlignedHeader requestAlignedHeapChunk() {
-        assert VMOperation.isGCInProgress() : "Should only be called from the collector.";
-        AlignedHeapChunk.AlignedHeader aChunk = HeapImpl.getChunkProvider().produceAlignedChunk();
-        if (aChunk.isNonNull()) {
-            if (this.isOldSpace()) {
-                RememberedSet.get().enableRememberedSetForChunk(aChunk);
-            }
-            appendAlignedHeapChunk(aChunk);
+        AlignedHeapChunk.AlignedHeader chunk;
+        if (isYoungSpace()) {
+            assert isSurvivorSpace();
+            chunk = HeapImpl.getHeapImpl().getYoungGeneration().requestAlignedSurvivorChunk();
+        } else {
+            chunk = HeapImpl.getHeapImpl().getOldGeneration().requestAlignedChunk();
         }
-        return aChunk;
+        if (chunk.isNonNull()) {
+            appendAlignedHeapChunk(chunk);
+        }
+        return chunk;
     }
 
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     void absorb(Space src) {
         /*
          * Absorb the chunks of a source into this Space. I cannot just copy the lists, because each
@@ -491,21 +534,7 @@ public final class Space {
             appendUnalignedHeapChunk(uChunk);
             uChunk = next;
         }
-    }
-
-    boolean walkHeapChunks(MemoryWalker.Visitor visitor) {
-        boolean continueVisiting = true;
-        AlignedHeapChunk.AlignedHeader aChunk = getFirstAlignedHeapChunk();
-        while (continueVisiting && aChunk.isNonNull()) {
-            continueVisiting = visitor.visitHeapChunk(aChunk, AlignedHeapChunk.getMemoryWalkerAccess());
-            aChunk = HeapChunk.getNext(aChunk);
-        }
-        UnalignedHeapChunk.UnalignedHeader uChunk = getFirstUnalignedHeapChunk();
-        while (continueVisiting && uChunk.isNonNull()) {
-            continueVisiting = visitor.visitHeapChunk(uChunk, UnalignedHeapChunk.getMemoryWalkerAccess());
-            uChunk = HeapChunk.getNext(uChunk);
-        }
-        return continueVisiting;
+        assert src.isEmpty();
     }
 
     /**
@@ -514,17 +543,40 @@ public final class Space {
      */
     @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
     UnsignedWord getChunkBytes() {
-        assert !isEdenSpace() || VMOperation.isGCInProgress() : "eden data is only accurate during a GC";
-        return accounting.getAlignedChunkBytes().add(accounting.getUnalignedChunkBytes());
+        assert !isEdenSpace() || areEdenBytesCorrect() : "eden bytes are only accurate during a GC, or at a safepoint after a TLAB flush";
+        return getAlignedChunkBytes().add(accounting.getUnalignedChunkBytes());
+    }
+
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    private static boolean areEdenBytesCorrect() {
+        if (VMOperation.isGCInProgress()) {
+            return true;
+        } else if (VMOperation.isInProgressAtSafepoint()) {
+            /* Verify that there are no threads that have a TLAB. */
+            for (IsolateThread thread = VMThreads.firstThread(); thread.isNonNull(); thread = VMThreads.nextThread(thread)) {
+                ThreadLocalAllocation.Descriptor tlab = ThreadLocalAllocation.getTlab(thread);
+                if (tlab.getAlignedChunk().isNonNull() || tlab.getUnalignedChunk().isNonNull()) {
+                    return false;
+                }
+            }
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
+    UnsignedWord getAlignedChunkBytes() {
+        return accounting.getAlignedChunkBytes();
     }
 
     UnsignedWord computeObjectBytes() {
-        assert !isEdenSpace() || VMOperation.isGCInProgress() : "eden data is only accurate during a GC";
+        assert !isEdenSpace() || areEdenBytesCorrect() : "eden bytes are only accurate during a GC, or at a safepoint after a TLAB flush";
         return computeAlignedObjectBytes().add(computeUnalignedObjectBytes());
     }
 
     private UnsignedWord computeAlignedObjectBytes() {
-        UnsignedWord result = WordFactory.zero();
+        UnsignedWord result = Word.zero();
         AlignedHeapChunk.AlignedHeader aChunk = getFirstAlignedHeapChunk();
         while (aChunk.isNonNull()) {
             UnsignedWord allocatedBytes = HeapChunk.getTopOffset(aChunk).subtract(AlignedHeapChunk.getObjectsStartOffset());
@@ -535,7 +587,7 @@ public final class Space {
     }
 
     private UnsignedWord computeUnalignedObjectBytes() {
-        UnsignedWord result = WordFactory.zero();
+        UnsignedWord result = Word.zero();
         UnalignedHeapChunk.UnalignedHeader uChunk = getFirstUnalignedHeapChunk();
         while (uChunk.isNonNull()) {
             UnsignedWord allocatedBytes = HeapChunk.getTopOffset(uChunk).subtract(UnalignedHeapChunk.getObjectStartOffset());
@@ -544,81 +596,25 @@ public final class Space {
         }
         return result;
     }
-}
 
-/**
- * Accounting for a {@link Space}. For the eden space, the values are inaccurate outside of a GC
- * (see {@link HeapPolicy#getYoungUsedBytes()} and {@link HeapPolicy#getEdenUsedBytes()}.
- */
-final class SpaceAccounting {
-    private long alignedCount;
-    private UnsignedWord alignedChunkBytes;
-    private long unalignedCount;
-    private UnsignedWord unalignedChunkBytes;
+    boolean contains(Pointer p) {
+        AlignedHeapChunk.AlignedHeader aChunk = getFirstAlignedHeapChunk();
+        while (aChunk.isNonNull()) {
+            Pointer start = AlignedHeapChunk.getObjectsStart(aChunk);
+            if (start.belowOrEqual(p) && p.belowThan(HeapChunk.getTopPointer(aChunk))) {
+                return true;
+            }
+            aChunk = HeapChunk.getNext(aChunk);
+        }
 
-    @Platforms(Platform.HOSTED_ONLY.class)
-    SpaceAccounting() {
-        reset();
-    }
-
-    public void reset() {
-        alignedCount = 0L;
-        alignedChunkBytes = WordFactory.zero();
-        unalignedCount = 0L;
-        unalignedChunkBytes = WordFactory.zero();
-    }
-
-    public UnsignedWord getChunkBytes() {
-        return getAlignedChunkBytes().add(getUnalignedChunkBytes());
-    }
-
-    public long getAlignedChunkCount() {
-        return alignedCount;
-    }
-
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    public UnsignedWord getAlignedChunkBytes() {
-        return alignedChunkBytes;
-    }
-
-    public long getUnalignedChunkCount() {
-        return unalignedCount;
-    }
-
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    public UnsignedWord getUnalignedChunkBytes() {
-        return unalignedChunkBytes;
-    }
-
-    void report(Log reportLog) {
-        reportLog.string("aligned: ").unsigned(alignedChunkBytes).string("/").unsigned(alignedCount);
-        reportLog.string(" ");
-        reportLog.string("unaligned: ").unsigned(unalignedChunkBytes).string("/").unsigned(unalignedCount);
-    }
-
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    void noteAlignedHeapChunk(AlignedHeapChunk.AlignedHeader chunk) {
-        UnsignedWord size = AlignedHeapChunk.getCommittedObjectMemory(chunk);
-        alignedCount += 1;
-        alignedChunkBytes = alignedChunkBytes.add(size);
-    }
-
-    void unnoteAlignedHeapChunk(AlignedHeapChunk.AlignedHeader chunk) {
-        UnsignedWord size = AlignedHeapChunk.getCommittedObjectMemory(chunk);
-        alignedCount -= 1;
-        alignedChunkBytes = alignedChunkBytes.subtract(size);
-    }
-
-    @Uninterruptible(reason = "Called from uninterruptible code.", mayBeInlined = true)
-    void noteUnalignedHeapChunk(UnalignedHeapChunk.UnalignedHeader chunk) {
-        UnsignedWord size = UnalignedHeapChunk.getCommittedObjectMemory(chunk);
-        unalignedCount += 1;
-        unalignedChunkBytes = unalignedChunkBytes.add(size);
-    }
-
-    void unnoteUnalignedHeapChunk(UnalignedHeapChunk.UnalignedHeader chunk) {
-        UnsignedWord size = UnalignedHeapChunk.getCommittedObjectMemory(chunk);
-        unalignedCount -= 1;
-        unalignedChunkBytes = unalignedChunkBytes.subtract(size);
+        UnalignedHeapChunk.UnalignedHeader uChunk = getFirstUnalignedHeapChunk();
+        while (uChunk.isNonNull()) {
+            Pointer start = UnalignedHeapChunk.getObjectStart(uChunk);
+            if (start.belowOrEqual(p) && p.belowThan(HeapChunk.getTopPointer(uChunk))) {
+                return true;
+            }
+            uChunk = HeapChunk.getNext(uChunk);
+        }
+        return false;
     }
 }

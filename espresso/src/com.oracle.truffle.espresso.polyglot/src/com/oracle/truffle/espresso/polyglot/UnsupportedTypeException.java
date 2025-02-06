@@ -41,16 +41,18 @@
 
 package com.oracle.truffle.espresso.polyglot;
 
+import java.io.IOException;
+import java.io.NotSerializableException;
+import java.io.ObjectOutputStream;
+
 /**
  * An exception thrown if an interop {@link Object} does not support the type of one ore more
  * arguments.
  *
  * @since 21.0
  */
+@SuppressWarnings("serial")
 public final class UnsupportedTypeException extends InteropException {
-
-    private static final long serialVersionUID = 1857745390734085182L;
-
     private final Object[] suppliedValues;
 
     private UnsupportedTypeException(String message, Object[] suppliedValues) {
@@ -102,10 +104,7 @@ public final class UnsupportedTypeException extends InteropException {
      * caused this problem. An example for this is a language specific proxy mechanism that invokes
      * guest language code to describe an object. If the guest language code fails to execute and
      * this interop exception is a valid interpretation of the error, then the error should be
-     * provided as cause. The cause can then be used by the source language as new exception cause
-     * if the {@link InteropException} is translated to a source language error. If the
-     * {@link InteropException} is discarded, then the cause will most likely get discarded by the
-     * source language as well.
+     * provided as cause.
      *
      * @param cause the guest language exception that caused the error.
      * 
@@ -115,4 +114,8 @@ public final class UnsupportedTypeException extends InteropException {
         return new UnsupportedTypeException(hint, suppliedValues, cause);
     }
 
+    @SuppressWarnings({"static-method", "unused"})
+    private void writeObject(ObjectOutputStream outputStream) throws IOException {
+        throw new NotSerializableException(UnsupportedTypeException.class.getSimpleName() + " serialization is not supported.");
+    }
 }

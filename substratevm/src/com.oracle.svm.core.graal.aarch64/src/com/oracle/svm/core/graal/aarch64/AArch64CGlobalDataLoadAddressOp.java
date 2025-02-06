@@ -25,13 +25,13 @@
 package com.oracle.svm.core.graal.aarch64;
 
 import static jdk.vm.ci.code.ValueUtil.asRegister;
-import static org.graalvm.compiler.lir.LIRInstruction.OperandFlag.REG;
+import static jdk.graal.compiler.lir.LIRInstruction.OperandFlag.REG;
 
-import org.graalvm.compiler.asm.aarch64.AArch64Address;
-import org.graalvm.compiler.asm.aarch64.AArch64MacroAssembler;
-import org.graalvm.compiler.lir.LIRInstructionClass;
-import org.graalvm.compiler.lir.aarch64.AArch64LIRInstruction;
-import org.graalvm.compiler.lir.asm.CompilationResultBuilder;
+import jdk.graal.compiler.asm.aarch64.AArch64Address;
+import jdk.graal.compiler.asm.aarch64.AArch64MacroAssembler;
+import jdk.graal.compiler.lir.LIRInstructionClass;
+import jdk.graal.compiler.lir.aarch64.AArch64LIRInstruction;
+import jdk.graal.compiler.lir.asm.CompilationResultBuilder;
 import org.graalvm.word.Pointer;
 
 import com.oracle.svm.core.SubstrateUtil;
@@ -56,14 +56,15 @@ public final class AArch64CGlobalDataLoadAddressOp extends AArch64LIRInstruction
 
     @Override
     public void emitCode(CompilationResultBuilder crb, AArch64MacroAssembler masm) {
-        int bits = result.getPlatformKind().getSizeInBytes() * 8;
+        int addressBitSize = result.getPlatformKind().getSizeInBytes() * Byte.SIZE;
+        assert addressBitSize == 64;
         if (SubstrateUtil.HOSTED) {
             // AOT compilation: record patch that is fixed up later
             crb.compilationResult.recordDataPatch(masm.position(), new CGlobalDataReference(dataInfo));
             Register resultRegister = asRegister(result);
             if (dataInfo.isSymbolReference()) {
                 // Pure symbol reference: the data contains the symbol's address, load it
-                masm.adrpLdr(64, resultRegister, resultRegister);
+                masm.adrpLdr(addressBitSize, resultRegister, resultRegister);
             } else {
                 // Data: load its address
                 masm.adrpAdd(resultRegister);
@@ -74,7 +75,7 @@ public final class AArch64CGlobalDataLoadAddressOp extends AArch64LIRInstruction
             Pointer address = globalsBase.add(dataInfo.getOffset());
             masm.mov(asRegister(result), address.rawValue());
             if (dataInfo.isSymbolReference()) { // load data, which contains symbol's address
-                masm.ldr(bits, asRegister(result), AArch64Address.createBaseRegisterOnlyAddress(asRegister(result)));
+                masm.ldr(addressBitSize, asRegister(result), AArch64Address.createBaseRegisterOnlyAddress(addressBitSize, asRegister(result)));
             }
         }
     }

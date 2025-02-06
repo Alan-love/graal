@@ -27,7 +27,7 @@ import java.nio.ByteBuffer;
 
 import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
 import com.oracle.truffle.espresso.meta.Meta;
-import com.oracle.truffle.espresso.runtime.StaticObject;
+import com.oracle.truffle.espresso.runtime.staticobject.StaticObject;
 
 /**
  * These (incomplete) substitutions are just a band-aid to run critical internal code (e.g.
@@ -66,9 +66,9 @@ public final class Target_sun_misc_Perf {
 
     @Substitution(hasReceiver = true)
     @SuppressWarnings("unused")
-    public static @Host(ByteBuffer.class) StaticObject createLong(@Host(typeName = "Lsun/misc/Perf;") StaticObject self,
-                    @SuppressWarnings("unused") @Host(String.class) StaticObject name, int variability, int units, long value,
-                    @InjectMeta Meta meta) {
+    public static @JavaType(ByteBuffer.class) StaticObject createLong(@JavaType(internalName = "Lsun/misc/Perf;") StaticObject self,
+                    @SuppressWarnings("unused") @JavaType(String.class) StaticObject name, int variability, int units, long value,
+                    @Inject Meta meta) {
         if (units <= 0 || units > U_Last) {
             throw meta.throwException(meta.java_lang_IllegalArgumentException);
         }
@@ -88,7 +88,7 @@ public final class Target_sun_misc_Perf {
                 throw meta.throwException(meta.java_lang_IllegalArgumentException);
         }
 
-        return (StaticObject) meta.java_nio_ByteBuffer_wrap.invokeDirect(null, StaticObject.wrap(longToBytes(value), meta));
+        return (StaticObject) meta.java_nio_ByteBuffer_wrap.invokeDirectStatic(StaticObject.wrap(longToBytes(value), meta));
     }
 
     @Substitution

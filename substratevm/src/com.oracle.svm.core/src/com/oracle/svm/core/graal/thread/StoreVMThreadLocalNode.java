@@ -24,39 +24,63 @@
  */
 package com.oracle.svm.core.graal.thread;
 
-import static org.graalvm.compiler.nodeinfo.NodeCycles.CYCLES_2;
-import static org.graalvm.compiler.nodeinfo.NodeSize.SIZE_1;
+import static jdk.graal.compiler.nodeinfo.NodeCycles.CYCLES_2;
+import static jdk.graal.compiler.nodeinfo.NodeSize.SIZE_1;
 
-import org.graalvm.compiler.core.common.type.StampFactory;
-import org.graalvm.compiler.graph.NodeClass;
-import org.graalvm.compiler.nodeinfo.NodeInfo;
-import org.graalvm.compiler.nodes.AbstractStateSplit;
-import org.graalvm.compiler.nodes.ConstantNode;
-import org.graalvm.compiler.nodes.ValueNode;
-import org.graalvm.compiler.nodes.extended.JavaWriteNode;
-import org.graalvm.compiler.nodes.memory.OnHeapMemoryAccess.BarrierType;
-import org.graalvm.compiler.nodes.memory.address.AddressNode;
-import org.graalvm.compiler.nodes.memory.address.OffsetAddressNode;
-import org.graalvm.compiler.nodes.spi.Lowerable;
-import org.graalvm.compiler.nodes.spi.LoweringTool;
+import jdk.graal.compiler.core.common.memory.BarrierType;
+import jdk.graal.compiler.core.common.memory.MemoryOrderMode;
+import jdk.graal.compiler.core.common.type.StampFactory;
+import jdk.graal.compiler.graph.NodeClass;
+import jdk.graal.compiler.nodeinfo.NodeInfo;
+import jdk.graal.compiler.nodes.AbstractStateSplit;
+import jdk.graal.compiler.nodes.ConstantNode;
+import jdk.graal.compiler.nodes.ValueNode;
+import jdk.graal.compiler.nodes.extended.JavaWriteNode;
+import jdk.graal.compiler.nodes.memory.OrderedMemoryAccess;
+import jdk.graal.compiler.nodes.memory.SingleMemoryKill;
+import jdk.graal.compiler.nodes.memory.address.AddressNode;
+import jdk.graal.compiler.nodes.memory.address.OffsetAddressNode;
+import jdk.graal.compiler.nodes.spi.Lowerable;
+import jdk.graal.compiler.nodes.spi.LoweringTool;
+import org.graalvm.word.LocationIdentity;
 
 import com.oracle.svm.core.threadlocal.VMThreadLocalInfo;
 
 @NodeInfo(cycles = CYCLES_2, size = SIZE_1)
-public class StoreVMThreadLocalNode extends AbstractStateSplit implements Lowerable {
+public class StoreVMThreadLocalNode extends AbstractStateSplit implements VMThreadLocalAccess, Lowerable, SingleMemoryKill, OrderedMemoryAccess {
     public static final NodeClass<StoreVMThreadLocalNode> TYPE = NodeClass.create(StoreVMThreadLocalNode.class);
 
     protected final VMThreadLocalInfo threadLocalInfo;
     protected final BarrierType barrierType;
+    private final MemoryOrderMode memoryOrder;
     @Input protected ValueNode holder;
     @Input protected ValueNode value;
 
-    public StoreVMThreadLocalNode(VMThreadLocalInfo threadLocalInfo, ValueNode holder, ValueNode value, BarrierType barrierType) {
+    public StoreVMThreadLocalNode(VMThreadLocalInfo threadLocalInfo, ValueNode holder, ValueNode value, BarrierType barrierType,
+                    MemoryOrderMode memoryOrder) {
         super(TYPE, StampFactory.forVoid());
         this.threadLocalInfo = threadLocalInfo;
         this.barrierType = barrierType;
+        this.memoryOrder = memoryOrder;
         this.holder = holder;
         this.value = value;
+    }
+
+    public ValueNode getValue() {
+        return value;
+    }
+
+    @Override
+    public LocationIdentity getKilledLocationIdentity() {
+        if (ordersMemoryAccesses()) {
+            return LocationIdentity.any();
+        }
+        return threadLocalInfo.locationIdentity;
+    }
+
+    @Override
+    public MemoryOrderMode getMemoryOrder() {
+        return memoryOrder;
     }
 
     @Override
@@ -65,7 +89,7 @@ public class StoreVMThreadLocalNode extends AbstractStateSplit implements Lowera
 
         ConstantNode offset = ConstantNode.forLong(threadLocalInfo.offset, graph());
         AddressNode address = graph().unique(new OffsetAddressNode(holder, offset));
-        JavaWriteNode write = graph().add(new JavaWriteNode(threadLocalInfo.storageKind, address, threadLocalInfo.locationIdentity, value, barrierType, true));
+        JavaWriteNode write = graph().add(new JavaWriteNode(threadLocalInfo.storageKind, address, threadLocalInfo.locationIdentity, value, barrierType, true, true, memoryOrder));
         write.setStateAfter(stateAfter());
         graph().replaceFixedWithFixed(this, write);
         tool.getLowerer().lower(write, tool);

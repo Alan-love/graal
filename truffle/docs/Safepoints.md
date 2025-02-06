@@ -1,7 +1,13 @@
+---
+layout: docs
+toc_group: truffle
+link_title: Truffle Language Safepoint Tutorial
+permalink: /graalvm-as-a-platform/language-implementation-framework/Safepoint/
+---
 # Truffle Language Safepoint Tutorial
 
-As of 21.1 Truffle has support for guest language safepoints. 
-Truffle safepoints allow to interrupt the guest language execution to perform thread local actions submitted by a language or tool. 
+As of 21.1 Truffle has support for guest language safepoints.
+Truffle safepoints allow to interrupt the guest language execution to perform thread local actions submitted by a language or tool.
 A safepoint is a location during the guest language execution where the state is consistent and other operations can read its state.
 
 This replaces previous instrumentation or assumption-based approaches to safepoints, which required the code to be invalidated for a thread local action to be performed.
@@ -21,11 +27,11 @@ Common use-cases of Truffle language safepoints are:
 
 ## Language Support
 
-Safepoints are explicitly polled by invoking the `TruffleSafepoint.poll(Node)` method. 
-A Truffle guest language implementation must ensure that a safepoint is polled repeatedly within a constant time interval. 
-For example, a single arithmetic expression completes within a constant number of CPU cycles. 
-However, a loop that summarizes values over an array uses a non-constant time dependent on the actual array size. 
-This typically means that safepoints are best polled at the end of loops and at the end of function or method calls to cover recursion. 
+Safepoints are explicitly polled by invoking the `TruffleSafepoint.poll(Node)` method.
+A Truffle guest language implementation must ensure that a safepoint is polled repeatedly within a constant time interval.
+For example, a single arithmetic expression completes within a constant number of CPU cycles.
+However, a loop that summarizes values over an array uses a non-constant time dependent on the actual array size.
+This typically means that safepoints are best polled at the end of loops and at the end of function or method calls to cover recursion.
 In addition, any guest language code that blocks the execution, like guest language locks, need to use the  `TruffleSafepoint.setBlocked(Interrupter)` API to allow cooperative polling of safepoints while the thread is waiting.
 
 Please read more details on what steps language implementations need to take to support thread local actions in the [javadoc](https://www.graalvm.org/truffle/javadoc/com/oracle/truffle/api/TruffleSafepoint.html).
@@ -45,6 +51,16 @@ env.submitThreadLocal(null, new ThreadLocalAction(true /*side-effecting*/, true 
      protected void perform(Access access) {
          assert access.getThread() == Thread.currentThread();
      }
+
+    @Override
+    protected void notifyBlocked(Access access) {
+        assert access.getThread() == Thread.currentThread();
+    }
+
+    @Override
+    protected void notifyUnblocked(Access access) {
+        assert access.getThread() == Thread.currentThread();
+    }
 });
 
 ```
@@ -53,11 +69,11 @@ Read more in the [javadoc](https://www.graalvm.org/truffle/javadoc/com/oracle/tr
 
 ## Current Limitations
 
-There is currently no way to run thread local actions while the thread is executing in boundary annotated methods unless the method cooperatively polls safepoints or uses the blocking API. 
-Unfortunately it is not always possible to cooperatively poll safepoints, for example, if the code currently executes third party native code. 
-A future improvement will allow to run code for other threads while they are blocked. 
+There is currently no way to run thread local actions while the thread is executing in boundary annotated methods unless the method cooperatively polls safepoints or uses the blocking API.
+Unfortunately it is not always possible to cooperatively poll safepoints, for example, if the code currently executes third party native code.
+A future improvement will allow to run code for other threads while they are blocked.
 This is one of the reasons why it is recommended to use `ThreadLocalAction.Access.getThread()` instead of directly using `Thread.currentThread()`.
-When the native call returns it needs to wait for any thread local action that is currently executing for this thread. 
+When the native call returns it needs to wait for any thread local action that is currently executing for this thread.
 This will enable to collect guest language stack traces from other threads while they are blocked by uncooperative native code.
 Currently the action will be performed on the next safepoint location when the native code returns.
 
@@ -65,7 +81,7 @@ Currently the action will be performed on the next safepoint location when the n
 
 There are several debug options available:
 
-### Excercise safepoints with SafepointALot 
+### Excercise safepoints with SafepointALot
 
 SafepointALot is a tool to exercise every safepoint of an application and collect statistics.
 
@@ -80,22 +96,64 @@ graalvm/bin/js --engine.SafepointALot js-benchmarks/harness.js -- octane-deltabl
 Prints the following output to the log on context close:
 
 ```
-DeltaBlue: 540
-[engine] Safepoint Statistics
-  --------------------------------------------------------------------------------------
-   Thread Name         Safepoints | Interval     Avg              Min              Max
-  --------------------------------------------------------------------------------------
-   main                  48384054 |            0.425 us           0.1 us       44281.1 us
-  -------------------------------------------------------------------------------------
-   All threads           48384054 |            0.425 us           0.1 us       42281.1 us
+DeltaBlue: 3037
+[engine] Safepoint Statistics 
+  ------------------------------------------------------------------------------------------------------------------------------------------------------- 
+   Thread Name         Safepoints | Interval     Avg              Min              Max      | Blocked Intervals   Avg              Min              Max
+  ------------------------------------------------------------------------------------------------------------------------------------------------------- 
+   main                  83187332 |            0,452 us           0,2 us      104938,8 us   |      18            6,536 us           0,9 us          36,8 us
+  ------------------------------------------------------------------------------------------------------------------------------------------------------- 
+   All threads           83187332 |            0,452 us           0,2 us      104938,8 us   |      18            6,536 us           0,9 us          36,8 us
 ```
 
-It is recommended for guest language implementations to try to stay below 1ms on average. 
+It is recommended for guest language implementations to try to stay below 1ms on average.
 Note that precise timing can depend on CPU and interruptions by the GC.
 Since GC times are included in the safepoint interval times, it is expected that the maximum is close to the maximum GC interruption time.
 Future versions of this tool will be able to exclude GC interruption times from this statistic.
 
-### Trace thread local actions 
+The SafepointALot tool also does not interrupt blocking operations that typically wait for some resource to be available (e.g. IO, thread start).
+These blocked intervals are shown separately in the statistics. Ordinary thread local actions do interrupt blocking operations, and so the blocked intervals do not apply to them.
+
+### Find missing safepoint polls
+
+The option `TraceMissingSafepointPollInterval` helps to find missing safepoint polls, use it like:
+
+```
+$ bin/js --experimental-options --engine.TraceMissingSafepointPollInterval=20 -e 'print(6*7)'
+...
+42
+[engine] No TruffleSafepoint.poll() for 36ms on main (stacktrace 1ms after the last poll)
+	at java.base/java.lang.StringLatin1.replace(StringLatin1.java:312)
+	at java.base/java.lang.String.replace(String.java:2933)
+	at java.base/jdk.internal.loader.BuiltinClassLoader.defineClass(BuiltinClassLoader.java:801)
+	at java.base/jdk.internal.loader.BuiltinClassLoader.findClassInModuleOrNull(BuiltinClassLoader.java:741)
+	at java.base/jdk.internal.loader.BuiltinClassLoader.loadClassOrNull(BuiltinClassLoader.java:665)
+	at java.base/jdk.internal.loader.BuiltinClassLoader.loadClass(BuiltinClassLoader.java:639)
+	at java.base/jdk.internal.loader.ClassLoaders$AppClassLoader.loadClass(ClassLoaders.java:188)
+	at java.base/java.lang.ClassLoader.loadClass(ClassLoader.java:526)
+	at org.graalvm.truffle/com.oracle.truffle.polyglot.PolyglotValueDispatch.createInteropValue(PolyglotValueDispatch.java:1694)
+	at org.graalvm.truffle/com.oracle.truffle.polyglot.PolyglotLanguageInstance$1.apply(PolyglotLanguageInstance.java:149)
+	at org.graalvm.truffle/com.oracle.truffle.polyglot.PolyglotLanguageInstance$1.apply(PolyglotLanguageInstance.java:147)
+	at java.base/java.util.concurrent.ConcurrentHashMap.computeIfAbsent(ConcurrentHashMap.java:1708)
+	at org.graalvm.truffle/com.oracle.truffle.polyglot.PolyglotLanguageInstance.lookupValueCacheImpl(PolyglotLanguageInstance.java:147)
+	at org.graalvm.truffle/com.oracle.truffle.polyglot.PolyglotLanguageInstance.lookupValueCache(PolyglotLanguageInstance.java:137)
+	at org.graalvm.truffle/com.oracle.truffle.polyglot.PolyglotLanguageContext.asValue(PolyglotLanguageContext.java:948)
+	at org.graalvm.truffle/com.oracle.truffle.polyglot.PolyglotContextImpl.eval(PolyglotContextImpl.java:1686)
+	at org.graalvm.truffle/com.oracle.truffle.polyglot.PolyglotContextDispatch.eval(PolyglotContextDispatch.java:60)
+	at org.graalvm.polyglot/org.graalvm.polyglot.Context.eval(Context.java:402)
+	at org.graalvm.js.launcher/com.oracle.truffle.js.shell.JSLauncher.executeScripts(JSLauncher.java:365)
+	at org.graalvm.js.launcher/com.oracle.truffle.js.shell.JSLauncher.launch(JSLauncher.java:93)
+	at org.graalvm.launcher/org.graalvm.launcher.AbstractLanguageLauncher.launch(AbstractLanguageLauncher.java:296)
+	at org.graalvm.launcher/org.graalvm.launcher.AbstractLanguageLauncher.launch(AbstractLanguageLauncher.java:121)
+	at org.graalvm.launcher/org.graalvm.launcher.AbstractLanguageLauncher.runLauncher(AbstractLanguageLauncher.java:168)
+...
+```
+
+It prints host stacktraces when there was not a safepoint poll in the last N milliseconds, N being the argument to `TraceMissingSafepointPollInterval`.
+
+On HotSpot there can be long delays between guest safepoints due to classloading, so it makes sense to run this with a native image or focus on non-classloading stacktraces. 
+
+### Trace thread local actions
 
 The option `--engine.TraceThreadLocalActions` allows to trace all thread local actions of any origin.
 
@@ -173,8 +231,8 @@ Prints the following output:
 
 ## Further Reading
 
-Daloze, Benoit, Chris Seaton, Daniele Bonetta, and Hanspeter Mössenböck. 
-"Techniques and applications for guest-language safepoints." 
+Daloze, Benoit, Chris Seaton, Daniele Bonetta, and Hanspeter Mössenböck.
+"Techniques and applications for guest-language safepoints."
 In Proceedings of the 10th Workshop on Implementation, Compilation, Optimization of Object-Oriented Languages, Programs and Systems, pp. 1-10. 2015.
 
 [https://dl.acm.org/doi/abs/10.1145/2843915.2843921](https://dl.acm.org/doi/abs/10.1145/2843915.2843921)

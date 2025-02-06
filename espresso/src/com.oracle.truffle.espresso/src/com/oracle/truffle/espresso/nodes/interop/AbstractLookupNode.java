@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2022, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -26,21 +26,28 @@ package com.oracle.truffle.espresso.nodes.interop;
 import static java.lang.Math.max;
 import static java.lang.Math.min;
 
-import java.util.BitSet;
+import java.util.ArrayList;
 
 import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
 import com.oracle.truffle.api.interop.ArityException;
-import com.oracle.truffle.api.nodes.Node;
+import com.oracle.truffle.api.interop.UnknownIdentifierException;
+import com.oracle.truffle.espresso.classfile.descriptors.Name;
+import com.oracle.truffle.espresso.classfile.descriptors.Signature;
+import com.oracle.truffle.espresso.classfile.descriptors.Symbol;
 import com.oracle.truffle.espresso.impl.Klass;
 import com.oracle.truffle.espresso.impl.Method;
+import com.oracle.truffle.espresso.nodes.EspressoNode;
+import com.oracle.truffle.espresso.runtime.EspressoContext;
 
-public abstract class AbstractLookupNode extends Node {
+public abstract class AbstractLookupNode extends EspressoNode {
     public static final char METHOD_SELECTION_SEPARATOR = '/';
 
-    abstract Method[] getMethodArray(Klass k);
+    abstract Method.MethodVersion[] getMethodArray(Klass k);
 
     @TruffleBoundary
-    Method doLookup(Klass klass, String key, boolean publicOnly, boolean isStatic, int arity) throws ArityException {
+    Method[] doLookup(Klass klass, String key, boolean publicOnly, boolean isStatic, int arity) throws ArityException, UnknownIdentifierException {
+        EspressoContext ctx = getContext();
+        ArrayList<Method> result = new ArrayList<>();
         String methodName;
         String signature = null;
         int separatorIndex = key.indexOf(METHOD_SELECTION_SEPARATOR);
@@ -50,39 +57,49 @@ public abstract class AbstractLookupNode extends Node {
         } else {
             methodName = key;
         }
-        Method result = null;
+        Symbol<Name> name = ctx.getNames().lookup(methodName);
+        if (name == null) {
+            throw UnknownIdentifierException.create(methodName);
+        }
+        Symbol<Signature> sig = null;
+        if (signature != null) {
+            sig = ctx.getSignatures().lookupValidSignature(signature);
+            if (sig == null) {
+                throw UnknownIdentifierException.create(methodName);
+            }
+        }
+
         int minOverallArity = Integer.MAX_VALUE;
         int maxOverallArity = -1;
-        for (Method m : getMethodArray(klass)) {
-            if (matchMethod(m, methodName, signature, isStatic, publicOnly)) {
-                int matchArity = m.getParameterCount();
+        boolean skipArityCheck = arity == -1;
+        boolean memberFound = false;
+        for (Method.MethodVersion m : getMethodArray(klass)) {
+            if (matchMethod(m.getMethod(), name, sig, isStatic, publicOnly)) {
+                memberFound = true;
+                int matchArity = m.getMethod().getParameterCount();
                 minOverallArity = min(minOverallArity, matchArity);
                 maxOverallArity = max(maxOverallArity, matchArity);
-                if (matchArity == arity) {
-                    if (result != null) {
-                        /*
-                         * Multiple methods with the same name and arity (if specified), cannot
-                         * disambiguate
-                         */
-                        return null;
-                    }
-                    result = m;
+                if (matchArity == arity || skipArityCheck || (m.getMethod().isVarargs() && arity >= matchArity - 1)) {
+                    result.add(m.getMethod());
                 }
             }
         }
-        if (result == null && maxOverallArity >= 0) {
-            throw ArityException.create(arity > maxOverallArity ? maxOverallArity : minOverallArity, arity);
+        if (!memberFound) {
+            throw UnknownIdentifierException.create(methodName);
         }
-        return result;
+        if (!skipArityCheck && result.isEmpty() && maxOverallArity >= 0) {
+            throw ArityException.create(minOverallArity, maxOverallArity, arity);
+        }
+        return result.isEmpty() ? null : result.toArray(Method.EMPTY_ARRAY);
     }
 
-    private static boolean matchMethod(Method m, String methodName, String signature, boolean isStatic, boolean publicOnly) {
+    private static boolean matchMethod(Method m, Symbol<Name> methodName, Symbol<Signature> signature, boolean isStatic, boolean publicOnly) {
         return (!publicOnly || m.isPublic()) &&
                         m.isStatic() == isStatic &&
                         !m.isSignaturePolymorphicDeclared() &&
-                        m.getName().toString().equals(methodName) &&
+                        methodName == m.getName() &&
                         // If signature is specified, do the check.
-                        (signature == null || m.getSignatureAsString().equals(signature));
+                        (signature == null || signature == m.getRawSignature());
     }
 
     @TruffleBoundary
@@ -96,17 +113,23 @@ public abstract class AbstractLookupNode extends Node {
         } else {
             methodName = key;
         }
-        BitSet seenArity = new BitSet();
-        // we will disambiguate overloads with arity
-        for (Method m : getMethodArray(klass)) {
-            if (matchMethod(m, methodName, signature, isStatic, publicOnly)) {
-                int arity = m.getParameterCount();
-                if (seenArity.get(arity)) {
-                    return false;
-                }
-                seenArity.set(arity);
+        EspressoContext ctx = getContext();
+        Symbol<Name> name = ctx.getNames().lookup(methodName);
+        if (name == null) {
+            return false;
+        }
+        Symbol<Signature> sig = null;
+        if (signature != null) {
+            sig = ctx.getSignatures().lookupValidSignature(signature);
+            if (sig == null) {
+                return false;
             }
         }
-        return !seenArity.isEmpty();
+        for (Method.MethodVersion m : getMethodArray(klass)) {
+            if (matchMethod(m.getMethod(), name, sig, isStatic, publicOnly)) {
+                return true;
+            }
+        }
+        return false;
     }
 }

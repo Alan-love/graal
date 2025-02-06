@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2020, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -40,6 +40,7 @@
  */
 package com.oracle.truffle.nfi.backend.spi;
 
+import com.oracle.truffle.api.dsl.GenerateAOT;
 import com.oracle.truffle.api.interop.ArityException;
 import com.oracle.truffle.api.interop.InteropLibrary;
 import com.oracle.truffle.api.interop.UnsupportedMessageException;
@@ -52,6 +53,7 @@ import com.oracle.truffle.nfi.backend.spi.types.NativeSimpleType;
  * Library that specifies the protocol between the Truffle NFI and its backend implementations.
  */
 @GenerateLibrary
+@GenerateAOT
 @SuppressWarnings("unused")
 public abstract class NFIBackendSignatureLibrary extends Library {
 
@@ -67,6 +69,9 @@ public abstract class NFIBackendSignatureLibrary extends Library {
      * The returned pointer should be a function pointer. Calling that function pointer sends the
      * {@link InteropLibrary#execute} message to the executable object. The returned object should
      * not be executable.
+     *
+     * NFI backends can assume that the execute message of the executable object will never throw.
+     * Exceptions are instead stored as "pending" and rethrown at the next managed frame.
      */
     public abstract Object createClosure(Object signature, Object executable);
 }

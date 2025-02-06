@@ -24,25 +24,25 @@
  */
 package com.oracle.svm.hosted.meta;
 
-import java.lang.annotation.Annotation;
-import java.lang.reflect.Field;
-
 import com.oracle.graal.pointsto.infrastructure.OriginalFieldProvider;
+import com.oracle.graal.pointsto.infrastructure.WrappedJavaField;
 import com.oracle.graal.pointsto.meta.AnalysisField;
+import com.oracle.graal.pointsto.meta.AnalysisUniverse;
+import com.oracle.svm.core.StaticFieldsSupport;
 import com.oracle.svm.core.meta.SharedField;
-import com.oracle.svm.core.meta.SubstrateObjectConstant;
+import com.oracle.svm.hosted.ameta.FieldValueInterceptionSupport;
+import com.oracle.svm.hosted.imagelayer.HostedImageLayerBuildingSupport;
+import com.oracle.svm.hosted.imagelayer.SVMImageLayerLoader;
 
 import jdk.vm.ci.meta.JavaConstant;
 import jdk.vm.ci.meta.JavaKind;
-import jdk.vm.ci.meta.JavaTypeProfile;
+import jdk.vm.ci.meta.ResolvedJavaField;
 
 /**
  * Store the compile-time information for a field in the Substrate VM, such as the field offset.
  */
-public class HostedField implements OriginalFieldProvider, SharedField, Comparable<HostedField> {
+public class HostedField extends HostedElement implements OriginalFieldProvider, SharedField, WrappedJavaField {
 
-    private final HostedUniverse universe;
-    private final HostedMetaAccess metaAccess;
     public final AnalysisField wrapped;
 
     private final HostedType holder;
@@ -50,25 +50,22 @@ public class HostedField implements OriginalFieldProvider, SharedField, Comparab
 
     protected int location;
 
-    private final JavaTypeProfile typeProfile;
-
     static final int LOC_UNMATERIALIZED_STATIC_CONSTANT = -10;
 
-    public HostedField(HostedUniverse universe, HostedMetaAccess metaAccess, AnalysisField wrapped, HostedType holder, HostedType type, JavaTypeProfile typeProfile) {
-        this.universe = universe;
-        this.metaAccess = metaAccess;
+    public HostedField(AnalysisField wrapped, HostedType holder, HostedType type) {
         this.wrapped = wrapped;
         this.holder = holder;
         this.type = type;
-        this.typeProfile = typeProfile;
         this.location = LOC_UNINITIALIZED;
     }
 
-    public JavaTypeProfile getFieldTypeProfile() {
-        return typeProfile;
+    @Override
+    public AnalysisField getWrapped() {
+        return wrapped;
     }
 
     protected void setLocation(int location) {
+        wrapped.checkGuaranteeFolded();
         assert this.location == LOC_UNINITIALIZED;
         assert location >= 0;
         this.location = location;
@@ -77,6 +74,10 @@ public class HostedField implements OriginalFieldProvider, SharedField, Comparab
     protected void setUnmaterializedStaticConstant() {
         assert this.location == LOC_UNINITIALIZED && isStatic();
         this.location = LOC_UNMATERIALIZED_STATIC_CONSTANT;
+    }
+
+    public boolean isUnmaterialized() {
+        return this.location == LOC_UNMATERIALIZED_STATIC_CONSTANT;
     }
 
     public boolean hasLocation() {
@@ -104,13 +105,23 @@ public class HostedField implements OriginalFieldProvider, SharedField, Comparab
         return wrapped.isAccessed();
     }
 
-    public boolean isInImageHeap() {
-        return wrapped.isInImageHeap();
+    @Override
+    public boolean isReachable() {
+        return wrapped.isReachable();
+    }
+
+    public boolean isRead() {
+        return wrapped.isRead();
     }
 
     @Override
     public boolean isWritten() {
         return wrapped.isWritten();
+    }
+
+    @Override
+    public boolean isValueAvailable() {
+        return FieldValueInterceptionSupport.singleton().isValueAvailable(wrapped);
     }
 
     @Override
@@ -138,23 +149,6 @@ public class HostedField implements OriginalFieldProvider, SharedField, Comparab
         return wrapped.hashCode();
     }
 
-    public JavaConstant readValue(JavaConstant receiver) {
-        JavaConstant wrappedReceiver;
-        if (receiver != null && SubstrateObjectConstant.asObject(receiver) instanceof Class) {
-            /* Manual object replacement from java.lang.Class to DynamicHub. */
-            wrappedReceiver = SubstrateObjectConstant.forObject(metaAccess.lookupJavaType((Class<?>) SubstrateObjectConstant.asObject(receiver)).getHub());
-        } else {
-            wrappedReceiver = receiver;
-        }
-        return universe.lookup(universe.getConstantReflectionProvider().readFieldValue(wrapped, wrappedReceiver));
-    }
-
-    public JavaConstant readStorageValue(JavaConstant receiver) {
-        JavaConstant result = readValue(receiver);
-        assert result.getJavaKind() == getType().getStorageKind() : this;
-        return result;
-    }
-
     @Override
     public HostedType getDeclaringClass() {
         return holder;
@@ -171,23 +165,8 @@ public class HostedField implements OriginalFieldProvider, SharedField, Comparab
     }
 
     @Override
-    public Annotation[] getAnnotations() {
-        return wrapped.getAnnotations();
-    }
-
-    @Override
-    public Annotation[] getDeclaredAnnotations() {
-        return wrapped.getDeclaredAnnotations();
-    }
-
-    @Override
-    public <T extends Annotation> T getAnnotation(Class<T> annotationClass) {
-        return wrapped.getAnnotation(annotationClass);
-    }
-
-    @Override
     public String toString() {
-        return "HostedField<" + format("%h.%n") + " location: " + location + "   " + wrapped.toString() + ">";
+        return "HostedField<" + format("%h.%n") + " -> " + wrapped.toString() + ", location: " + location + ">";
     }
 
     @Override
@@ -196,21 +175,23 @@ public class HostedField implements OriginalFieldProvider, SharedField, Comparab
     }
 
     @Override
-    public int compareTo(HostedField other) {
-        /*
-         * Order by JavaKind. This is required, since we want instance fields of the same size and
-         * kind consecutive.
-         */
-        int result = other.getJavaKind().ordinal() - this.getJavaKind().ordinal();
-        /*
-         * If the kind is the same, i.e., result == 0, we return 0 so that the sorting keeps the
-         * order unchanged and therefore keeps the field order we get from the hosting VM.
-         */
-        return result;
+    public ResolvedJavaField unwrapTowardsOriginalField() {
+        return wrapped;
     }
 
     @Override
-    public Field getJavaField() {
-        return OriginalFieldProvider.getJavaField(getDeclaringClass().universe.getSnippetReflection(), wrapped);
+    public boolean isInBaseLayer() {
+        return wrapped.isInBaseLayer();
+    }
+
+    @Override
+    public JavaConstant getStaticFieldBase() {
+        AnalysisUniverse universe = type.wrapped.getUniverse();
+        boolean primitive = getStorageKind().isPrimitive();
+        if (isInBaseLayer()) {
+            SVMImageLayerLoader imageLayerLoader = HostedImageLayerBuildingSupport.singleton().getLoader();
+            return primitive ? imageLayerLoader.getBaseLayerStaticPrimitiveFields() : imageLayerLoader.getBaseLayerStaticObjectFields();
+        }
+        return universe.getSnippetReflection().forObject(primitive ? StaticFieldsSupport.getStaticPrimitiveFields() : StaticFieldsSupport.getStaticObjectFields());
     }
 }

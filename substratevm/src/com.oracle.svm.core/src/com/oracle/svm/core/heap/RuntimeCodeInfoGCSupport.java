@@ -24,7 +24,7 @@
  */
 package com.oracle.svm.core.heap;
 
-import com.oracle.svm.core.annotate.Uninterruptible;
+import com.oracle.svm.core.Uninterruptible;
 import com.oracle.svm.core.code.CodeInfo;
 
 public abstract class RuntimeCodeInfoGCSupport {
@@ -53,20 +53,4 @@ public abstract class RuntimeCodeInfoGCSupport {
      */
     @Uninterruptible(reason = "Called when installing code.", callerMustBe = true)
     public abstract void registerDeoptMetadata(CodeInfo codeInfo);
-
-    /**
-     * Notify the GC that the application is going to invalidate run-time compiled code that has
-     * embedded references to Java heap objects. This notification must not be triggered if the GC
-     * itself frees a code metadata object.
-     */
-    @Uninterruptible(reason = "Called when freeing code.", callerMustBe = true)
-    public abstract void unregisterCodeConstants(CodeInfo codeInfo);
-
-    /**
-     * Notify the GC that the application is going to free a code metadata object that references
-     * Java heap objects from native-memory. This notification must not be triggered if the GC
-     * itself frees a code metadata object.
-     */
-    @Uninterruptible(reason = "Called when freeing code.", callerMustBe = true)
-    public abstract void unregisterRuntimeCodeInfo(CodeInfo codeInfo);
 }

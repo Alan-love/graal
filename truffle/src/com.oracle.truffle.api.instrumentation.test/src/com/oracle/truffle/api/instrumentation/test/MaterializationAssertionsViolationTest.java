@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2020, 2022, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -40,6 +40,9 @@
  */
 package com.oracle.truffle.api.instrumentation.test;
 
+import static org.hamcrest.MatcherAssert.assertThat;
+import static org.junit.Assert.assertThrows;
+
 import java.util.ArrayList;
 import java.util.LinkedList;
 import java.util.List;
@@ -50,13 +53,11 @@ import java.util.regex.Pattern;
 import org.graalvm.polyglot.Context;
 import org.graalvm.polyglot.PolyglotException;
 import org.graalvm.polyglot.Source;
+import org.hamcrest.core.StringContains;
 import org.junit.Before;
-import org.junit.Rule;
 import org.junit.Test;
-import org.junit.rules.ExpectedException;
 
 import com.oracle.truffle.api.CallTarget;
-import com.oracle.truffle.api.Truffle;
 import com.oracle.truffle.api.frame.VirtualFrame;
 import com.oracle.truffle.api.instrumentation.EventBinding;
 import com.oracle.truffle.api.instrumentation.EventContext;
@@ -76,8 +77,6 @@ import com.oracle.truffle.api.test.polyglot.ProxyLanguage;
 
 public class MaterializationAssertionsViolationTest extends AbstractPolyglotTest {
     private static final Pattern NODE_PATTERN = Pattern.compile("^S(\\d+)E(\\d+)\\((.*)\\)$");
-
-    @Rule public ExpectedException expectedException = ExpectedException.none();
 
     @GenerateWrapper
     static class CustomMaterializeNode extends Node implements InstrumentableNode {
@@ -154,6 +153,10 @@ public class MaterializationAssertionsViolationTest extends AbstractPolyglotTest
         }
     }
 
+    public MaterializationAssertionsViolationTest() {
+        needsInstrumentEnv = true;
+    }
+
     @Before
     public void setup() {
         setupEnv(Context.create(), new ProxyLanguage() {
@@ -212,7 +215,7 @@ public class MaterializationAssertionsViolationTest extends AbstractPolyglotTest
             protected CallTarget parse(ParsingRequest request) throws Exception {
                 com.oracle.truffle.api.source.Source source = request.getSource();
                 String code = source.getCharacters().toString();
-                CallTarget target = Truffle.getRuntime().createCallTarget(new RootNode(languageInstance) {
+                CallTarget target = new RootNode(languageInstance) {
 
                     @Node.Children private CustomMaterializeNode[] children = parseNodes(code, source);
 
@@ -231,7 +234,7 @@ public class MaterializationAssertionsViolationTest extends AbstractPolyglotTest
                         return source.createSection(1);
                     }
 
-                });
+                }.getCallTarget();
                 targets.add(target);
                 return target;
             }
@@ -240,13 +243,14 @@ public class MaterializationAssertionsViolationTest extends AbstractPolyglotTest
 
     @Test
     public void testMultipleMaterializationAssertion() {
-        expectedException.expect(PolyglotException.class);
-        expectedException.expectMessage("java.lang.AssertionError: Node must not be materialized multiple times for the same set of tags!");
-        Source source = Source.create(ProxyLanguage.ID, "S2E0()");
-        ExecutionEventListener listener = createListener();
-        instrumentEnv.getInstrumenter().attachExecutionEventListener(SourceSectionFilter.newBuilder().tagIs(StandardTags.StatementTag.class).build(), listener);
-        instrumentEnv.getInstrumenter().attachExecutionEventListener(SourceSectionFilter.newBuilder().tagIs(StandardTags.StatementTag.class).build(), listener);
-        context.eval(source);
+        PolyglotException exception = assertThrows(PolyglotException.class, () -> {
+            Source source = Source.create(ProxyLanguage.ID, "S2E0()");
+            ExecutionEventListener listener = createListener();
+            instrumentEnv.getInstrumenter().attachExecutionEventListener(SourceSectionFilter.newBuilder().tagIs(StandardTags.StatementTag.class).build(), listener);
+            instrumentEnv.getInstrumenter().attachExecutionEventListener(SourceSectionFilter.newBuilder().tagIs(StandardTags.StatementTag.class).build(), listener);
+            context.eval(source);
+        });
+        assertThat(exception.getMessage(), StringContains.containsString("java.lang.AssertionError: Node must not be materialized multiple times for the same set of tags!"));
     }
 
     /**
@@ -267,30 +271,32 @@ public class MaterializationAssertionsViolationTest extends AbstractPolyglotTest
 
     @Test
     public void testGradualMaterializationAssertionCaught() {
-        expectedException.expect(AssertionError.class);
-        expectedException.expectMessage("There should always be some new materialize tag!");
-        Source source = Source.create(ProxyLanguage.ID, "S1E2()");
-        ExecutionEventListener listener = createListener();
-        /*
-         * Execute first so that for the subsequent instrumentation, the materializeTags are
-         * recorded in retired node reference, and during the second instrumentation, we find out
-         * that the node should not materialize further, but it does.
-         */
-        context.eval(source);
-        EventBinding<ExecutionEventListener> binding = instrumentEnv.getInstrumenter().attachExecutionEventListener(
-                        SourceSectionFilter.newBuilder().tagIs(StandardTags.StatementTag.class, StandardTags.ExpressionTag.class).build(), listener);
-        binding.dispose();
-        instrumentEnv.getInstrumenter().attachExecutionEventListener(SourceSectionFilter.newBuilder().tagIs(StandardTags.ExpressionTag.class).build(), listener);
+        AssertionError error = assertThrows(AssertionError.class, () -> {
+            Source source = Source.create(ProxyLanguage.ID, "S1E2()");
+            ExecutionEventListener listener = createListener();
+            /*
+             * Execute first so that for the subsequent instrumentation, the materializeTags are
+             * recorded in retired node reference, and during the second instrumentation, we find
+             * out that the node should not materialize further, but it does.
+             */
+            context.eval(source);
+            EventBinding<ExecutionEventListener> binding = instrumentEnv.getInstrumenter().attachExecutionEventListener(
+                            SourceSectionFilter.newBuilder().tagIs(StandardTags.StatementTag.class, StandardTags.ExpressionTag.class).build(), listener);
+            binding.dispose();
+            instrumentEnv.getInstrumenter().attachExecutionEventListener(SourceSectionFilter.newBuilder().tagIs(StandardTags.ExpressionTag.class).build(), listener);
+        });
+        assertThat(error.getMessage(), StringContains.containsString("There should always be some new materialize tag!"));
     }
 
     @Test
     public void testNewTreeMaterializationAssertion() {
-        expectedException.expect(PolyglotException.class);
-        expectedException.expectMessage("java.lang.AssertionError: New tree should be fully materialized!");
-        Source source = Source.create(ProxyLanguage.ID, "S1E0(S1E0())");
-        ExecutionEventListener listener = createListener();
-        instrumentEnv.getInstrumenter().attachExecutionEventListener(SourceSectionFilter.newBuilder().tagIs(StandardTags.StatementTag.class).build(), listener);
-        context.eval(source);
+        PolyglotException exception = assertThrows(PolyglotException.class, () -> {
+            Source source = Source.create(ProxyLanguage.ID, "S1E0(S1E0())");
+            ExecutionEventListener listener = createListener();
+            instrumentEnv.getInstrumenter().attachExecutionEventListener(SourceSectionFilter.newBuilder().tagIs(StandardTags.StatementTag.class).build(), listener);
+            context.eval(source);
+        });
+        assertThat(exception.getMessage(), StringContains.containsString("java.lang.AssertionError: New tree should be fully materialized!"));
     }
 
     private static ExecutionEventListener createListener() {

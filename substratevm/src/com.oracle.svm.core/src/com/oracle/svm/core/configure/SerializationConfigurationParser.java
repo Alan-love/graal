@@ -25,38 +25,50 @@
  */
 package com.oracle.svm.core.configure;
 
-import java.io.IOException;
-import java.io.Reader;
-import java.util.Map;
+import java.util.List;
 
-import com.oracle.svm.core.util.json.JSONParser;
+import org.graalvm.collections.EconomicMap;
+import org.graalvm.nativeimage.impl.RuntimeSerializationSupport;
 
-public class SerializationConfigurationParser extends ConfigurationParser {
+import jdk.graal.compiler.util.json.JsonParserException;
 
-    public static final String NAME_KEY = "name";
+public abstract class SerializationConfigurationParser<C> extends ConfigurationParser {
+
     public static final String CUSTOM_TARGET_CONSTRUCTOR_CLASS_KEY = "customTargetConstructorClass";
 
-    private final SerializationParserFunction consumer;
+    protected final ConfigurationConditionResolver<C> conditionResolver;
+    protected final RuntimeSerializationSupport<C> serializationSupport;
 
-    public SerializationConfigurationParser(SerializationParserFunction consumer) {
-        this.consumer = consumer;
-    }
-
-    @Override
-    public void parseAndRegister(Reader reader) throws IOException {
-        JSONParser parser = new JSONParser(reader);
-        Object json = parser.parse();
-        for (Object serializationKey : asList(json, "first level of document must be an array of serialization lists")) {
-            Map<String, Object> data = asMap(serializationKey, "second level of document must be serialization descriptor objects ");
-            String targetSerializationClass = asString(data.get(NAME_KEY));
-            Object optionalCustomCtorValue = data.get(CUSTOM_TARGET_CONSTRUCTOR_CLASS_KEY);
-            String customTargetConstructorClass = optionalCustomCtorValue != null ? asString(optionalCustomCtorValue) : null;
-            consumer.accept(targetSerializationClass, customTargetConstructorClass);
+    public static <C> SerializationConfigurationParser<C> create(boolean strictMetadata, ConfigurationConditionResolver<C> conditionResolver, RuntimeSerializationSupport<C> serializationSupport,
+                    boolean strictConfiguration) {
+        if (strictMetadata) {
+            return new SerializationMetadataParser<>(conditionResolver, serializationSupport, strictConfiguration);
+        } else {
+            return new LegacySerializationConfigurationParser<>(conditionResolver, serializationSupport, strictConfiguration);
         }
     }
 
-    @FunctionalInterface
-    public interface SerializationParserFunction {
-        void accept(String targetSerializationClass, String customTargetConstructorClass);
+    public SerializationConfigurationParser(ConfigurationConditionResolver<C> conditionResolver, RuntimeSerializationSupport<C> serializationSupport, boolean strictConfiguration) {
+        super(strictConfiguration);
+        this.serializationSupport = serializationSupport;
+        this.conditionResolver = conditionResolver;
+    }
+
+    protected void parseSerializationTypes(List<Object> listOfSerializationTypes, boolean lambdaCapturingTypes) {
+        for (Object serializationType : listOfSerializationTypes) {
+            parseSerializationDescriptorObject(asMap(serializationType, "Third-level of document must be serialization descriptor objects"), lambdaCapturingTypes);
+        }
+    }
+
+    protected abstract void parseSerializationDescriptorObject(EconomicMap<String, Object> data, boolean lambdaCapturingType);
+
+    protected void registerType(ConfigurationTypeDescriptor targetSerializationClass, C condition) {
+        if (targetSerializationClass instanceof NamedConfigurationTypeDescriptor namedClass) {
+            serializationSupport.register(condition, namedClass.name());
+        } else if (targetSerializationClass instanceof ProxyConfigurationTypeDescriptor proxyClass) {
+            serializationSupport.registerProxyClass(condition, proxyClass.interfaceNames());
+        } else {
+            throw new JsonParserException("Unknown configuration type descriptor: %s".formatted(targetSerializationClass.toString()));
+        }
     }
 }

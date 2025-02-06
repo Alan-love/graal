@@ -24,34 +24,52 @@
  */
 package com.oracle.svm.core.identityhashcode;
 
-import org.graalvm.compiler.graph.NodeClass;
-import org.graalvm.compiler.nodeinfo.NodeCycles;
-import org.graalvm.compiler.nodeinfo.NodeInfo;
-import org.graalvm.compiler.nodeinfo.NodeSize;
-import org.graalvm.compiler.nodes.ValueNode;
-import org.graalvm.compiler.replacements.nodes.IdentityHashCodeNode;
 import org.graalvm.word.LocationIdentity;
 
-import com.oracle.svm.core.meta.SubstrateObjectConstant;
+import com.oracle.svm.core.config.ConfigurationValues;
 
-import jdk.vm.ci.meta.JavaConstant;
+import jdk.graal.compiler.api.replacements.Fold;
+import jdk.graal.compiler.graph.NodeClass;
+import jdk.graal.compiler.nodeinfo.NodeCycles;
+import jdk.graal.compiler.nodeinfo.NodeInfo;
+import jdk.graal.compiler.nodeinfo.NodeSize;
+import jdk.graal.compiler.nodes.ValueNode;
+import jdk.graal.compiler.nodes.spi.CoreProviders;
+import jdk.graal.compiler.replacements.nodes.IdentityHashCodeNode;
 
-@NodeInfo(cycles = NodeCycles.CYCLES_2, size = NodeSize.SIZE_8)
+@NodeInfo(cycles = NodeCycles.CYCLES_UNKNOWN, cyclesRationale = "Decided depending on identity hash code storage.", //
+                size = NodeSize.SIZE_UNKNOWN, sizeRationale = "Decided depending on identity hash code storage.")
 public final class SubstrateIdentityHashCodeNode extends IdentityHashCodeNode {
 
     public static final NodeClass<SubstrateIdentityHashCodeNode> TYPE = NodeClass.create(SubstrateIdentityHashCodeNode.class);
 
-    public SubstrateIdentityHashCodeNode(ValueNode object, int bci) {
+    public static ValueNode create(ValueNode object, int bci, CoreProviders providers) {
+        ValueNode result = canonical(object, providers);
+        return result != null ? result : new SubstrateIdentityHashCodeNode(object, bci);
+    }
+
+    protected SubstrateIdentityHashCodeNode(ValueNode object, int bci) {
         super(TYPE, object, bci);
     }
 
     @Override
     public LocationIdentity getKilledLocationIdentity() {
-        return IdentityHashCodeSupport.IDENTITY_HASHCODE_LOCATION;
+        // With optional identity hash codes, we must write bits in the object header.
+        return isIdentityHashFieldOptional() ? LocationIdentity.any() : IdentityHashCodeSupport.IDENTITY_HASHCODE_LOCATION;
     }
 
     @Override
-    protected int getIdentityHashCode(JavaConstant constant) {
-        return ((SubstrateObjectConstant) constant).getIdentityHashCode();
+    public NodeCycles estimatedNodeCycles() {
+        return isIdentityHashFieldOptional() ? NodeCycles.CYCLES_8 : NodeCycles.CYCLES_2;
+    }
+
+    @Override
+    protected NodeSize dynamicNodeSizeEstimate() {
+        return isIdentityHashFieldOptional() ? NodeSize.SIZE_32 : NodeSize.SIZE_8;
+    }
+
+    @Fold
+    static boolean isIdentityHashFieldOptional() {
+        return ConfigurationValues.getObjectLayout().isIdentityHashFieldOptional();
     }
 }

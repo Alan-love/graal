@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2019, 2023, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -25,27 +25,28 @@
 package com.oracle.svm.hosted;
 
 import java.nio.file.Path;
+import java.util.Locale;
 import java.util.stream.Collectors;
 
+import jdk.graal.compiler.word.Word;
 import org.graalvm.nativeimage.ImageSingletons;
 import org.graalvm.nativeimage.Platform;
-import org.graalvm.nativeimage.hosted.Feature;
 import org.graalvm.word.PointerBase;
-import org.graalvm.word.WordFactory;
 
 import com.oracle.graal.pointsto.reports.ReportUtils;
 import com.oracle.svm.core.SubstrateOptions;
 import com.oracle.svm.core.VM;
-import com.oracle.svm.core.annotate.AutomaticFeature;
 import com.oracle.svm.core.c.CGlobalData;
 import com.oracle.svm.core.c.CGlobalDataFactory;
 import com.oracle.svm.core.c.libc.LibCBase;
+import com.oracle.svm.core.feature.AutomaticallyRegisteredFeature;
+import com.oracle.svm.core.feature.InternalFeature;
 import com.oracle.svm.hosted.c.CGlobalDataFeature;
 import com.oracle.svm.hosted.c.NativeLibraries;
 import com.oracle.svm.hosted.c.codegen.CCompilerInvoker;
 
-@AutomaticFeature
-public class VMFeature implements Feature {
+@AutomaticallyRegisteredFeature
+public class VMFeature implements InternalFeature {
 
     private NativeLibraries nativeLibraries;
     private static final String STATIC_BINARY_MARKER_SYMBOL_NAME = "__svm_vm_is_static_binary";
@@ -54,23 +55,34 @@ public class VMFeature implements Feature {
 
     @Override
     public void afterRegistration(AfterRegistrationAccess access) {
-        ImageSingletons.add(VM.class, createVMSingletonValue());
+        ImageSingletons.add(VM.class, new VM(determineVMInfo()));
     }
 
-    protected VM createVMSingletonValue() {
-        String config = System.getProperty("org.graalvm.config", "CE");
-        return new VM(config);
+    protected String determineVMInfo() {
+        return getSelectedGCName();
+    }
+
+    protected static final String getSelectedGCName() {
+        if (SubstrateOptions.useSerialGC()) {
+            return "serial gc";
+        } else if (SubstrateOptions.useEpsilonGC()) {
+            return "epsilon gc";
+        } else {
+            return "unknown gc";
+        }
     }
 
     @Override
     public void beforeAnalysis(BeforeAnalysisAccess a) {
         if (SubstrateOptions.DumpTargetInfo.getValue()) {
-            System.out.println("# Building image for target platform: " + ImageSingletons.lookup(Platform.class).getClass().getName());
-            if (ImageSingletons.contains(CCompilerInvoker.class)) {
-                System.out.println("# Using native toolchain:");
-                ImageSingletons.lookup(CCompilerInvoker.class).compilerInfo.dump(x -> System.out.println("#   " + x));
-            }
-            System.out.println("# Using CLibrary: " + ImageSingletons.lookup(LibCBase.class).getClass().getName());
+            ReportUtils.report("compilation-target information", SubstrateOptions.reportsPath(), "target_info", "txt", out -> {
+                out.println("Building image for target platform: " + ImageSingletons.lookup(Platform.class).getClass().getName());
+                if (ImageSingletons.contains(CCompilerInvoker.class)) {
+                    out.println("Using native toolchain:");
+                    ImageSingletons.lookup(CCompilerInvoker.class).compilerInfo.dump(x -> out.println("   " + x));
+                }
+                out.println("Using CLibrary: " + ImageSingletons.lookup(LibCBase.class).getClass().getName());
+            });
         }
 
         FeatureImpl.BeforeAnalysisAccessImpl access = (FeatureImpl.BeforeAnalysisAccessImpl) a;
@@ -81,30 +93,35 @@ public class VMFeature implements Feature {
     public void afterAnalysis(AfterAnalysisAccess access) {
         CGlobalDataFeature.singleton().registerWithGlobalSymbol(
                         CGlobalDataFactory.createCString(VM.class.getName() + valueSeparator +
-                                        ImageSingletons.lookup(VM.class).version, VERSION_INFO_SYMBOL_NAME));
+                                        ImageSingletons.lookup(VM.class).vendorVersion, VERSION_INFO_SYMBOL_NAME));
 
         addCGlobalDataString("Target.Platform", ImageSingletons.lookup(Platform.class).getClass().getName());
         addCGlobalDataString("Target.LibC", ImageSingletons.lookup(LibCBase.class).getClass().getName());
+        addCGlobalDataString("Java.Version", System.getProperty("java.version"));
 
         addCGlobalDataString("Target.Libraries", String.join("|", nativeLibraries.getLibraries()));
         addCGlobalDataString("Target.StaticLibraries", nativeLibraries.getStaticLibraries().stream().map(Path::getFileName).map(Path::toString).collect(Collectors.joining("|")));
         if (ImageSingletons.contains(CCompilerInvoker.class)) {
-            addCGlobalDataString("Target.CCompiler", ImageSingletons.lookup(CCompilerInvoker.class).compilerInfo.toString());
+            addCGlobalDataString("Target.CCompiler", ImageSingletons.lookup(CCompilerInvoker.class).compilerInfo.toCGlobalDataString());
         }
 
         if (SubstrateOptions.DumpTargetInfo.getValue()) {
-            System.out.println("# Static libraries:");
-            nativeLibraries.getStaticLibraries().stream().map(ReportUtils::getCWDRelativePath).map(Path::toString).forEach(x -> System.out.println("#   " + x));
-            System.out.println("# Other libraries: " + String.join(",", nativeLibraries.getLibraries()));
+            ReportUtils.report("native-library information", SubstrateOptions.reportsPath(), "native_library_info", "txt", out -> {
+                out.println("Static libraries:");
+                nativeLibraries.getStaticLibraries().stream().map(ReportUtils::getCWDRelativePath).map(Path::toString).forEach(x -> out.println("   " + x));
+                out.println("Other libraries: " + String.join(",", nativeLibraries.getLibraries()));
+            });
         }
 
-        CGlobalData<PointerBase> isStaticBinaryMarker = CGlobalDataFactory.createWord(WordFactory.unsigned(SubstrateOptions.StaticExecutable.getValue() ? 1 : 0), STATIC_BINARY_MARKER_SYMBOL_NAME);
-        CGlobalDataFeature.singleton().registerWithGlobalHiddenSymbol(isStaticBinaryMarker);
+        if (!Platform.includedIn(Platform.WINDOWS.class)) {
+            CGlobalData<PointerBase> isStaticBinaryMarker = CGlobalDataFactory.createWord(Word.unsigned(SubstrateOptions.StaticExecutable.getValue() ? 1 : 0), STATIC_BINARY_MARKER_SYMBOL_NAME);
+            CGlobalDataFeature.singleton().registerWithGlobalHiddenSymbol(isStaticBinaryMarker);
+        }
     }
 
     private static void addCGlobalDataString(String infoType, String content) {
         String data = VM.class.getName() + "." + infoType + valueSeparator + content;
-        String symbolName = "__svm_vm_" + infoType.toLowerCase().replace(".", "_");
+        String symbolName = "__svm_vm_" + infoType.toLowerCase(Locale.ROOT).replace(".", "_");
         CGlobalDataFeature.singleton().registerWithGlobalSymbol(CGlobalDataFactory.createCString(data, symbolName));
     }
 }

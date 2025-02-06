@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017, 2020, Oracle and/or its affiliates.
+ * Copyright (c) 2017, 2024, Oracle and/or its affiliates.
  *
  * All rights reserved.
  *
@@ -30,10 +30,11 @@
 package com.oracle.truffle.llvm.runtime.nodes.memory.store;
 
 import com.oracle.truffle.api.dsl.Cached;
-import com.oracle.truffle.api.dsl.CachedLanguage;
+import com.oracle.truffle.api.dsl.Idempotent;
 import com.oracle.truffle.api.dsl.NodeField;
 import com.oracle.truffle.api.dsl.Specialization;
-import com.oracle.truffle.llvm.runtime.LLVMLanguage;
+import com.oracle.truffle.api.frame.VirtualFrame;
+import com.oracle.truffle.api.nodes.Node;
 import com.oracle.truffle.llvm.runtime.LLVMVarArgCompoundValue;
 import com.oracle.truffle.llvm.runtime.memory.LLVMMemMoveNode;
 import com.oracle.truffle.llvm.runtime.nodes.api.LLVMStoreNode;
@@ -46,57 +47,70 @@ import com.oracle.truffle.llvm.runtime.pointer.LLVMPointer;
 @NodeField(type = long.class, name = "structSize")
 public abstract class LLVMStructStoreNode extends LLVMStoreNode {
 
+    protected final boolean isRecursive;
+
+    @Idempotent
     public abstract long getStructSize();
 
     @Child private LLVMMemMoveNode memMove;
 
-    protected LLVMStructStoreNode(LLVMMemMoveNode memMove) {
+    protected LLVMStructStoreNode(LLVMMemMoveNode memMove, boolean isRecursive) {
         this.memMove = memMove;
+        this.isRecursive = isRecursive;
+    }
+
+    protected LLVMStructStoreNode(LLVMMemMoveNode memMove) {
+        this(memMove, false);
+    }
+
+    protected LLVMStructStoreNode() {
+        this(false);
+    }
+
+    protected LLVMStructStoreNode(boolean isRecursive) {
+        this(null, isRecursive);
     }
 
     public LLVMStructStoreNode createRecursive() {
-        return LLVMStructStoreNodeGen.create(memMove, null, null, getStructSize());
+        return LLVMStructStoreNodeGen.create((LLVMMemMoveNode) ((Node) memMove).deepCopy(), null, null, getStructSize());
     }
 
     /**
      * @param address
      * @param value
-     * @see #executeWithTarget(Object, Object)
+     * @see #executeWithTarget(VirtualFrame, Object, Object)
      */
     @Specialization(guards = "getStructSize() == 0")
     protected void noCopy(Object address, Object value) {
         // nothing to do
     }
 
-    @Specialization(guards = {"getStructSize() > 0", "!isAutoDerefHandle(language, address)", "!isAutoDerefHandle(language, value)"})
-    protected void doOp(LLVMNativePointer address, LLVMNativePointer value,
-                    @CachedLanguage @SuppressWarnings("unused") LLVMLanguage language) {
-        memMove.executeWithTarget(address, value, getStructSize());
+    @Specialization(guards = {"getStructSize() > 0", "!isAutoDerefHandle(address)", "!isAutoDerefHandle(value)"})
+    protected void doOp(VirtualFrame frame, LLVMNativePointer address, LLVMNativePointer value) {
+        memMove.executeWithTarget(frame, address, value, getStructSize());
     }
 
-    @Specialization(guards = {"getStructSize() > 0", "isAutoDerefHandle(language, addr)", "isAutoDerefHandle(language, value)"})
-    protected void doOpDerefHandle(LLVMNativePointer addr, LLVMNativePointer value,
-                    @CachedLanguage @SuppressWarnings("unused") LLVMLanguage language,
+    @Specialization(guards = {"getStructSize() > 0", "isAutoDerefHandle(addr)", "isAutoDerefHandle(value)"})
+    protected void doOpDerefHandle(VirtualFrame frame, LLVMNativePointer addr, LLVMNativePointer value,
                     @Cached LLVMDerefHandleGetReceiverNode getReceiver) {
-        doManaged(getReceiver.execute(addr), getReceiver.execute(value));
+        doManaged(frame, getReceiver.execute(addr), getReceiver.execute(value));
     }
 
     @Specialization(guards = "getStructSize() > 0")
-    protected void doManaged(LLVMManagedPointer address, LLVMPointer value) {
-        memMove.executeWithTarget(address, value, getStructSize());
+    protected void doManaged(VirtualFrame frame, LLVMManagedPointer address, LLVMPointer value) {
+        memMove.executeWithTarget(frame, address, value, getStructSize());
     }
 
-    @Specialization(guards = {"getStructSize() > 0", "!isAutoDerefHandle(language, address)"}, replaces = "doOp")
-    protected void doConvert(LLVMNativePointer address, LLVMPointer value,
-                    @CachedLanguage @SuppressWarnings("unused") LLVMLanguage language,
+    @Specialization(guards = {"getStructSize() > 0", "!isAutoDerefHandle(address)"}, replaces = "doOp")
+    protected void doConvert(VirtualFrame frame, LLVMNativePointer address, LLVMPointer value,
                     @Cached("createToNativeWithTarget()") LLVMToNativeNode toNative) {
-        memMove.executeWithTarget(address, toNative.executeWithTarget(value), getStructSize());
+        memMove.executeWithTarget(frame, address, toNative.executeWithTarget(value), getStructSize());
     }
 
-    @Specialization
-    protected void doVarArgCompoundValue(LLVMNativePointer address, LLVMVarArgCompoundValue value,
+    @Specialization(guards = "!isRecursive")
+    protected void doVarArgCompoundValue(VirtualFrame frame, LLVMNativePointer address, LLVMVarArgCompoundValue value,
                     @Cached("createRecursive()") LLVMStructStoreNode recursionNode) {
-        recursionNode.executeWithTarget(address, value.getAddr());
+        recursionNode.executeWithTarget(frame, address, value.getAddr());
     }
 
 }

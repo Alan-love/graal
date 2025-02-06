@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2017, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -40,17 +40,12 @@
  */
 package com.oracle.truffle.nfi;
 
-import com.oracle.truffle.api.dsl.Fallback;
-import com.oracle.truffle.api.dsl.Specialization;
-import com.oracle.truffle.api.interop.InteropLibrary;
-import com.oracle.truffle.api.library.CachedLibrary;
-import com.oracle.truffle.api.library.ExportLibrary;
-import com.oracle.truffle.api.library.ExportMessage;
-import com.oracle.truffle.nfi.api.SignatureLibrary;
+import com.oracle.truffle.api.dsl.NeverDefault;
+import com.oracle.truffle.api.dsl.NodeFactory;
 
 final class NFIType {
 
-    final TypeCachedState cachedState;
+    @NeverDefault final TypeCachedState cachedState;
     final Object backendType;
 
     final Object runtimeData;
@@ -60,109 +55,39 @@ final class NFIType {
     }
 
     NFIType(TypeCachedState cachedState, Object backendType, Object runtimeData) {
+        assert cachedState != null;
         this.cachedState = cachedState;
         this.backendType = backendType;
         this.runtimeData = runtimeData;
     }
 
-    abstract static class TypeCachedState {
+    static class TypeCachedState {
 
         final int managedArgCount;
 
-        TypeCachedState(int managedArgCount) {
+        final NodeFactory<? extends ConvertTypeNode> toNativeFactory;
+        final NodeFactory<? extends ConvertTypeNode> fromNativeFactory;
+
+        /**
+         * Default value used for exception returns.
+         */
+        final Object defaultValue;
+
+        TypeCachedState(int managedArgCount, NodeFactory<? extends ConvertTypeNode> toNative, NodeFactory<? extends ConvertTypeNode> fromNative, Object defaultValue) {
             this.managedArgCount = managedArgCount;
-        }
-    }
-
-    static final TypeCachedState SIMPLE = new SimpleTypeCachedState();
-    static final TypeCachedState CLOSURE = new ClosureTypeCachedState();
-    static final TypeCachedState INJECTED = new InjectedTypeCachedState();
-
-    @ExportLibrary(NFITypeLibrary.class)
-    static final class SimpleTypeCachedState extends TypeCachedState {
-
-        private SimpleTypeCachedState() {
-            super(1);
-            // singleton
+            this.toNativeFactory = toNative;
+            this.fromNativeFactory = fromNative;
+            this.defaultValue = defaultValue;
         }
 
-        @ExportMessage
-        Object convertToNative(NFIType type, Object value) {
-            assert type.cachedState == this;
-            return value;
+        @NeverDefault
+        ConvertTypeNode createToNative() {
+            return toNativeFactory.createNode();
         }
 
-        @ExportMessage
-        Object convertFromNative(NFIType type, Object value) {
-            assert type.cachedState == this;
-            return value;
-        }
-    }
-
-    @ExportLibrary(NFITypeLibrary.class)
-    static final class ClosureTypeCachedState extends TypeCachedState {
-
-        private ClosureTypeCachedState() {
-            super(1);
-            // singleton
-        }
-
-        @ExportMessage
-        static class ConvertToNative {
-
-            @Specialization(limit = "3", guards = "interop.isExecutable(value)")
-            static Object convertToNative(ClosureTypeCachedState state, NFIType type, Object value,
-                            @SuppressWarnings("unused") @CachedLibrary("value") InteropLibrary interop,
-                            @CachedLibrary("type.runtimeData") SignatureLibrary library) {
-                assert type.cachedState == state;
-                return library.createClosure(type.runtimeData, value);
-            }
-
-            @Fallback
-            static Object convertToNative(ClosureTypeCachedState state, NFIType type, Object value) {
-                // it's not executable, so assume it's already a function pointer
-                assert type.cachedState == state;
-                return value;
-            }
-        }
-
-        @ExportMessage
-        static class ConvertFromNative {
-
-            @Specialization(limit = "3", guards = "interop.isNull(nullValue)")
-            static Object doNull(ClosureTypeCachedState state, NFIType type, Object nullValue,
-                            @SuppressWarnings("unused") @CachedLibrary("nullValue") InteropLibrary interop) {
-                assert type.cachedState == state;
-                return nullValue;
-            }
-
-            @Specialization(limit = "3", guards = "!interop.isNull(value)")
-            static Object doBind(ClosureTypeCachedState state, NFIType type, Object value,
-                            @SuppressWarnings("unused") @CachedLibrary("value") InteropLibrary interop,
-                            @CachedLibrary("type.runtimeData") SignatureLibrary library) {
-                assert type.cachedState == state;
-                return library.bind(type.runtimeData, value);
-            }
-        }
-    }
-
-    @ExportLibrary(NFITypeLibrary.class)
-    static final class InjectedTypeCachedState extends TypeCachedState {
-
-        private InjectedTypeCachedState() {
-            super(0);
-        }
-
-        @ExportMessage
-        Object convertFromNative(NFIType type, @SuppressWarnings("unused") Object value) {
-            assert type.cachedState == this;
-            return null;
-        }
-
-        @ExportMessage
-        Object convertToNative(NFIType type, Object value) {
-            assert type.cachedState == this && value == null;
-            return type.runtimeData;
+        @NeverDefault
+        ConvertTypeNode createFromNative() {
+            return fromNativeFactory.createNode();
         }
     }
 }

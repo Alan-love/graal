@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2019, 2021, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -34,7 +34,6 @@ import org.junit.Test;
 
 import com.oracle.truffle.api.CallTarget;
 import com.oracle.truffle.api.CompilerDirectives;
-import com.oracle.truffle.api.Truffle;
 import com.oracle.truffle.api.TruffleLanguage;
 import com.oracle.truffle.api.frame.VirtualFrame;
 import com.oracle.truffle.api.instrumentation.GenerateWrapper;
@@ -64,9 +63,9 @@ public class NotReadableValuesTest {
         InspectorTester tester = InspectorTester.start(true);
         tester.sendMessage("{\"id\":1,\"method\":\"Runtime.enable\"}");
         tester.sendMessage("{\"id\":2,\"method\":\"Debugger.enable\"}");
-        assertTrue(tester.compareReceivedMessages(
+        tester.receiveMessages(
                         "{\"result\":{},\"id\":1}\n" +
-                        "{\"result\":{},\"id\":2}\n"));
+                        "{\"result\":{\"debuggerId\":\"UniqueDebuggerId.", "},\"id\":2}\n");
         tester.sendMessage("{\"id\":3,\"method\":\"Runtime.runIfWaitingForDebugger\"}");
         assertTrue(tester.compareReceivedMessages(
                         "{\"result\":{},\"id\":3}\n" +
@@ -128,7 +127,7 @@ public class NotReadableValuesTest {
 
         @Override
         protected final CallTarget parse(TruffleLanguage.ParsingRequest request) throws Exception {
-            return Truffle.getRuntime().createCallTarget(new TestRootNode(languageInstance, request.getSource()));
+            return new TestRootNode(languageInstance, request.getSource()).getCallTarget();
         }
 
         @Override
@@ -278,7 +277,7 @@ public class NotReadableValuesTest {
             }
         }
 
-        private static class MetaObject extends ProxyInteropObject {
+        private static final class MetaObject extends ProxyInteropObject {
 
             @Override
             protected boolean isMetaObject() {
@@ -336,7 +335,7 @@ public class NotReadableValuesTest {
             }
         }
 
-        private static class ArrayValue extends ProxyInteropObject {
+        private static final class ArrayValue extends ProxyInteropObject {
 
             private static final long LENGTH = 6;
             private static final Set<Long> NOT_READABLE = new HashSet<>(Arrays.asList(new Long[]{2L, 3L}));

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, 2020, Oracle and/or its affiliates.
+ * Copyright (c) 2019, 2024, Oracle and/or its affiliates.
  *
  * All rights reserved.
  *
@@ -32,6 +32,7 @@ package com.oracle.truffle.llvm.toolchain.launchers.common;
 import org.graalvm.home.HomeFinder;
 import org.graalvm.home.Version;
 
+import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -39,6 +40,7 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
 
 public class Driver {
 
@@ -54,13 +56,9 @@ public class Driver {
         this(exe, true);
     }
 
-    public Driver() {
-        this.exe = null;
-        this.isBundledTool = false;
-    }
-
     public enum OS {
 
+        WINDOWS,
         DARWIN,
         LINUX;
 
@@ -71,6 +69,9 @@ public class Driver {
             }
             if (name.equals("Mac OS X") || name.equals("Darwin")) {
                 return DARWIN;
+            }
+            if (name.startsWith("Windows")) {
+                return WINDOWS;
             }
             throw new IllegalArgumentException("unknown OS: " + name);
         }
@@ -84,20 +85,43 @@ public class Driver {
         }
     }
 
-    private static final boolean hasJreDir = System.getProperty("java.specification.version").startsWith("1.");
+    public enum Arch {
+
+        X86_64,
+        AARCH_64;
+
+        private static Arch findCurrent() {
+            final String name = System.getProperty("os.arch");
+            if (name.equals("amd64")) {
+                return X86_64;
+            }
+            if (name.equals("x86_64")) {
+                return X86_64;
+            }
+            if (name.equals("aarch64")) {
+                return AARCH_64;
+            }
+            throw new IllegalArgumentException("unknown architecture: " + name);
+        }
+
+        private static final class Lazy {
+            private static final Arch current = findCurrent();
+        }
+
+        public static Arch getCurrent() {
+            return Lazy.current;
+        }
+    }
 
     private static Path getRuntimeDir() {
         Path runtimeDir = HomeFinder.getInstance().getHomeFolder();
         if (runtimeDir == null) {
             throw new IllegalStateException("Could not find GraalVM home");
         }
-        if (hasJreDir) {
-            runtimeDir = runtimeDir.resolve("jre");
-        }
         return runtimeDir;
     }
 
-    public Path getLLVMBinDir() {
+    public static Path getLLVMBinDir() {
         final String property = System.getProperty("llvm.bin.dir");
         if (property != null) {
             return Paths.get(property);
@@ -112,7 +136,7 @@ public class Driver {
         return getRuntimeDir().resolve("lib").resolve("llvm").resolve("bin");
     }
 
-    public Path getSulongHome() {
+    public static Path getSulongHome() {
         final Path sulongHome = HomeFinder.getInstance().getLanguageHomes().get("llvm");
         if (sulongHome != null) {
             return sulongHome;
@@ -151,8 +175,8 @@ public class Driver {
         toolArgs.addAll(sulongArgs);
         // add user flags
         toolArgs.addAll(userArgs);
-        printInfos(verbose, help, earlyExit, toolArgs);
         if (earlyExit) {
+            printInfos(verbose, help, earlyExit, toolArgs);
             return 0;
         }
         ProcessBuilder pb = new ProcessBuilder(toolArgs);
@@ -172,12 +196,17 @@ public class Driver {
             }
             // wait for process termination
             p.waitFor();
+            printInfos(verbose, help, earlyExit, toolArgs);
             // set exit code
-            return p.exitValue();
+            int exitCode = p.exitValue();
+            if (verbose) {
+                System.err.println("exit code: " + exitCode);
+            }
+            return exitCode;
         } catch (IOException ioe) {
             // can only occur on ProcessBuilder#start, no destroying necessary
             if (isBundledTool) {
-                printMissingToolMessage();
+                printMissingToolMessage(Optional.ofNullable(new File(this.exe).toPath().getParent()).map(Path::getParent).map(Path::toString).orElse("<invalid>"));
             }
             throw ioe;
         } catch (Exception e) {
@@ -204,9 +233,8 @@ public class Driver {
         return pb.inheritIO();
     }
 
-    public void printMissingToolMessage() {
-        System.err.println("Tool execution failed. Are you sure the toolchain is available at " + getLLVMBinDir().getParent());
-        System.err.println("You can install it via GraalVM updater: `gu install llvm-toolchain`");
+    public static void printMissingToolMessage(String llvmRoot) {
+        System.err.println("Tool execution failed. Are you sure the toolchain is available at " + llvmRoot);
         System.err.println();
         System.err.println("More infos: https://www.graalvm.org/docs/reference-manual/languages/llvm/");
     }
@@ -223,9 +251,9 @@ public class Driver {
             System.out.println("GraalVM version: " + getVersion());
         }
         if (verbose) {
-            System.out.println("GraalVM wrapper script for " + getTool());
-            System.out.println("GraalVM version: " + getVersion());
-            System.out.println("running: " + String.join(" ", toolArgs));
+            System.err.println("GraalVM wrapper script for " + getTool());
+            System.err.println("GraalVM version: " + getVersion());
+            System.err.println("running: " + String.join(" ", toolArgs));
         }
         if (help) {
             if (!earlyExit) {
@@ -240,7 +268,7 @@ public class Driver {
         return Paths.get(exe).getFileName();
     }
 
-    public Path getLLVMExecutable(String tool) {
+    public static Path getLLVMExecutable(String tool) {
         return getLLVMBinDir().resolve(tool);
     }
 }

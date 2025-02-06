@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2019, 2021, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,10 +24,38 @@
  */
 package com.oracle.svm.core.configure;
 
-public interface ResourcesRegistry {
-    void addResources(String pattern);
+import java.util.Collection;
+import java.util.Locale;
 
-    void ignoreResources(String pattern);
+import org.graalvm.nativeimage.ImageSingletons;
+import org.graalvm.nativeimage.impl.ConfigurationCondition;
+import org.graalvm.nativeimage.impl.RuntimeResourceSupport;
 
-    void addResourceBundles(String name);
+public interface ResourcesRegistry<C> extends RuntimeResourceSupport<C> {
+
+    @SuppressWarnings("unchecked")
+    static ResourcesRegistry<ConfigurationCondition> singleton() {
+        return ImageSingletons.lookup(ResourcesRegistry.class);
+    }
+
+    void addClassBasedResourceBundle(C condition, String basename, String className);
+
+    /**
+     * Although the interface-methods below are already defined in the super-interface
+     * {@link RuntimeResourceSupport} they are also needed here for legacy code that accesses them
+     * reflectively.
+     */
+    @Deprecated
+    default void addResources(C condition, String pattern) {
+        addResources(condition, pattern, "unknown");
+    }
+
+    @Override
+    void ignoreResources(C condition, String pattern);
+
+    @Override
+    void addResourceBundles(C condition, String name);
+
+    @Override
+    void addResourceBundles(C condition, String basename, Collection<Locale> locales);
 }

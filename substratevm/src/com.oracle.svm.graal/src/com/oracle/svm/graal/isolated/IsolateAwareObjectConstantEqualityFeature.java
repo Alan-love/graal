@@ -26,11 +26,12 @@ package com.oracle.svm.graal.isolated;
 
 import org.graalvm.nativeimage.ImageSingletons;
 import org.graalvm.nativeimage.c.function.CEntryPoint;
-import org.graalvm.nativeimage.hosted.Feature;
 
 import com.oracle.svm.core.SubstrateOptions;
-import com.oracle.svm.core.annotate.AutomaticFeature;
 import com.oracle.svm.core.c.function.CEntryPointOptions;
+import com.oracle.svm.core.feature.AutomaticallyRegisteredFeature;
+import com.oracle.svm.core.feature.InternalFeature;
+import com.oracle.svm.core.graal.RuntimeCompilation;
 import com.oracle.svm.core.meta.DirectSubstrateObjectConstant;
 import com.oracle.svm.core.meta.ObjectConstantEquality;
 import com.oracle.svm.core.meta.SubstrateObjectConstant;
@@ -65,21 +66,21 @@ final class IsolateAwareObjectConstantEquality implements ObjectConstantEquality
         throw VMError.shouldNotReachHere("Unknown object constant: " + b);
     }
 
-    @CEntryPoint
-    @CEntryPointOptions(include = CEntryPointOptions.NotIncludedAutomatically.class, publishAs = CEntryPointOptions.Publish.NotPublished)
+    @CEntryPoint(exceptionHandler = IsolatedCompileClient.BooleanExceptionHandler.class, include = CEntryPoint.NotIncludedAutomatically.class, publishAs = CEntryPoint.Publish.NotPublished)
+    @CEntryPointOptions(callerEpilogue = IsolatedCompileClient.ExceptionRethrowCallerEpilogue.class)
     static boolean isolatedConstantHandleTargetsEqual(@SuppressWarnings("unused") ClientIsolateThread client, ClientHandle<?> x, ClientHandle<?> y) {
         return IsolatedCompileClient.get().unhand(x) == IsolatedCompileClient.get().unhand(y);
     }
 
-    @CEntryPoint
-    @CEntryPointOptions(include = CEntryPointOptions.NotIncludedAutomatically.class, publishAs = CEntryPointOptions.Publish.NotPublished)
+    @CEntryPoint(exceptionHandler = IsolatedCompileClient.BooleanExceptionHandler.class, include = CEntryPoint.NotIncludedAutomatically.class, publishAs = CEntryPoint.Publish.NotPublished)
+    @CEntryPointOptions(callerEpilogue = IsolatedCompileClient.ExceptionRethrowCallerEpilogue.class)
     private static boolean isolatedHandleTargetEqualImageObject(@SuppressWarnings("unused") ClientIsolateThread client, ClientHandle<?> x, ImageHeapRef<?> y) {
         return IsolatedCompileClient.get().unhand(x) == ImageHeapObjects.deref(y);
     }
 }
 
-@AutomaticFeature
-final class IsolateAwareObjectConstantEqualityFeature implements Feature {
+@AutomaticallyRegisteredFeature
+final class IsolateAwareObjectConstantEqualityFeature implements InternalFeature {
     @Override
     public boolean isInConfiguration(IsInConfigurationAccess access) {
         return SubstrateOptions.supportCompileInIsolates();
@@ -87,6 +88,8 @@ final class IsolateAwareObjectConstantEqualityFeature implements Feature {
 
     @Override
     public void afterRegistration(AfterRegistrationAccess access) {
-        ImageSingletons.add(ObjectConstantEquality.class, new IsolateAwareObjectConstantEquality());
+        if (RuntimeCompilation.isEnabled()) {
+            ImageSingletons.add(ObjectConstantEquality.class, new IsolateAwareObjectConstantEquality());
+        }
     }
 }

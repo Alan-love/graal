@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2024, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -20,134 +20,69 @@
  * or visit www.oracle.com if you need additional information or have any
  * questions.
  */
-
 package com.oracle.truffle.espresso.impl;
 
-import java.util.ArrayList;
 import java.util.concurrent.locks.ReadWriteLock;
 
-import com.oracle.truffle.espresso.descriptors.Symbol;
-import com.oracle.truffle.espresso.descriptors.Symbol.Name;
-import com.oracle.truffle.espresso.runtime.EspressoContext;
-import com.oracle.truffle.espresso.runtime.StaticObject;
+import com.oracle.truffle.espresso.classfile.descriptors.Name;
+import com.oracle.truffle.espresso.classfile.descriptors.Symbol;
+import com.oracle.truffle.espresso.classfile.tables.AbstractModuleTable;
+import com.oracle.truffle.espresso.descriptors.EspressoSymbols.Names;
+import com.oracle.truffle.espresso.jdwp.api.ModuleRef;
+import com.oracle.truffle.espresso.meta.Meta;
+import com.oracle.truffle.espresso.runtime.staticobject.StaticObject;
 
-public class ModuleTable extends EntryTable<ModuleTable.ModuleEntry, ClassRegistry> {
-
+public final class ModuleTable extends AbstractModuleTable<StaticObject, ModuleTable.ModuleEntry> {
     public ModuleTable(ReadWriteLock lock) {
         super(lock);
     }
 
     @Override
-    protected ModuleEntry createEntry(Symbol<Name> name, ClassRegistry registry) {
-        return new ModuleEntry(name, registry);
+    protected ModuleEntry createEntry(Symbol<Name> name, ModuleData<StaticObject> data) {
+        return new ModuleEntry(name, data);
     }
 
-    public ModuleEntry createAndAddEntry(Symbol<Name> name, ClassRegistry registry, boolean isOpen, StaticObject module) {
-        ModuleEntry moduleEntry = createAndAddEntry(name, registry);
-        if (moduleEntry == null) {
-            return null;
-        }
-        moduleEntry.setModule(module);
-        moduleEntry.isOpen = isOpen;
-        return moduleEntry;
-    }
-
-    public static class ModuleEntry extends EntryTable.NamedEntry {
-
-        // TODO: module versions.
-        ModuleEntry(Symbol<Name> name, ClassRegistry data) {
-            super(name);
-            this.registry = data;
+    public static final class ModuleEntry extends AbstractModuleTable.AbstractModuleEntry<StaticObject> implements ModuleRef {
+        ModuleEntry(Symbol<Name> name, ModuleData<StaticObject> data) {
+            super(name, data);
         }
 
-        public static ModuleEntry createUnnamedModuleEntry(StaticObject module, ClassRegistry registry) {
-            ModuleEntry result = new ModuleEntry(null, registry);
-            result.setCanReadAllUnnamed();
-            if (!StaticObject.isNull(module)) {
-                result.setModule(module);
-            }
-            result.isOpen = true;
-            return result;
-        }
-
-        private final ClassRegistry registry;
-        private StaticObject module = StaticObject.NULL;
-        private boolean isOpen = false;
-
-        private boolean canReadAllUnnamed = false;
-
-        private ArrayList<ModuleEntry> reads;
-
-        public ClassRegistry registry() {
-            return registry;
-        }
-
-        public void addReads(ModuleEntry from) {
-            if (!isNamed()) {
-                return;
-            }
-            synchronized (this) {
-                if (from == null) {
-                    setCanReadAllUnnamed();
-                    return;
-                }
-                if (reads == null) {
-                    reads = new ArrayList<>();
-                }
-                if (!contains(from)) {
-                    reads.add(from);
-                }
+        @Override
+        public String jdwpName() {
+            if (name == null) {
+                // JDWP expects the unnamed module to return empty string
+                return "";
+            } else {
+                return name.toString();
             }
         }
 
-        public boolean canRead(ModuleEntry m, EspressoContext context) {
-            if (!isNamed() || m.isJavaBase(context)) {
-                return true;
+        @Override
+        public Object classLoader() {
+            StaticObject module = module();
+            if (module != null) {
+                assert StaticObject.notNull(module);
+                Meta meta = module.getKlass().getMeta();
+                return meta.java_lang_Module_loader.getObject(module);
+            } else {
+                // this must be the early java.base module
+                assert name.equals(Names.java_base);
+                return StaticObject.NULL;
             }
-            synchronized (this) {
-                if (!hasReads()) {
-                    return false;
-                } else {
-                    return contains(m);
-                }
+        }
+
+        public ClassRegistry registry(Meta meta) {
+            StaticObject module = module();
+            ClassRegistries registries = meta.getContext().getRegistries();
+            if (module != null) {
+                assert StaticObject.notNull(module);
+                StaticObject loader = meta.java_lang_Module_loader.getObject(module);
+                return registries.getClassRegistry(loader);
+            } else {
+                // this must be the early java.base module
+                assert name.equals(Names.java_base);
+                return registries.getBootClassRegistry();
             }
         }
-
-        private boolean contains(ModuleEntry from) {
-            return reads.contains(from);
-        }
-
-        public void setModule(StaticObject module) {
-            this.module = module;
-        }
-
-        public StaticObject module() {
-            return module;
-        }
-
-        public void setCanReadAllUnnamed() {
-            canReadAllUnnamed = true;
-        }
-
-        public boolean canReadAllUnnamed() {
-            return canReadAllUnnamed;
-        }
-
-        public boolean isOpen() {
-            return isOpen;
-        }
-
-        public boolean isNamed() {
-            return getName() != null;
-        }
-
-        public boolean isJavaBase(EspressoContext context) {
-            return this == context.getRegistries().getJavaBaseModule();
-        }
-
-        public boolean hasReads() {
-            return reads != null && !reads.isEmpty();
-        }
-
     }
 }

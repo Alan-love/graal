@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2019, 2022, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,15 +24,18 @@
  */
 package com.oracle.svm.core.heap;
 
-import java.util.ArrayList;
+import java.util.List;
 
+import org.graalvm.nativeimage.ImageSingletons;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
-import org.graalvm.nativeimage.hosted.Feature;
 
-import com.oracle.svm.core.annotate.AutomaticFeature;
-import com.oracle.svm.core.annotate.DuplicatedInNativeCode;
-import com.oracle.svm.core.annotate.Uninterruptible;
+import com.oracle.svm.core.Uninterruptible;
+import com.oracle.svm.core.feature.AutomaticallyRegisteredFeature;
+import com.oracle.svm.core.feature.AutomaticallyRegisteredImageSingleton;
+import com.oracle.svm.core.feature.InternalFeature;
+import com.oracle.svm.core.util.DuplicatedInNativeCode;
+import com.oracle.svm.core.util.ImageHeapList;
 import com.oracle.svm.core.util.VMError;
 
 /**
@@ -40,34 +43,22 @@ import com.oracle.svm.core.util.VMError;
  * garbage collector implementations.
  */
 public class GCCause {
-    @Platforms(Platform.HOSTED_ONLY.class) private static final ArrayList<GCCause> HostedGCCauseList = new ArrayList<>();
 
     @DuplicatedInNativeCode public static final GCCause JavaLangSystemGC = new GCCause("java.lang.System.gc()", 0);
-    @DuplicatedInNativeCode public static final GCCause UnitTest = new GCCause("UnitTest", 1);
-    @DuplicatedInNativeCode public static final GCCause TestGCInDeoptimizer = new GCCause("TestGCInDeoptimizer", 2);
-
-    protected static GCCause[] GCCauses = new GCCause[]{JavaLangSystemGC, UnitTest, TestGCInDeoptimizer};
+    @DuplicatedInNativeCode public static final GCCause UnitTest = new GCCause("Forced GC in unit test", 1);
+    @DuplicatedInNativeCode public static final GCCause TestGCInDeoptimizer = new GCCause("Test GC in deoptimizer", 2);
+    @DuplicatedInNativeCode public static final GCCause HintedGC = new GCCause("Hinted GC", 3);
+    @DuplicatedInNativeCode public static final GCCause JvmtiForceGC = new GCCause("JvmtiEnv ForceGarbageCollection", 4);
+    @DuplicatedInNativeCode public static final GCCause HeapDump = new GCCause("Heap Dump Initiated GC", 5);
+    @DuplicatedInNativeCode public static final GCCause DiagnosticCommand = new GCCause("Diagnostic Command", 6);
 
     private final int id;
     private final String name;
 
     @Platforms(Platform.HOSTED_ONLY.class)
     protected GCCause(String name, int id) {
-        /* Checkstyle: allow synchronization. */
         this.id = id;
         this.name = name;
-        addGCCauseMapping();
-    }
-
-    @Platforms(Platform.HOSTED_ONLY.class)
-    private void addGCCauseMapping() {
-        synchronized (HostedGCCauseList) { /* Checkstyle: disallow synchronization. */
-            while (HostedGCCauseList.size() <= id) {
-                HostedGCCauseList.add(null);
-            }
-            VMError.guarantee(HostedGCCauseList.get(id) == null, name + " and another GCCause have the same id.");
-            HostedGCCauseList.set(id, this);
-        }
     }
 
     public String getName() {
@@ -80,20 +71,40 @@ public class GCCause {
     }
 
     public static GCCause fromId(int causeId) {
-        return GCCauses[causeId];
+        return getGCCauses().get(causeId);
     }
 
-    @Platforms(Platform.HOSTED_ONLY.class)
-    public static void cacheReverseMapping() {
-        GCCauses = HostedGCCauseList.toArray(new GCCause[HostedGCCauseList.size()]);
+    public static List<GCCause> getGCCauses() {
+        return ImageSingletons.lookup(GCCauseSupport.class).gcCauses;
     }
 }
 
-@AutomaticFeature
-class GCCauseFeature implements Feature {
+@AutomaticallyRegisteredImageSingleton
+class GCCauseSupport {
+    final List<GCCause> gcCauses = ImageHeapList.create(GCCause.class, null);
+
+    @Platforms(Platform.HOSTED_ONLY.class)
+    Object collectGCCauses(Object obj) {
+        if (obj instanceof GCCause gcCause) {
+            synchronized (gcCauses) {
+                int id = gcCause.getId();
+                while (gcCauses.size() <= id) {
+                    gcCauses.add(null);
+                }
+                var existing = gcCauses.set(id, gcCause);
+                if (existing != null && existing != gcCause) {
+                    throw VMError.shouldNotReachHere("Two GCCause objects have the same id " + id + ": " + gcCause.getName() + ", " + existing.getName());
+                }
+            }
+        }
+        return obj;
+    }
+}
+
+@AutomaticallyRegisteredFeature
+class GCCauseFeature implements InternalFeature {
     @Override
-    public void beforeCompilation(BeforeCompilationAccess access) {
-        GCCause.cacheReverseMapping();
-        access.registerAsImmutable(GCCause.GCCauses);
+    public void duringSetup(DuringSetupAccess access) {
+        access.registerObjectReplacer(ImageSingletons.lookup(GCCauseSupport.class)::collectGCCauses);
     }
 }

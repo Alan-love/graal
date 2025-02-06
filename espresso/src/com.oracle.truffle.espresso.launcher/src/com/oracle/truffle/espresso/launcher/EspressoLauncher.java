@@ -22,8 +22,12 @@
  */
 package com.oracle.truffle.espresso.launcher;
 
+import java.io.BufferedReader;
 import java.io.File;
 import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -40,6 +44,12 @@ import org.graalvm.polyglot.Context.Builder;
 import org.graalvm.polyglot.PolyglotException;
 import org.graalvm.polyglot.Value;
 
+/**
+ * A simple emulation of the {@code java} launcher that parses the command line flags and builds and
+ * Espresso context based on them. This code isn't used by anyone except Espresso developers,
+ * because in a shipped Espresso the VM is started via {@code mokapot} instead (see
+ * {@code hacking.md} for details).
+ */
 public final class EspressoLauncher extends AbstractLanguageLauncher {
     private static final String AGENT_LIB = "java.AgentLib.";
     private static final String AGENT_PATH = "java.AgentPath.";
@@ -132,7 +142,7 @@ public final class EspressoLauncher extends AbstractLanguageLauncher {
 
         /**
          * Advances the position, skipping over the value associated with an option if needed.
-         * 
+         *
          * @return true if there are still arguments to process, false otherwise.
          */
         boolean next() {
@@ -168,7 +178,12 @@ public final class EspressoLauncher extends AbstractLanguageLauncher {
         String classpath = null;
         String jarFileName = null;
         ArrayList<String> unrecognized = new ArrayList<>();
-        Arguments args = new Arguments(arguments);
+        boolean isRelaxStaticObjectSafetyChecksSet = false;
+        int javaAgentIndex = 0;
+
+        List<String> expandedArguments = expandAtFiles(arguments);
+
+        Arguments args = new Arguments(expandedArguments);
         while (args.next()) {
             String arg = args.getKey();
             switch (arg) {
@@ -192,6 +207,9 @@ public final class EspressoLauncher extends AbstractLanguageLauncher {
                 case "--add-reads":
                     parseNumberedOption(args, "java.AddReads", "module");
                     break;
+                case "--enable-native-access":
+                    parseNumberedOption(args, "java.EnableNativeAccess", "module");
+                    break;
                 case "-m":
                 case "--module":
                     /* This arguments specifies in which module we find the main class. */
@@ -206,6 +224,7 @@ public final class EspressoLauncher extends AbstractLanguageLauncher {
                     versionAction = VersionAction.PrintAndExit;
                     break;
                 case "-showversion":
+                case "--show-version":
                     versionAction = VersionAction.PrintAndContinue;
                     break;
 
@@ -226,13 +245,41 @@ public final class EspressoLauncher extends AbstractLanguageLauncher {
 
                 case "-client":
                 case "-server":
+                case "-truffle":
                 case "-d64":
                 case "-Xdebug": // only for backward compatibility
                     // ignore
                     break;
+                case "-Xcomp":
+                    espressoOptions.put("engine.CompileImmediately", "true");
+                    break;
+                case "-Xbatch":
+                    espressoOptions.put("engine.BackgroundCompilation", "false");
+                    espressoOptions.put("engine.CompileImmediately", "true");
+                    break;
+                case "-Xint":
+                    espressoOptions.put("engine.Compilation", "false");
+                    break;
+                case "-Xshare:auto":
+                case "-Xshare:off":
+                    // ignore
+                    break;
+                case "-XX:+UseJVMCICompiler":
+                case "-XX:-UseJVMCICompiler":
+                    getError().println("Ignoring " + arg);
+                    break;
 
                 case "-XX:+PauseOnExit":
                     pauseOnExit = true;
+                    break;
+
+                case "--engine.RelaxStaticObjectSafetyChecks":
+                    isRelaxStaticObjectSafetyChecksSet = true;
+                    unrecognized.add(args.getArg());
+                    break;
+
+                case "--enable-preview":
+                    espressoOptions.put("java.EnablePreview", "true");
                     break;
 
                 default:
@@ -255,7 +302,7 @@ public final class EspressoLauncher extends AbstractLanguageLauncher {
                         espressoOptions.put("java.JDWPOptions", value);
                     } else if (arg.startsWith("-javaagent:")) {
                         String value = arg.substring("-javaagent:".length());
-                        espressoOptions.put(JAVA_AGENT, value);
+                        espressoOptions.put(JAVA_AGENT + "." + javaAgentIndex++, value);
                         mergeOption("java.AddModules", "java.instrument");
                     } else if (arg.startsWith("-agentlib:")) {
                         String[] split = splitEquals(arg.substring("-agentlib:".length()));
@@ -265,6 +312,8 @@ public final class EspressoLauncher extends AbstractLanguageLauncher {
                         espressoOptions.put(AGENT_PATH + split[0], split[1]);
                     } else if (arg.startsWith("-Xmn") || arg.startsWith("-Xms") || arg.startsWith("-Xmx") || arg.startsWith("-Xss")) {
                         unrecognized.add("--vm." + arg.substring(1));
+                    } else if (arg.startsWith("-XX:")) {
+                        handleXXArg(arg, unrecognized);
                     } else
                     // -Dsystem.property=value
                     if (arg.startsWith("-D")) {
@@ -313,7 +362,7 @@ public final class EspressoLauncher extends AbstractLanguageLauncher {
 
                     mainClassName = getMainClassName(jarFileName);
                 }
-                buildJvmArgs(arguments, args.getNumberOfProcessedArgs());
+                buildJvmArgs(expandedArguments, args.getNumberOfProcessedArgs());
                 args.pushLeftoversArgs();
                 break;
             }
@@ -327,16 +376,84 @@ public final class EspressoLauncher extends AbstractLanguageLauncher {
             if (classpath == null) {
                 // (3) the environment variable CLASSPATH
                 classpath = System.getenv("CLASSPATH");
-                if (classpath == null) {
-                    // (4) the current working directory only
-                    classpath = ".";
-                }
             }
         }
 
-        espressoOptions.put("java.Classpath", classpath);
+        if (classpath != null) {
+            espressoOptions.put("java.Classpath", classpath);
+        }
+
+        if (!isRelaxStaticObjectSafetyChecksSet) {
+            // Since Espresso has a verifier, the Static Object Model does not need to perform shape
+            // checks and can use unsafe casts. Cmd line args have precedence over this default
+            // value.
+            espressoOptions.put("engine.RelaxStaticObjectSafetyChecks", "true");
+        }
 
         return unrecognized;
+    }
+
+    private List<String> expandAtFiles(List<String> arguments) {
+        List<String> expanded = null;
+        for (int i = 0; i < arguments.size(); i++) {
+            String arg = arguments.get(i);
+            if (arg.startsWith("@")) {
+                if (expanded == null) {
+                    expanded = new ArrayList<>(arguments.subList(0, i));
+                }
+                parseArgFile(arg.substring(1, arg.length()), expanded);
+            } else if (expanded != null) {
+                expanded.add(arg);
+            }
+        }
+        return expanded == null ? arguments : expanded;
+    }
+
+    private void parseArgFile(String pathArg, List<String> expanded) {
+        Path argFilePath = Paths.get(pathArg);
+        try {
+            BufferedReader reader = Files.newBufferedReader(argFilePath);
+            new ArgFileParser(reader).parse(expanded::add);
+        } catch (IOException e) {
+            throw abort(new RuntimeException("Cannot open @argfile", e), 1);
+        }
+    }
+
+    private static final Set<String> knownPassThroughOptions = Set.of(
+                    "WhiteBoxAPI",
+                    "EnableJVMCI");
+
+    private void handleXXArg(String fullArg, ArrayList<String> unrecognized) {
+        String arg = fullArg.substring("-XX:".length());
+        String name;
+        String value;
+        if (arg.length() >= 1 && (arg.charAt(0) == '+' || arg.charAt(0) == '-')) {
+            value = Boolean.toString(arg.charAt(0) == '+');
+            name = arg.substring(1);
+        } else {
+            int idx = arg.indexOf('=');
+            if (idx < 0) {
+                unrecognized.add(fullArg);
+                return;
+            }
+            name = arg.substring(0, idx);
+            value = arg.substring(idx + 1);
+        }
+        if (knownPassThroughOptions.contains(name)) {
+            espressoOptions.put("java." + name, value);
+            return;
+        }
+        switch (name) {
+            case "UnlockDiagnosticVMOptions", "UnlockExperimentalVMOptions" -> unrecognized.add("--experimental-options=" + value);
+            case "TieredStopAtLevel" -> {
+                if ("0".equals(value)) {
+                    espressoOptions.put("engine.Compilation", "false");
+                } else {
+                    unrecognized.add(fullArg);
+                }
+            }
+            default -> unrecognized.add(fullArg);
+        }
     }
 
     private void buildJvmArgs(List<String> arguments, int toBuild) {
@@ -347,7 +464,7 @@ public final class EspressoLauncher extends AbstractLanguageLauncher {
          * world. It is actually expected that the vm arguments list is populated with arguments
          * which have been pre-formatted by the regular Java launcher when passed to the VM, ie: the
          * arguments if the VM was created through a call to JNI_CreateJavaVM.
-         * 
+         *
          * In particular, it expects all kay-value pairs to be equals-separated and not
          * space-separated. Furthermore, it does not expect syntactic-sugared some arguments such as
          * '-m' or '--modules', that would have been replaced by the regular java launcher as
@@ -478,9 +595,10 @@ public final class EspressoLauncher extends AbstractLanguageLauncher {
             contextBuilder.option(entry.getKey(), entry.getValue());
         }
 
-        int rc = 1;
-
         contextBuilder.allowCreateThread(true);
+        // We use the host system exit for compatibility with the reference implementation.
+        contextBuilder.useSystemExit(true);
+        contextBuilder.option("java.ExitHost", "true");
 
         try (Context context = contextBuilder.build()) {
 
@@ -496,7 +614,14 @@ public final class EspressoLauncher extends AbstractLanguageLauncher {
                 } else {
                     // > Java 8
                     version = context.getBindings("java").getMember("java.lang.VersionProps");
-                    version.invokeMember("print", /* print to stderr = */false);
+                    if (version.hasMember("print/(Z)V")) {
+                        Value printMethod = version.getMember("print/(Z)V");
+                        printMethod.execute(/* print to stderr = */false);
+                    } else {
+                        // print is probably private
+                        // fallback until we have an embedded API to call private members
+                        printVersionFallback(context);
+                    }
                 }
                 if (versionAction == VersionAction.PrintAndExit) {
                     throw exit(0);
@@ -511,7 +636,16 @@ public final class EspressoLauncher extends AbstractLanguageLauncher {
                 Value mainKlass = launcherHelper //
                                 .invokeMember("checkAndLoadMain", true, launchMode.ordinal(), mainClassName) //
                                 .getMember("static");
-                mainKlass.invokeMember("main/([Ljava/lang/String;)V", (Object) mainClassArgs.toArray(new String[0]));
+
+                // Convert arguments to a guest String[], avoiding passing a foreign object right
+                // away to Espresso.
+                Value stringArray = context.getBindings("java").getMember("[Ljava.lang.String;");
+                Value guestMainClassArgs = stringArray.newInstance(mainClassArgs.size());
+                for (int i = 0; i < mainClassArgs.size(); i++) {
+                    guestMainClassArgs.setArrayElement(i, mainClassArgs.get(i));
+                }
+
+                mainKlass.invokeMember("main/([Ljava/lang/String;)V", guestMainClassArgs);
                 if (pauseOnExit) {
                     getError().print("Press any key to continue...");
                     try {
@@ -523,48 +657,50 @@ public final class EspressoLauncher extends AbstractLanguageLauncher {
             } catch (PolyglotException e) {
                 if (e.isInternalError()) {
                     e.printStackTrace();
+                    throw abort((String) null);
                 } else if (!e.isExit()) {
                     handleMainUncaught(context, e);
-                }
-            } finally {
-                try {
-                    context.eval("java", "<DestroyJavaVM>").execute();
-                } catch (PolyglotException e) {
-                    /*
-                     * If everything went well, an exit exception is expected here. Failure to see
-                     * an exit exception most likely means something went wrong during context
-                     * initialization.
-                     */
-                    if (e.isExit()) {
-                        rc = e.getExitStatus();
-                    } else {
-                        e.printStackTrace();
-                        throw handleUnexpectedDestroy(e);
-                    }
+                    throw abort((String) null);
+                } else {
+                    throw abort((String) null, e.getExitStatus());
                 }
             }
-            /*
-             * We abruptly exit the host system for compatibility with the reference implementation,
-             * and because we have no control over un-registering thread from Truffle, which
-             * sometimes leads to getting an exception on exit when trying to close a context with a
-             * rogue thread in native.
-             * 
-             * Note that since the launcher thread and the main thread are the same, a rogue native
-             * main means we may never return.
-             */
-            System.exit(rc);
         }
     }
 
-    private AbortException handleUnexpectedDestroy(PolyglotException e) {
-        String message = e.getMessage();
-        if (message != null) {
-            int colonIdx = message.indexOf(':');
-            if (colonIdx >= 0 && colonIdx + 1 < message.length()) {
-                throw abort(message.substring(colonIdx + 1));
-            }
+    private void printVersionFallback(Context context) {
+        // See java.lang.VersionProps.print
+        Value system = context.getBindings("java").getMember("java.lang.System");
+        String javaVersion = system.invokeMember("getProperty", "java.version").asString();
+        String javaVersionDate = system.invokeMember("getProperty", "java.version.date").asString();
+        String debugLevel = system.invokeMember("getProperty", "jdk.debug", "release").asString();
+        String vendorVersion = system.invokeMember("getProperty", "java.vendor.version", "").asString();
+        String javaRuntimeName = system.invokeMember("getProperty", "java.runtime.name").asString();
+        String javaRuntimeVersion = system.invokeMember("getProperty", "java.runtime.version").asString();
+        boolean isLTS = javaRuntimeVersion.contains("LTS");
+        String javaVMName = system.invokeMember("getProperty", "java.vm.name").asString();
+        String javaVMVersion = system.invokeMember("getProperty", "java.vm.version").asString();
+        String javVMInfo = system.invokeMember("getProperty", "java.vm.info").asString();
+        String launcherName = "espresso";
+
+        /* First line: platform version. */
+        /* Use a format more in line with GNU conventions */
+        getOutput().println(launcherName + " " + javaVersion + " " + javaVersionDate + (isLTS ? " LTS" : ""));
+
+        /* Second line: runtime version (ie, libraries). */
+        if ("release".equals(debugLevel)) {
+            /* Do not show debug level "release" builds */
+            debugLevel = "";
+        } else {
+            debugLevel = debugLevel + " ";
         }
-        throw abort(message);
+
+        vendorVersion = vendorVersion.isEmpty() ? "" : " " + vendorVersion;
+
+        getOutput().println(javaRuntimeName + vendorVersion + " (" + debugLevel + "build " + javaRuntimeVersion + ")");
+
+        /* Third line: JVM information. */
+        getOutput().println(javaVMName + vendorVersion + " (" + debugLevel + "build " + javaVMVersion + ", " + javVMInfo + ")");
     }
 
     private static void handleMainUncaught(Context context, PolyglotException e) {
@@ -592,6 +728,7 @@ public final class EspressoLauncher extends AbstractLanguageLauncher {
         options.add("-classpath");
         options.add("-version");
         options.add("-showversion");
+        options.add("--show-version");
         options.add("-ea");
         options.add("-enableassertions");
         options.add("-esa");

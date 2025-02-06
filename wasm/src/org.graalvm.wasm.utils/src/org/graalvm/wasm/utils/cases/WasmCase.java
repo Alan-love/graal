@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2019, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -40,25 +40,29 @@
  */
 package org.graalvm.wasm.utils.cases;
 
-import org.graalvm.polyglot.Source;
-import org.graalvm.polyglot.Value;
-import org.graalvm.polyglot.io.ByteSequence;
-import org.graalvm.wasm.utils.Assert;
-import org.graalvm.wasm.utils.SystemProperties;
-import org.graalvm.wasm.utils.WasmResource;
-
 import java.io.BufferedReader;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
-import java.io.UnsupportedEncodingException;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.EnumSet;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Properties;
 import java.util.function.BiConsumer;
+
+import org.graalvm.polyglot.Source;
+import org.graalvm.polyglot.Value;
+import org.graalvm.polyglot.io.ByteSequence;
+import org.graalvm.wasm.WasmLanguage;
+import org.graalvm.wasm.utils.SystemProperties;
+import org.graalvm.wasm.utils.WasmBinaryTools;
+import org.graalvm.wasm.utils.WasmResource;
+import org.junit.Assert;
 
 /**
  * Instances of this class are used for WebAssembly test/benchmark cases.
@@ -86,17 +90,18 @@ public abstract class WasmCase {
         return options;
     }
 
-    public ArrayList<Source> getSources() throws IOException, InterruptedException {
+    public ArrayList<Source> getSources(EnumSet<WasmBinaryTools.WabtOption> wabtOptions) throws IOException, InterruptedException {
         ArrayList<Source> sources = new ArrayList<>();
-        for (Map.Entry<String, byte[]> entry : createBinaries().entrySet()) {
-            Source.Builder sourceBuilder = Source.newBuilder("wasm", ByteSequence.create(entry.getValue()), entry.getKey());
+        for (Map.Entry<String, byte[]> entry : createBinaries(wabtOptions).entrySet()) {
+            Source.Builder sourceBuilder = Source.newBuilder(WasmLanguage.ID, ByteSequence.create(entry.getValue()), entry.getKey());
+            sourceBuilder.cached(false);
             Source source = sourceBuilder.build();
             sources.add(source);
         }
         return sources;
     }
 
-    public abstract Map<String, byte[]> createBinaries() throws IOException, InterruptedException;
+    public abstract Map<String, byte[]> createBinaries(EnumSet<WasmBinaryTools.WabtOption> wabtOptions) throws IOException, InterruptedException;
 
     public static WasmStringCase create(String name, WasmCaseData data, String program) {
         return new WasmStringCase(name, data, program, new Properties());
@@ -116,7 +121,7 @@ public abstract class WasmCase {
 
             // When an output is expected, we also check that the main function returns is 0 if it
             // returns a number.
-            if (result.isNumber()) {
+            if (result != null && result.isNumber()) {
                 Assert.assertEquals("Failure: exit code:", 0, result.asInt());
             }
         });
@@ -127,15 +132,23 @@ public abstract class WasmCase {
     }
 
     public static WasmCaseData expectedFloat(float expectedValue, float delta) {
-        return new WasmCaseData((Value result, String output) -> Assert.assertFloatEquals("Failure: result:", expectedValue, result.as(Float.class), delta));
+        return new WasmCaseData((Value result, String output) -> Assert.assertEquals("Failure: result:", expectedValue, result.as(Float.class), delta));
     }
 
     public static WasmCaseData expectedDouble(double expectedValue, double delta) {
-        return new WasmCaseData((Value result, String output) -> Assert.assertDoubleEquals("Failure: result:", expectedValue, result.as(Double.class), delta));
+        return new WasmCaseData((Value result, String output) -> Assert.assertEquals("Failure: result:", expectedValue, result.as(Double.class), delta));
     }
 
     public static WasmCaseData expectedThrows(String expectedErrorMessage, WasmCaseData.ErrorType phase) {
         return new WasmCaseData(expectedErrorMessage.trim(), phase);
+    }
+
+    public static WasmCaseData expectedMultiValue(Object[] expectedValues) {
+        return new WasmCaseData((Value result, String output) -> {
+            for (int i = 0; i < expectedValues.length; i++) {
+                Assert.assertEquals("Failure: result: ", expectedValues[i], result.getArrayElement(i).as(Object.class));
+            }
+        });
     }
 
     public static Collection<WasmCase> collectFileCases(String type, String resource) throws IOException {
@@ -146,7 +159,8 @@ public abstract class WasmCase {
 
         // Open the wasm_test_index file of the bundle. The wasm_test_index file contains the
         // available cases for that bundle.
-        InputStream index = WasmCase.class.getResourceAsStream(String.format("/%s/%s/wasm_test_index", type, resource));
+        String indexResourcePath = String.format("/%s/%s/wasm_test_index", type, resource);
+        InputStream index = Objects.requireNonNull(WasmCase.class.getResourceAsStream(indexResourcePath), indexResourcePath);
         BufferedReader indexReader = new BufferedReader(new InputStreamReader(index));
 
         // Iterate through the available test of the bundle.
@@ -205,6 +219,27 @@ public abstract class WasmCase {
             case "double":
                 caseData = WasmCase.expected(Double.parseDouble(resultValue.trim()));
                 break;
+            case "multi-value":
+                String[] values = resultValue.split("\\s+");
+                Object[] expectedValues = new Object[values.length / 2];
+                for (int i = 0; i < values.length; i += 2) {
+                    switch (values[i]) {
+                        case "int":
+                            expectedValues[i / 2] = Integer.parseInt(values[i + 1]);
+                            break;
+                        case "long":
+                            expectedValues[i / 2] = Long.parseLong(values[i + 1]);
+                            break;
+                        case "float":
+                            expectedValues[i / 2] = Float.parseFloat(values[i + 1]);
+                            break;
+                        case "double":
+                            expectedValues[i / 2] = Double.parseDouble(values[i + 1]);
+                            break;
+                    }
+                }
+                caseData = WasmCase.expectedMultiValue(expectedValues);
+                break;
             case "validation":
                 caseData = WasmCase.expectedThrows(resultValue, WasmCaseData.ErrorType.Validation);
                 break;
@@ -212,7 +247,7 @@ public abstract class WasmCase {
                 caseData = WasmCase.expectedThrows(resultValue, WasmCaseData.ErrorType.Runtime);
                 break;
             default:
-                Assert.fail(String.format("Unknown type in result specification: %s", resultType));
+                throw new RuntimeException(String.format("Unknown type in result specification: %s", resultType));
         }
 
         if (mainContents.size() == 1) {
@@ -222,7 +257,7 @@ public abstract class WasmCase {
             } else if (content instanceof byte[]) {
                 return WasmCase.create(caseName, caseData, (byte[]) content, options);
             } else {
-                Assert.fail("Unknown content type: " + content.getClass());
+                throw new RuntimeException("Unknown content type: " + content.getClass());
             }
         } else if (mainContents.size() > 1) {
             return new WasmMultiCase(caseName, caseData, mainContents, options);
@@ -235,7 +270,7 @@ public abstract class WasmCase {
         final String name = SystemProperties.BENCHMARK_NAME;
 
         Assert.assertNotNull("Please select a benchmark by setting -D" + SystemProperties.BENCHMARK_NAME_PROPERTY_NAME, name);
-        Assert.assertTrue("Benchmark name must not be empty", !name.trim().isEmpty());
+        Assert.assertFalse("Benchmark name must not be empty", name.trim().isEmpty());
 
         final WasmCase result = WasmCase.collectFileCase("bench", resource, name);
         Assert.assertNotNull(String.format("Benchmark %s.%s not found", name, name), result);
@@ -245,13 +280,13 @@ public abstract class WasmCase {
 
     public static void validateResult(BiConsumer<Value, String> validator, Value result, ByteArrayOutputStream capturedStdout) {
         if (validator != null) {
-            try {
-                validator.accept(result, capturedStdout.toString("UTF-8"));
-            } catch (UnsupportedEncodingException e) {
-                Assert.fail("Should not reach here: unsupported encoding");
-            }
+            validator.accept(result, capturedStdout.toString(StandardCharsets.UTF_8));
         } else {
-            Assert.fail("Test was not expected to return a value.");
+            throw new RuntimeException("Test was not expected to return a value.");
         }
+    }
+
+    public boolean isSkipped() {
+        return options().getProperty("skip-on-windows", "false").equals("true") && System.getProperty("os.name", "").contains("Windows");
     }
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2021, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -41,24 +41,26 @@
 
 package org.graalvm.wasm.predefined.wasi.fd;
 
-import com.oracle.truffle.api.TruffleFile;
-import com.oracle.truffle.api.TruffleLanguage;
+import java.io.Closeable;
+import java.io.IOException;
+import java.util.concurrent.ThreadLocalRandom;
+
+import org.graalvm.collections.EconomicMap;
 import org.graalvm.wasm.WasmOptions;
 import org.graalvm.wasm.exception.Failure;
 import org.graalvm.wasm.exception.WasmException;
 
-import java.io.Closeable;
-import java.io.IOException;
-import java.util.HashMap;
-import java.util.Map;
-import java.util.concurrent.ThreadLocalRandom;
+import com.oracle.truffle.api.CompilerAsserts;
+import com.oracle.truffle.api.TruffleFile;
+import com.oracle.truffle.api.TruffleLanguage;
 
 public final class FdManager implements Closeable {
 
-    private final Map<Integer, Fd> handles;
+    private final EconomicMap<Integer, Fd> handles;
 
     public FdManager(TruffleLanguage.Env env) {
-        handles = new HashMap<>();
+        CompilerAsserts.neverPartOfCompilation();
+        handles = EconomicMap.create(3);
 
         put(0, new InputStreamFd(env.in()));
         put(1, new OutputStreamFd(env.out()));
@@ -79,16 +81,17 @@ public final class FdManager implements Closeable {
             final String virtualDirPath = parts[0];
             final String hostDirPath = parts.length == 2 ? parts[1] : parts[0];
 
-            final TruffleFile virtualDir = env.getPublicTruffleFile(virtualDirPath).normalize();
+            final TruffleFile virtualDir;
             final TruffleFile hostDir;
             try {
+                virtualDir = env.getPublicTruffleFile(virtualDirPath).normalize();
                 // Currently, we follow symbolic links.
                 hostDir = env.getPublicTruffleFile(hostDirPath).getCanonicalFile();
             } catch (IOException | SecurityException e) {
                 throw WasmException.create(Failure.INVALID_WASI_DIRECTORIES_MAPPING);
             }
 
-            put(fd, new PreopenedDirectoryFd(this, hostDir, virtualDir));
+            put(fd, new PreopenedDirectoryFd(this, hostDir, virtualDir, virtualDirPath));
             ++fd;
         }
     }
@@ -119,7 +122,12 @@ public final class FdManager implements Closeable {
     }
 
     public synchronized void remove(int fd) {
-        handles.remove(fd);
+        handles.removeKey(fd);
+    }
+
+    public synchronized void renumber(int fd, int to) {
+        handles.put(to, handles.get(fd));
+        handles.removeKey(fd);
     }
 
     /**
@@ -131,7 +139,7 @@ public final class FdManager implements Closeable {
 
     @Override
     public synchronized void close() throws IOException {
-        for (final Fd handle : handles.values()) {
+        for (final Fd handle : handles.getValues()) {
             handle.close();
         }
         handles.clear();

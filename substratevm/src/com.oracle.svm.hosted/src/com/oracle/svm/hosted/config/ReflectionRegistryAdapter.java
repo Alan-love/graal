@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2023, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,133 +24,115 @@
  */
 package com.oracle.svm.hosted.config;
 
-import java.lang.reflect.Executable;
-import java.util.List;
+import java.lang.reflect.Proxy;
+import java.util.Arrays;
 
-import org.graalvm.nativeimage.impl.ReflectionRegistry;
+import org.graalvm.nativeimage.impl.ConfigurationCondition;
+import org.graalvm.nativeimage.impl.RuntimeReflectionSupport;
+import org.graalvm.nativeimage.impl.RuntimeSerializationSupport;
 
 import com.oracle.svm.core.TypeResult;
-import com.oracle.svm.core.configure.ReflectionConfigurationParserDelegate;
+import com.oracle.svm.core.configure.ConfigurationTypeDescriptor;
+import com.oracle.svm.core.configure.NamedConfigurationTypeDescriptor;
 import com.oracle.svm.hosted.ImageClassLoader;
+import com.oracle.svm.hosted.reflect.ReflectionDataBuilder;
+import com.oracle.svm.hosted.reflect.proxy.ProxyRegistry;
 
-import jdk.vm.ci.meta.MetaUtil;
+public class ReflectionRegistryAdapter extends RegistryAdapter {
+    private final RuntimeReflectionSupport reflectionSupport;
+    private final ProxyRegistry proxyRegistry;
+    private final RuntimeSerializationSupport<ConfigurationCondition> serializationSupport;
 
-public class ReflectionRegistryAdapter implements ReflectionConfigurationParserDelegate<Class<?>> {
-    private final ReflectionRegistry registry;
-    private final ImageClassLoader classLoader;
-
-    public ReflectionRegistryAdapter(ReflectionRegistry registry, ImageClassLoader classLoader) {
-        this.registry = registry;
-        this.classLoader = classLoader;
+    ReflectionRegistryAdapter(RuntimeReflectionSupport reflectionSupport, ProxyRegistry proxyRegistry, RuntimeSerializationSupport<ConfigurationCondition> serializationSupport,
+                    ImageClassLoader classLoader) {
+        super(reflectionSupport, classLoader);
+        this.reflectionSupport = reflectionSupport;
+        this.proxyRegistry = proxyRegistry;
+        this.serializationSupport = serializationSupport;
     }
 
     @Override
-    public void registerType(Class<?> type) {
-        registry.register(type);
-    }
-
-    @Override
-    @SuppressWarnings("deprecation")
-    public Class<?> resolveType(String typeName) {
-        return resolveTypeResult(typeName).get();
-    }
-
-    @Override
-    public TypeResult<Class<?>> resolveTypeResult(String typeName) {
-        String name = typeName;
-        if (name.indexOf('[') != -1) {
-            /* accept "int[][]", "java.lang.String[]" */
-            name = MetaUtil.internalNameToJava(MetaUtil.toInternalName(name), true, true);
+    public void registerType(ConfigurationCondition condition, Class<?> type) {
+        super.registerType(condition, type);
+        if (Proxy.isProxyClass(type)) {
+            proxyRegistry.accept(condition, Arrays.stream(type.getInterfaces()).map(Class::getTypeName).toList());
         }
-        return classLoader.findClass(name);
     }
 
     @Override
-    public void registerPublicClasses(Class<?> type) {
-        registry.register(type.getClasses());
-    }
-
-    @Override
-    public void registerDeclaredClasses(Class<?> type) {
-        registry.register(type.getDeclaredClasses());
-    }
-
-    @Override
-    public void registerPublicFields(Class<?> type) {
-        registry.register(false, type.getFields());
-    }
-
-    @Override
-    public void registerDeclaredFields(Class<?> type) {
-        registry.register(false, type.getDeclaredFields());
-    }
-
-    @Override
-    public void registerPublicMethods(Class<?> type) {
-        registry.register(type.getMethods());
-    }
-
-    @Override
-    public void registerDeclaredMethods(Class<?> type) {
-        registry.register(type.getDeclaredMethods());
-    }
-
-    @Override
-    public void registerPublicConstructors(Class<?> type) {
-        registry.register(type.getConstructors());
-    }
-
-    @Override
-    public void registerDeclaredConstructors(Class<?> type) {
-        registry.register(type.getDeclaredConstructors());
-    }
-
-    @Override
-    public void registerField(Class<?> type, String fieldName, boolean allowWrite) throws NoSuchFieldException {
-        registry.register(allowWrite, type.getDeclaredField(fieldName));
-    }
-
-    @Override
-    public boolean registerAllMethodsWithName(Class<?> type, String methodName) {
-        boolean found = false;
-        Executable[] methods = type.getDeclaredMethods();
-        for (Executable method : methods) {
-            if (method.getName().equals(methodName)) {
-                registry.register(method);
-                found = true;
+    public TypeResult<Class<?>> resolveType(ConfigurationCondition condition, ConfigurationTypeDescriptor typeDescriptor, boolean allowPrimitives) {
+        TypeResult<Class<?>> result = super.resolveType(condition, typeDescriptor, allowPrimitives);
+        if (!result.isPresent() && typeDescriptor instanceof NamedConfigurationTypeDescriptor namedDescriptor) {
+            Throwable classLookupException = result.getException();
+            if (classLookupException instanceof LinkageError) {
+                reflectionSupport.registerClassLookupException(condition, namedDescriptor.name(), classLookupException);
             }
         }
-        return found;
+        return result;
     }
 
     @Override
-    public boolean registerAllConstructors(Class<?> clazz) {
-        Executable[] methods = clazz.getDeclaredConstructors();
-        for (Executable method : methods) {
-            registry.register(method);
-        }
-        return methods.length > 0;
+    public void registerPublicClasses(ConfigurationCondition condition, Class<?> type) {
+        reflectionSupport.registerAllClassesQuery(condition, type);
     }
 
     @Override
-    public void registerMethod(Class<?> type, String methodName, List<Class<?>> methodParameterTypes) throws NoSuchMethodException {
-        Class<?>[] parameterTypesArray = methodParameterTypes.toArray(new Class<?>[0]);
-        registry.register((Executable) type.getDeclaredMethod(methodName, parameterTypesArray));
+    public void registerDeclaredClasses(ConfigurationCondition condition, Class<?> type) {
+        reflectionSupport.registerAllDeclaredClassesQuery(condition, type);
     }
 
     @Override
-    public void registerConstructor(Class<?> clazz, List<Class<?>> methodParameterTypes) throws NoSuchMethodException {
-        Class<?>[] parameterTypesArray = methodParameterTypes.toArray(new Class<?>[0]);
-        registry.register((Executable) clazz.getDeclaredConstructor(parameterTypesArray));
+    public void registerRecordComponents(ConfigurationCondition condition, Class<?> type) {
+        reflectionSupport.registerAllRecordComponentsQuery(condition, type);
     }
 
     @Override
-    public String getTypeName(Class<?> type) {
-        return type.getTypeName();
+    public void registerPermittedSubclasses(ConfigurationCondition condition, Class<?> type) {
+        reflectionSupport.registerAllPermittedSubclassesQuery(condition, type);
     }
 
     @Override
-    public String getSimpleName(Class<?> type) {
-        return type.getSimpleName();
+    public void registerNestMembers(ConfigurationCondition condition, Class<?> type) {
+        reflectionSupport.registerAllNestMembersQuery(condition, type);
+    }
+
+    @Override
+    public void registerSigners(ConfigurationCondition condition, Class<?> type) {
+        reflectionSupport.registerAllSignersQuery(condition, type);
+    }
+
+    @Override
+    public void registerPublicFields(ConfigurationCondition condition, boolean queriedOnly, Class<?> type) {
+        ((ReflectionDataBuilder) reflectionSupport).registerAllFieldsQuery(condition, queriedOnly, type);
+    }
+
+    @Override
+    public void registerDeclaredFields(ConfigurationCondition condition, boolean queriedOnly, Class<?> type) {
+        ((ReflectionDataBuilder) reflectionSupport).registerAllDeclaredFieldsQuery(condition, queriedOnly, type);
+    }
+
+    @Override
+    public void registerPublicMethods(ConfigurationCondition condition, boolean queriedOnly, Class<?> type) {
+        reflectionSupport.registerAllMethodsQuery(condition, queriedOnly, type);
+    }
+
+    @Override
+    public void registerDeclaredMethods(ConfigurationCondition condition, boolean queriedOnly, Class<?> type) {
+        reflectionSupport.registerAllDeclaredMethodsQuery(condition, queriedOnly, type);
+    }
+
+    @Override
+    public void registerPublicConstructors(ConfigurationCondition condition, boolean queriedOnly, Class<?> type) {
+        reflectionSupport.registerAllConstructorsQuery(condition, queriedOnly, type);
+    }
+
+    @Override
+    public void registerDeclaredConstructors(ConfigurationCondition condition, boolean queriedOnly, Class<?> type) {
+        reflectionSupport.registerAllDeclaredConstructorsQuery(condition, queriedOnly, type);
+    }
+
+    @Override
+    public void registerAsSerializable(ConfigurationCondition condition, Class<?> clazz) {
+        serializationSupport.register(condition, clazz);
     }
 }

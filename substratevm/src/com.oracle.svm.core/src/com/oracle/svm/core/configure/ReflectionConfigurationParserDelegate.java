@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2019, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -28,45 +28,49 @@ import java.util.List;
 
 import com.oracle.svm.core.TypeResult;
 
-public interface ReflectionConfigurationParserDelegate<T> {
+public interface ReflectionConfigurationParserDelegate<C, T> {
 
-    /**
-     * @deprecated use {@link #resolveTypeResult(String)} instead.
-     */
-    @Deprecated
-    default T resolveType(String typeName) {
-        return resolveTypeResult(typeName).get();
-    }
+    TypeResult<T> resolveType(C condition, ConfigurationTypeDescriptor typeDescriptor, boolean allowPrimitives);
 
-    TypeResult<T> resolveTypeResult(String typeName);
+    void registerType(C condition, T type);
 
-    void registerType(T type);
+    void registerPublicClasses(C condition, T type);
 
-    void registerPublicClasses(T type);
+    void registerDeclaredClasses(C condition, T type);
 
-    void registerDeclaredClasses(T type);
+    void registerRecordComponents(C condition, T type);
 
-    void registerPublicFields(T type);
+    void registerPermittedSubclasses(C condition, T type);
 
-    void registerDeclaredFields(T type);
+    void registerNestMembers(C condition, T type);
 
-    void registerPublicMethods(T type);
+    void registerSigners(C condition, T type);
 
-    void registerDeclaredMethods(T type);
+    void registerPublicFields(C condition, boolean queriedOnly, T type);
 
-    void registerPublicConstructors(T type);
+    void registerDeclaredFields(C condition, boolean queriedOnly, T type);
 
-    void registerDeclaredConstructors(T type);
+    void registerPublicMethods(C condition, boolean queriedOnly, T type);
 
-    void registerField(T type, String fieldName, boolean allowWrite) throws NoSuchFieldException;
+    void registerDeclaredMethods(C condition, boolean queriedOnly, T type);
 
-    boolean registerAllMethodsWithName(T type, String methodName);
+    void registerPublicConstructors(C condition, boolean queriedOnly, T type);
 
-    void registerMethod(T type, String methodName, List<T> methodParameterTypes) throws NoSuchMethodException;
+    void registerDeclaredConstructors(C condition, boolean queriedOnly, T type);
 
-    void registerConstructor(T type, List<T> methodParameterTypes) throws NoSuchMethodException;
+    void registerField(C condition, T type, String fieldName, boolean allowWrite) throws NoSuchFieldException;
 
-    boolean registerAllConstructors(T type);
+    boolean registerAllMethodsWithName(C condition, boolean queriedOnly, T type, String methodName);
+
+    void registerMethod(C condition, boolean queriedOnly, T type, String methodName, List<T> methodParameterTypes) throws NoSuchMethodException;
+
+    void registerConstructor(C condition, boolean queriedOnly, T type, List<T> methodParameterTypes) throws NoSuchMethodException;
+
+    boolean registerAllConstructors(C condition, boolean queriedOnly, T type);
+
+    void registerUnsafeAllocated(C condition, T clazz);
+
+    void registerAsSerializable(C condition, T clazz);
 
     String getTypeName(T type);
 

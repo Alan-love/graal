@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -337,8 +337,8 @@ public class ExportSubclassTest extends AbstractLibraryTest {
     }
 
     @ExpectError("Class declares @ExportMessage annotations but does not export any libraries. "//
-                    + "Exported messages cannot be resoved without exported library. "//
-                    + "Add @ExportLibrary(MyLibrary.class) to the class ot resolve this.")
+                    + "Exported messages cannot be resolved without exported library. "//
+                    + "Add @ExportLibrary(MyLibrary.class) to the class to fix this.")
     static class MissingExportLibraryError {
 
         @ExportMessage
@@ -367,10 +367,10 @@ public class ExportSubclassTest extends AbstractLibraryTest {
         }
     }
 
-    @ExpectError("No message 'invalidMessageName' found for library ExportSubclassLibrary1.")
     static class MissingExportWithBaseTypeInvalidMessageError extends ExportRedirectionBase {
 
         @ExportMessage
+        @ExpectError("No message 'invalidMessageName' found for library ExportSubclassLibrary1.")
         String invalidMessageName() {
             return "";
         }

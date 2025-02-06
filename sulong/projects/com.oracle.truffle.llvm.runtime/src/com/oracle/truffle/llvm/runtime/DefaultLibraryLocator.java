@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, 2020, Oracle and/or its affiliates.
+ * Copyright (c) 2019, 2023, Oracle and/or its affiliates.
  *
  * All rights reserved.
  *
@@ -46,7 +46,7 @@ public final class DefaultLibraryLocator extends LibraryLocator {
     }
 
     @Override
-    public TruffleFile locateLibrary(LLVMContext context, String lib, Object reason) {
+    public Object locateLibrary(LLVMContext context, String lib, Object reason) {
         Path libPath = Paths.get(lib);
         if (libPath.isAbsolute()) {
             return locateAbsolute(context, libPath);
@@ -54,7 +54,13 @@ public final class DefaultLibraryLocator extends LibraryLocator {
         return locateGlobal(context, lib);
     }
 
-    public static TruffleFile locateGlobal(LLVMContext context, String lib) {
+    public static Object locateGlobal(LLVMContext context, String lib) {
+        // search sulong runtime path
+        Object internalLib = LLVMContext.InternalLocator.INSTANCE.locateLibrary(context, lib, "<locate global>");
+        if (internalLib != null) {
+            return internalLib;
+        }
+
         // search global paths
         List<Path> libraryPaths = context.getLibraryPaths();
         traceSearchPath(context, libraryPaths);
@@ -73,17 +79,23 @@ public final class DefaultLibraryLocator extends LibraryLocator {
         assert libPath.isAbsolute();
         traceTry(context, libPath);
         TruffleFile file = context.getEnv().getInternalTruffleFile(libPath.toUri());
-        if (file.exists()) {
-            return file;
-        } else {
+        try {
+            if (file.exists()) {
+                return file;
+            }
+        } catch (SecurityException se) {
             /*
-             * On OSX Big Sur, some system libraries don't exist as a file. These libraries are
-             * native libraries anyway, Sulong can do nothing with these libraries, so we can just
-             * return null here. The NFI will later re-try locating these libraries, and they will
-             * be found via the dlopen cache.
+             * Files that aren't allowed to be accessed are treated like they would not exist, see
+             * below for an usecase.
              */
-            return null;
         }
+        /*
+         * On OSX Big Sur, some system libraries don't exist as a file. These libraries are native
+         * libraries anyway, Sulong can do nothing with these libraries, so we can just return null
+         * here. The NFI will later re-try locating these libraries, and they will be found via the
+         * dlopen cache.
+         */
+        return null;
     }
 
 }

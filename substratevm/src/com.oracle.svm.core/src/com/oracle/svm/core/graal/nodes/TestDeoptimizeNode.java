@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014, 2017, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2014, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,25 +24,26 @@
  */
 package com.oracle.svm.core.graal.nodes;
 
-import org.graalvm.compiler.core.common.type.StampFactory;
-import org.graalvm.compiler.graph.Node;
-import org.graalvm.compiler.graph.NodeClass;
-import org.graalvm.compiler.nodes.spi.Canonicalizable;
-import org.graalvm.compiler.nodes.spi.CanonicalizerTool;
-import org.graalvm.compiler.nodeinfo.NodeCycles;
-import org.graalvm.compiler.nodeinfo.NodeInfo;
-import org.graalvm.compiler.nodeinfo.NodeSize;
-import org.graalvm.compiler.nodes.DeoptimizeNode;
-import org.graalvm.compiler.nodes.FixedWithNextNode;
+import com.oracle.svm.core.BuildPhaseProvider;
+import com.oracle.svm.core.SubstrateUtil;
+import com.oracle.svm.core.util.VMError;
 
-import com.oracle.svm.core.meta.SharedMethod;
-
+import jdk.graal.compiler.core.common.type.StampFactory;
+import jdk.graal.compiler.graph.Node;
+import jdk.graal.compiler.graph.NodeClass;
+import jdk.graal.compiler.nodeinfo.NodeCycles;
+import jdk.graal.compiler.nodeinfo.NodeInfo;
+import jdk.graal.compiler.nodeinfo.NodeSize;
+import jdk.graal.compiler.nodes.DeoptimizeNode;
+import jdk.graal.compiler.nodes.FixedWithNextNode;
+import jdk.graal.compiler.nodes.spi.Canonicalizable;
+import jdk.graal.compiler.nodes.spi.CanonicalizerTool;
 import jdk.vm.ci.meta.DeoptimizationAction;
 import jdk.vm.ci.meta.DeoptimizationReason;
 
 /**
- * For deoptimzation testing. The node performs a deoptimization in a normally compiled method, but
- * is a no-op in the deoptimization target method.
+ * For deoptimization testing. The node performs a deoptimization, but the lowering to
+ * DeoptimizeNode is delayed, so that the analysis sees a return from original method.
  */
 @NodeInfo(cycles = NodeCycles.CYCLES_IGNORED, size = NodeSize.SIZE_IGNORED)
 public class TestDeoptimizeNode extends FixedWithNextNode implements Canonicalizable {
@@ -54,16 +55,12 @@ public class TestDeoptimizeNode extends FixedWithNextNode implements Canonicaliz
 
     @Override
     public Node canonical(CanonicalizerTool tool) {
-        if (graph().method() instanceof SharedMethod) {
-            SharedMethod method = (SharedMethod) graph().method();
-            if (method.isDeoptTarget()) {
-                /* no-op for deoptimization target methods. */
-                return null;
-            } else {
-                /* deoptimization for all other methods. */
-                return new DeoptimizeNode(DeoptimizationAction.None, DeoptimizationReason.TransferToInterpreter);
+        if (SubstrateUtil.HOSTED) {
+            if (!BuildPhaseProvider.isAnalysisFinished()) {
+                return this;
             }
+            return new DeoptimizeNode(DeoptimizationAction.None, DeoptimizationReason.TransferToInterpreter);
         }
-        return this;
+        throw VMError.shouldNotReachHere("Should only be used in hosted.");
     }
 }

@@ -24,15 +24,16 @@
  */
 package com.oracle.svm.core.genscavenge.graal.nodes;
 
-import static org.graalvm.compiler.nodeinfo.NodeCycles.CYCLES_64;
-import static org.graalvm.compiler.nodeinfo.NodeSize.SIZE_64;
+import static jdk.graal.compiler.nodeinfo.NodeCycles.CYCLES_64;
+import static jdk.graal.compiler.nodeinfo.NodeSize.SIZE_64;
 
-import org.graalvm.compiler.core.common.type.StampFactory;
-import org.graalvm.compiler.graph.NodeClass;
-import org.graalvm.compiler.nodeinfo.NodeInfo;
-import org.graalvm.compiler.nodes.FixedWithNextNode;
-import org.graalvm.compiler.nodes.ValueNode;
-import org.graalvm.compiler.nodes.spi.Lowerable;
+import jdk.graal.compiler.core.common.type.StampFactory;
+import jdk.graal.compiler.graph.NodeClass;
+import jdk.graal.compiler.nodeinfo.NodeInfo;
+import jdk.graal.compiler.nodes.FixedWithNextNode;
+import jdk.graal.compiler.nodes.ValueNode;
+import jdk.graal.compiler.nodes.spi.Lowerable;
+import jdk.graal.compiler.replacements.AllocationSnippets.FillContent;
 import org.graalvm.word.Pointer;
 
 @NodeInfo(cycles = CYCLES_64, size = SIZE_64)
@@ -75,5 +76,5 @@ public class FormatObjectNode extends FixedWithNextNode implements Lowerable {
     }
 
     @NodeIntrinsic
-    public static native Object formatObject(Pointer memory, Class<?> hub, boolean rememberedSet, boolean fillContents, boolean emitMemoryBarrier);
+    public static native Object formatObject(Pointer memory, Class<?> hub, boolean rememberedSet, FillContent fillContents, boolean emitMemoryBarrier);
 }

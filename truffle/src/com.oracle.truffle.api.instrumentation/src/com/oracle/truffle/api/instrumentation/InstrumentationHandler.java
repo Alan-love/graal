@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2016, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2016, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -60,12 +60,15 @@ import java.util.Map;
 import java.util.NoSuchElementException;
 import java.util.Objects;
 import java.util.Set;
+import java.util.WeakHashMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicReferenceArray;
 import java.util.concurrent.locks.Lock;
 import java.util.function.BiConsumer;
 import java.util.function.Supplier;
 
+import org.graalvm.collections.EconomicMap;
+import org.graalvm.collections.Equivalence;
 import org.graalvm.options.OptionValues;
 import org.graalvm.polyglot.io.MessageTransport;
 
@@ -80,6 +83,8 @@ import com.oracle.truffle.api.frame.VirtualFrame;
 import com.oracle.truffle.api.impl.Accessor;
 import com.oracle.truffle.api.impl.DispatchOutputStream;
 import com.oracle.truffle.api.instrumentation.InstrumentableNode.WrapperNode;
+import com.oracle.truffle.api.instrumentation.NearestNodesCollector.NodeListSection;
+import com.oracle.truffle.api.instrumentation.NearestNodesCollector.NodeSection;
 import com.oracle.truffle.api.instrumentation.ProbeNode.EventChainNode;
 import com.oracle.truffle.api.instrumentation.TruffleInstrument.Env;
 import com.oracle.truffle.api.nodes.LanguageInfo;
@@ -98,6 +103,7 @@ final class InstrumentationHandler {
 
     /* Enable trace output to stdout. */
     static final boolean TRACE = Boolean.getBoolean("truffle.instrumentation.trace");
+    private static final Object NOT_ENTERED = new Object();
 
     private final Object polyglotEngine;
 
@@ -108,7 +114,7 @@ final class InstrumentationHandler {
 
     final Collection<RootNode> loadedRoots = new WeakAsyncList<>(256);
     private final Collection<RootNode> executedRoots = new WeakAsyncList<>(64);
-    private final Collection<AllocationReporter> allocationReporters = new WeakAsyncList<>(16);
+    private final Map<LanguageInfo, AllocationReporter> allocationReporters = new WeakHashMap<>();
 
     private volatile boolean hasLoadOrExecutionBinding = false;
     private final CopyOnWriteList<EventBinding.Source<?>> executionBindings = new CopyOnWriteList<>(new EventBinding.Source<?>[0]);
@@ -174,7 +180,7 @@ final class InstrumentationHandler {
             trace("ON-LOAD: %-5s CallTarget: %s%n", lang, name);
         }
 
-        if (InstrumentAccessor.nodesAccess().getPolyglotEngine(root) == null) {
+        if (InstrumentAccessor.nodesAccess().getSharingLayer(root) == null) {
             return;
         }
 
@@ -185,8 +191,17 @@ final class InstrumentationHandler {
             if (!sourceSectionBindings.isEmpty() || sourcesLoaded.hasBindings()) {
                 VisitorBuilder visitorBuilder = new VisitorBuilder();
                 visitorBuilder.addNotifyLoadedOperationForAllBindings(VisitOperation.Scope.ALL);
+                if (!executionBindings.isEmpty()) {
+                    visitorBuilder.addInsertNearestWrapperCorrectionOperationForAllBindings(VisitOperation.Scope.ALL);
+                }
                 visitorBuilder.addFindSourcesOperation(VisitOperation.Scope.ALL);
                 visitRoot(root, root, visitorBuilder.buildVisitor(), false, true);
+            } else if (!executionBindings.isEmpty()) {
+                VisitorBuilder visitorBuilder = new VisitorBuilder();
+                boolean added = visitorBuilder.addInsertNearestWrapperCorrectionOperationForAllBindings(VisitOperation.Scope.ALL);
+                if (added) {
+                    visitRoot(root, root, visitorBuilder.buildVisitor(), false, true);
+                }
             }
         }
     }
@@ -218,19 +233,19 @@ final class InstrumentationHandler {
 
         Env env = new Env(polyglotInstrument, out, err, in, messageInterceptor);
         TruffleInstrument instrument = (TruffleInstrument) instrumentSupplier.get();
-        if (instrument.contextLocals == null) {
-            instrument.contextLocals = Collections.emptyList();
+        if (instrument.locals.contextLocals == null) {
+            instrument.locals.contextLocals = Collections.emptyList();
         } else {
-            instrument.contextLocals = Collections.unmodifiableList(instrument.contextLocals);
+            instrument.locals.contextLocals = Collections.unmodifiableList(instrument.locals.contextLocals);
         }
-        ENGINE.initializeInstrumentContextLocal(instrument.contextLocals, polyglotInstrument);
+        ENGINE.initializeInstrumentContextLocal(instrument.locals.contextLocals, polyglotInstrument);
 
-        if (instrument.contextThreadLocals == null) {
-            instrument.contextThreadLocals = Collections.emptyList();
+        if (instrument.locals.contextThreadLocals == null) {
+            instrument.locals.contextThreadLocals = Collections.emptyList();
         } else {
-            instrument.contextThreadLocals = Collections.unmodifiableList(instrument.contextThreadLocals);
+            instrument.locals.contextThreadLocals = Collections.unmodifiableList(instrument.locals.contextThreadLocals);
         }
-        ENGINE.initializeInstrumentContextThreadLocal(instrument.contextThreadLocals, polyglotInstrument);
+        ENGINE.initializeInstrumentContextThreadLocal(instrument.locals.contextThreadLocals, polyglotInstrument);
 
         try {
             env.instrumenter = new InstrumentClientInstrumenter(env, instrumentClassName);
@@ -350,7 +365,7 @@ final class InstrumentationHandler {
         return binding;
     }
 
-    <T> EventBinding<T> addSourceSectionBinding(EventBinding.SourceSectionLoaded<T> binding) {
+    <T> EventBinding<T> addSourceSectionBinding(EventBinding.Source<T> binding) {
         if (TRACE) {
             trace("BEGIN: Adding binding %s, %s%n", binding.getFilter(), binding.getElement());
         }
@@ -358,7 +373,7 @@ final class InstrumentationHandler {
         hasLoadOrExecutionBinding = true;
         this.sourceSectionBindings.add(binding);
 
-        if (binding.isNotifyLoaded()) {
+        if (((EventBinding.LoadedNotifier) binding).isNotifyLoaded()) {
             if (!loadedRoots.isEmpty()) {
                 VisitorBuilder visitorBuilder = new VisitorBuilder();
                 visitorBuilder.addNotifyLoadedOperationForBinding(VisitOperation.Scope.ONLY_ORIGINAL, binding);
@@ -469,7 +484,7 @@ final class InstrumentationHandler {
         }
 
         this.allocationBindings.add(binding);
-        for (AllocationReporter allocationReporter : allocationReporters) {
+        for (AllocationReporter allocationReporter : allocationReporters.values()) {
             if (binding.getAllocationFilter().contains(allocationReporter.language)) {
                 allocationReporter.addListener(binding.getElement());
             }
@@ -582,7 +597,7 @@ final class InstrumentationHandler {
         } else if (binding instanceof EventBinding.Allocation) {
             EventBinding.Allocation<?> allocationBinding = (EventBinding.Allocation<?>) binding;
             AllocationListener l = (AllocationListener) binding.getElement();
-            for (AllocationReporter allocationReporter : allocationReporters) {
+            for (AllocationReporter allocationReporter : allocationReporters.values()) {
                 if (allocationBinding.getAllocationFilter().contains(allocationReporter.language)) {
                     allocationReporter.removeListener(l);
                 }
@@ -628,7 +643,7 @@ final class InstrumentationHandler {
 
         Node parentInstrumentable = null;
         SourceSection parentInstrumentableSourceSection = null;
-        Node parentNode = probeNodeImpl.getParent();
+        Node parentNode = ((Node) probeNodeImpl.findInstrumentableNode()).getParent();
         while (parentNode != null && parentNode.getParent() != null) {
             if (parentInstrumentable == null) {
                 SourceSection parentSourceSection = parentNode.getSourceSection();
@@ -673,7 +688,7 @@ final class InstrumentationHandler {
                 parent = next;
             }
 
-            if (binding.isInstrumentedFull(providedTags, rootNode, instrumentedNode, sourceSection)) {
+            if (binding.isInstrumentedFull(providedTags, rootNode, instrumentedNode, sourceSection, true)) {
                 if (TRACE) {
                     trace("  Found binding %s, %s%n", binding.getFilter(), binding.getElement());
                 }
@@ -717,7 +732,7 @@ final class InstrumentationHandler {
                 visitorBuilder.addInsertWrapperOperationForAllBindings(VisitOperation.Scope.ALL);
                 visitorBuilder.addFindSourcesOperation(VisitOperation.Scope.ALL);
                 visitorBuilder.addFindSourcesExecutedOperation(VisitOperation.Scope.ALL);
-                visitRoot(rootNode, parentInstrumentable, visitorBuilder.buildVisitor(), true, false);
+                visitRoot(rootNode, parentInstrumentable, visitorBuilder.buildVisitor(), true, false, false);
             }
         }
     }
@@ -763,13 +778,20 @@ final class InstrumentationHandler {
     }
 
     static void notifySourceSectionLoaded(EventBinding.Source<?> binding, Node node, SourceSection section) {
-        if (section == null || binding.isDisposed()) {
+        if (section == null) {
             // Do not report null source sections to keep compatibility with the past behavior.
+            return;
+        }
+        notifySourceSectionLoaded(binding, new LoadSourceSectionEvent(section, node));
+    }
+
+    static void notifySourceSectionLoaded(EventBinding.Source<?> binding, LoadSourceSectionEvent event) {
+        if (binding.isDisposed()) {
             return;
         }
         LoadSourceSectionListener listener = (LoadSourceSectionListener) binding.getElement();
         try {
-            listener.onLoad(new LoadSourceSectionEvent(section, node));
+            listener.onLoad(event);
         } catch (Throwable t) {
             if (binding.isLanguageBinding()) {
                 throw t;
@@ -799,25 +821,26 @@ final class InstrumentationHandler {
         return newBindings;
     }
 
-    private void insertWrapper(Node instrumentableNode, SourceSection sourceSection) {
+    private ProbeNode insertWrapper(Node instrumentableNode, SourceSection sourceSection) {
         Lock lock = InstrumentAccessor.nodesAccess().getLock(instrumentableNode);
         try {
             lock.lock();
-            insertWrapperImpl(instrumentableNode, sourceSection);
+            return insertWrapperImpl(instrumentableNode, sourceSection);
         } finally {
             lock.unlock();
         }
     }
 
     @SuppressWarnings({"unchecked", "deprecation"})
-    private void insertWrapperImpl(Node node, SourceSection sourceSection) {
-        Node parent = node.getParent();
-        if (parent instanceof WrapperNode) {
+    private ProbeNode insertWrapperImpl(Node node, SourceSection sourceSection) {
+        InstrumentableNode instrumentable = (InstrumentableNode) node;
+        ProbeNode probe = instrumentable.findProbe();
+        if (probe != null) {
             // already wrapped, need to invalidate the wrapper something changed
-            invalidateWrapperImpl((WrapperNode) parent, node);
-            return;
+            invalidateProbe(node, probe);
+            return probe;
         }
-        ProbeNode probe = new ProbeNode(InstrumentationHandler.this, sourceSection);
+        probe = new ProbeNode(InstrumentationHandler.this, sourceSection);
         WrapperNode wrapper;
         if (node instanceof InstrumentableNode) {
             try {
@@ -829,11 +852,11 @@ final class InstrumentationHandler {
             throw new AssertionError();
         }
 
-        final Node wrapperNode = getWrapperNodeChecked(wrapper, node, parent);
-
+        final Node wrapperNode = getWrapperNodeChecked(wrapper, node, node.getParent());
         node.replace(wrapperNode, "Insert instrumentation wrapper node.");
 
         assert probe.getContext().validEventContextOnWrapperInsert();
+        return probe;
     }
 
     private static Node getWrapperNodeChecked(Object wrapper, Node node, Node parent) {
@@ -855,14 +878,27 @@ final class InstrumentationHandler {
         }
 
         if (!NodeUtil.isReplacementSafe(parent, node, wrapperNode)) {
+            String wrapperClass = wrapperNode.getClass().getName();
+            String nodeClass = node.getClass().getName();
+            String fieldName = NodeUtil.findChildFieldName(parent, node);
             throw new IllegalStateException(
-                            String.format("WrapperNode implementation %s cannot be safely replaced in parent node class %s.", wrapperNode.getClass().getName(), parent.getClass().getName()));
+                            String.format("Cannot insert wrapper %s for node %s because the field %s#%s cannot be assigned with a %s.%nAt %s%nYou might want to widen the field type to %s or generate a different wrapper for %s.",
+                                            wrapperClass, nodeClass, parent.getClass().getName(), fieldName, wrapperClass, node.getSourceSection(), wrapperNode.getClass().getSuperclass().getName(),
+                                            nodeClass));
         }
         return wrapperNode;
     }
 
-    private <T extends ExecutionEventNodeFactory> EventBinding<T> attachFactory(AbstractInstrumenter instrumenter, SourceSectionFilter filter, SourceSectionFilter inputFilter, T factory) {
-        return addExecutionBinding(new EventBinding.Execution<>(instrumenter, filter, inputFilter, factory));
+    private <T extends ExecutionEventNodeFactory> EventBinding<T> attachFactory(AbstractInstrumenter instrumenter, NearestSectionFilter nearestFilter, SourceSectionFilter filter,
+                    SourceSectionFilter inputFilter, T factory) {
+        assert nearestFilter == null || inputFilter == null; // They can not be non-null both.
+        EventBinding.Source<T> binding;
+        if (nearestFilter != null) {
+            binding = new EventBinding.NearestExecution<>(instrumenter, nearestFilter, filter, factory);
+        } else {
+            binding = new EventBinding.Execution<>(instrumenter, filter, inputFilter, factory);
+        }
+        return addExecutionBinding(binding);
     }
 
     private <T extends ExecutionEventListener> EventBinding<T> attachListener(AbstractInstrumenter instrumenter, SourceSectionFilter filter, SourceSectionFilter inputFilter, T listener) {
@@ -873,8 +909,15 @@ final class InstrumentationHandler {
         return addSourceLoadedBinding(new EventBinding.SourceLoaded<>(abstractInstrumenter, filter, null, listener, true, notifyLoaded));
     }
 
-    private <T> EventBinding<T> attachSourceSectionListener(AbstractInstrumenter abstractInstrumenter, SourceSectionFilter filter, T listener, boolean notifyLoaded) {
-        return addSourceSectionBinding(new EventBinding.SourceSectionLoaded<>(abstractInstrumenter, filter, null, listener, true, notifyLoaded));
+    private <T> EventBinding<T> attachSourceSectionListener(AbstractInstrumenter abstractInstrumenter, NearestSectionFilter nearestFilter, SourceSectionFilter baseFilter, T listener,
+                    boolean notifyLoaded) {
+        EventBinding.Source<T> binding;
+        if (nearestFilter != null) {
+            binding = new EventBinding.LoadNearestSection<>(abstractInstrumenter, nearestFilter, baseFilter, listener, false, notifyLoaded);
+        } else {
+            binding = new EventBinding.SourceSectionLoaded<>(abstractInstrumenter, baseFilter, null, listener, false, notifyLoaded);
+        }
+        return addSourceSectionBinding(binding);
     }
 
     private void visitLoadedSourceSections(AbstractInstrumenter abstractInstrumenter, SourceSectionFilter filter, LoadSourceSectionListener listener) {
@@ -960,81 +1003,111 @@ final class InstrumentationHandler {
         return !contextsBindings.isEmpty();
     }
 
+    boolean hasThreadBindings() {
+        return !threadsBindings.isEmpty();
+    }
+
     void notifyContextCreated(TruffleContext context) {
         for (EventBinding<? extends ContextsListener> binding : contextsBindings) {
-            binding.getElement().onContextCreated(context);
+            if (binding.getInstrumenter().isReadyForContextEvents()) {
+                binding.getElement().onContextCreated(context);
+            }
         }
     }
 
     void notifyContextClosed(TruffleContext context) {
         for (EventBinding<? extends ContextsListener> binding : contextsBindings) {
-            binding.getElement().onContextClosed(context);
+            if (binding.getInstrumenter().isReadyForContextEvents()) {
+                binding.getElement().onContextClosed(context);
+            }
         }
     }
 
     void notifyContextResetLimit(TruffleContext context) {
         for (EventBinding<? extends ContextsListener> binding : contextsBindings) {
-            binding.getElement().onContextResetLimits(context);
+            if (binding.getInstrumenter().isReadyForContextEvents()) {
+                binding.getElement().onContextResetLimits(context);
+            }
         }
     }
 
     void notifyLanguageContextCreate(TruffleContext context, LanguageInfo language) {
         for (EventBinding<? extends ContextsListener> binding : contextsBindings) {
-            binding.getElement().onLanguageContextCreate(context, language);
+            if (binding.getInstrumenter().isReadyForContextEvents()) {
+                binding.getElement().onLanguageContextCreate(context, language);
+            }
         }
     }
 
     void notifyLanguageContextCreated(TruffleContext context, LanguageInfo language) {
         for (EventBinding<? extends ContextsListener> binding : contextsBindings) {
-            binding.getElement().onLanguageContextCreated(context, language);
+            if (binding.getInstrumenter().isReadyForContextEvents()) {
+                binding.getElement().onLanguageContextCreated(context, language);
+            }
         }
     }
 
     void notifyLanguageContextCreateFailed(TruffleContext context, LanguageInfo language) {
         for (EventBinding<? extends ContextsListener> binding : contextsBindings) {
-            binding.getElement().onLanguageContextCreateFailed(context, language);
+            if (binding.getInstrumenter().isReadyForContextEvents()) {
+                binding.getElement().onLanguageContextCreateFailed(context, language);
+            }
         }
     }
 
     void notifyLanguageContextInitialize(TruffleContext context, LanguageInfo language) {
         for (EventBinding<? extends ContextsListener> binding : contextsBindings) {
-            binding.getElement().onLanguageContextInitialize(context, language);
+            if (binding.getInstrumenter().isReadyForContextEvents()) {
+                binding.getElement().onLanguageContextInitialize(context, language);
+            }
         }
     }
 
     void notifyLanguageContextInitialized(TruffleContext context, LanguageInfo language) {
         for (EventBinding<? extends ContextsListener> binding : contextsBindings) {
-            binding.getElement().onLanguageContextInitialized(context, language);
+            if (binding.getInstrumenter().isReadyForContextEvents()) {
+                binding.getElement().onLanguageContextInitialized(context, language);
+            }
         }
     }
 
     void notifyLanguageContextInitializeFailed(TruffleContext context, LanguageInfo language) {
         for (EventBinding<? extends ContextsListener> binding : contextsBindings) {
-            binding.getElement().onLanguageContextInitializeFailed(context, language);
+            if (binding.getInstrumenter().isReadyForContextEvents()) {
+                binding.getElement().onLanguageContextInitializeFailed(context, language);
+            }
         }
     }
 
     void notifyLanguageContextFinalized(TruffleContext context, LanguageInfo language) {
         for (EventBinding<? extends ContextsListener> binding : contextsBindings) {
-            binding.getElement().onLanguageContextFinalized(context, language);
+            if (binding.getInstrumenter().isReadyForContextEvents()) {
+                binding.getElement().onLanguageContextFinalized(context, language);
+            }
         }
     }
 
     void notifyLanguageContextDisposed(TruffleContext context, LanguageInfo language) {
         for (EventBinding<? extends ContextsListener> binding : contextsBindings) {
-            binding.getElement().onLanguageContextDisposed(context, language);
+            if (binding.getInstrumenter().isReadyForContextEvents()) {
+                binding.getElement().onLanguageContextDisposed(context, language);
+            }
         }
     }
 
     void notifyThreadStarted(TruffleContext context, Thread thread) {
         for (EventBinding<? extends ThreadsListener> binding : threadsBindings) {
-            binding.getElement().onThreadInitialized(context, thread);
+            if (binding.getInstrumenter().isReadyForContextEvents()) {
+                binding.getElement().onThreadInitialized(context, thread);
+            }
         }
     }
 
     void notifyThreadFinished(TruffleContext context, Thread thread) {
         for (EventBinding<? extends ThreadsListener> binding : threadsBindings) {
-            binding.getElement().onThreadDisposed(context, thread);
+            if (binding.getInstrumenter().isReadyForContextEvents()) {
+                binding.getElement().onThreadDisposed(context, thread);
+            }
         }
     }
 
@@ -1093,6 +1166,7 @@ final class InstrumentationHandler {
         visitor.rootBits = RootNodeBits.get(root);
         visitor.setExecutedRootNodeBit = setExecutedRootNodeBit;
         visitor.preVisit(root, node, firstExecution);
+        Object prevRootVisit = NOT_ENTERED;
         try {
             Lock lock = InstrumentAccessor.nodesAccess().getLock(node);
             lock.lock();
@@ -1103,6 +1177,7 @@ final class InstrumentationHandler {
                     if (TRACE) {
                         trace("BEGIN: Traverse root %s for %s%n", root.toString(), visitor);
                     }
+                    prevRootVisit = InstrumentAccessor.engineAccess().enterRootNodeVisit(root);
                     if (forceRootBitComputation) {
                         visitor.computingRootNodeBits = RootNodeBits.isUninitialized(visitor.rootBits) ? RootNodeBits.getAll() : visitor.rootBits;
                     } else if (RootNodeBits.isUninitialized(visitor.rootBits)) {
@@ -1128,7 +1203,13 @@ final class InstrumentationHandler {
                 lock.unlock();
             }
         } finally {
-            visitor.postVisit();
+            try {
+                visitor.postVisit();
+            } finally {
+                if (prevRootVisit != NOT_ENTERED) {
+                    InstrumentAccessor.engineAccess().leaveRootNodeVisit(root, prevRootVisit);
+                }
+            }
         }
 
         if (TRACE) {
@@ -1136,7 +1217,6 @@ final class InstrumentationHandler {
         }
     }
 
-    @SuppressWarnings("deprecation")
     static void removeWrapper(ProbeNode node) {
         if (TRACE) {
             trace("Remove wrapper for %s%n", node.getContext().getInstrumentedSourceSection());
@@ -1145,18 +1225,18 @@ final class InstrumentationHandler {
         ((Node) wrapperNode).replace(wrapperNode.getDelegateNode());
     }
 
-    @SuppressWarnings("deprecation")
     private static void invalidateWrapper(Node node) {
-        Node parent = node.getParent();
-        if (!(parent instanceof WrapperNode)) {
-            // not yet wrapped
+        assert node instanceof InstrumentableNode;
+
+        ProbeNode probe = ((InstrumentableNode) node).findProbe();
+        if (probe == null) {
+            // not yet inserted
             return;
         }
-        invalidateWrapperImpl((WrapperNode) parent, node);
+        invalidateProbe(node, probe);
     }
 
-    private static void invalidateWrapperImpl(WrapperNode parent, Node node) {
-        ProbeNode probeNode = parent.getProbeNode();
+    private static void invalidateProbe(Node node, ProbeNode probeNode) {
         if (TRACE) {
             SourceSection section = probeNode.getContext().getInstrumentedSourceSection();
             trace("Invalidate wrapper for %s, section %s %n", node, section);
@@ -1184,8 +1264,7 @@ final class InstrumentationHandler {
     }
 
     AllocationReporter getAllocationReporter(LanguageInfo info) {
-        AllocationReporter allocationReporter = new AllocationReporter(info);
-        allocationReporters.add(allocationReporter);
+        AllocationReporter allocationReporter = allocationReporters.computeIfAbsent(info, AllocationReporter::new);
         for (EventBinding.Allocation<? extends AllocationListener> binding : allocationBindings) {
             if (binding.getAllocationFilter().contains(info)) {
                 allocationReporter.addListener(binding.getElement());
@@ -1212,21 +1291,19 @@ final class InstrumentationHandler {
         exception.printStackTrace(stream);
     }
 
-    private static WrapperNode getWrapperNode(Node node) {
-        Node parent = node.getParent();
-        return parent instanceof WrapperNode ? (WrapperNode) parent : null;
-    }
-
     private static void clearRetiredNodeReference(Node node) {
         // There are no retired nodes the subtrees of which we need to traverse.
-        WrapperNode wrapperNode = getWrapperNode(node);
-        if (wrapperNode != null) {
-            wrapperNode.getProbeNode().clearRetiredNodeReference();
-            // At this point the probe node might already have no chain, and it
-            // also might not be updated further, and so only invalidation makes
-            // sure the wrapper gets eventually removed.
-            invalidateWrapperImpl(wrapperNode, node);
+
+        ProbeNode probe = ((InstrumentableNode) node).findProbe();
+        if (probe == null) {
+            // not yet inserted
+            return;
         }
+        probe.clearRetiredNodeReference();
+        // At this point the probe node might already have no chain, and it
+        // also might not be updated further, and so only invalidation makes
+        // sure the wrapper gets eventually removed.
+        invalidateProbe(node, probe);
     }
 
     private abstract static class VisitOperation {
@@ -1245,11 +1322,12 @@ final class InstrumentationHandler {
         }
 
         protected final Scope scope;
-        protected EventBinding.Source<?>[] bindingsAtConstructionTime;
+        protected final EventBinding.Source<?>[] bindingsAtConstructionTime;
+        protected EconomicMap<EventBinding.Source<?>, EconomicMap<Source, NearestNodesCollector>> nearestNodeCollectors;
         /**
          * True if this operation contains only one binding. The reason for storing this in a
          * separate field is that the bindings collection is either a singleton list or an async
-         * collectionswhich does not support size(). Which one of those it is is know only at
+         * collection, which does not support size(). Which one of those it is is known only at
          * construction time.
          */
         private final boolean singleBindingOperation;
@@ -1302,8 +1380,54 @@ final class InstrumentationHandler {
         protected void postVisitCleanup() {
         }
 
-        protected void postVisitNotifications() {
+        private boolean updateNearestNode(EventBinding.Source<?> binding, Node instrumentableNode, SourceSection sourceSection, SourceSection rootSection) {
+            if (!(binding instanceof EventBinding.NearestSourceSection)) {
+                return false;
+            }
+            EventBinding.NearestSourceSection<?> nearestBinding = (EventBinding.NearestSourceSection<?>) binding;
+            NearestSectionFilter nearestFilter = nearestBinding.getNearestFilter();
+            if (nearestNodeCollectors == null) {
+                nearestNodeCollectors = EconomicMap.create(Equivalence.IDENTITY_WITH_SYSTEM_HASHCODE);
+            }
+            EconomicMap<Source, NearestNodesCollector> collectorMap = nearestNodeCollectors.get(nearestBinding);
+            if (collectorMap == null) {
+                collectorMap = EconomicMap.create(Equivalence.IDENTITY_WITH_SYSTEM_HASHCODE);
+                nearestNodeCollectors.put(nearestBinding, collectorMap);
+            }
+            Source source = sourceSection.getSource();
+            NearestNodesCollector collector = collectorMap.get(source);
+            if (collector == null) {
+                collector = new NearestNodesCollector(nearestFilter);
+                collectorMap.put(source, collector);
+            }
+            collector.loadedSection(instrumentableNode, sourceSection, rootSection);
+            return true;
         }
+
+        @SuppressWarnings("unused")
+        protected void postVisitNotifications(Set<Class<?>> providedTags, SourceSection rootSourceSection) {
+        }
+
+        protected final void visitNearestSections(Set<Class<?>> providedTags, SourceSection rootSourceSection) {
+            for (EventBinding.Source<?> binding : bindingsAtConstructionTime) {
+                EconomicMap<Source, NearestNodesCollector> collectorMap = nearestNodeCollectors.get(binding);
+                if (collectorMap != null) {
+                    Set<Class<? extends Tag>> allTags = convertTags(providedTags);
+                    for (NearestNodesCollector collector : collectorMap.getValues()) {
+                        NodeSection nearest = collector.getNearest(allTags);
+                        if (nearest != null) {
+                            NodeListSection oldNearest = ((EventBinding.NearestSourceSection<?>) binding).setTheNearest(nearest, rootSourceSection, allTags);
+                            performNearest(binding, nearest, oldNearest);
+                        }
+                    }
+                }
+            }
+        }
+
+        @SuppressWarnings("unused")
+        protected void performNearest(EventBinding.Source<?> binding, NodeSection nearest, NodeListSection oldNearest) {
+        }
+
     }
 
     private class InsertWrapperOperation extends VisitOperation {
@@ -1318,6 +1442,26 @@ final class InstrumentationHandler {
         @Override
         protected void perform(EventBinding.Source<?> binding, Node node, SourceSection section, boolean executedRoot) {
             insertWrapper(node, section);
+        }
+
+        @Override
+        protected void postVisitNotifications(Set<Class<?>> providedTags, SourceSection rootSourceSection) {
+            if (nearestNodeCollectors != null) {
+                visitNearestSections(providedTags, rootSourceSection);
+            }
+        }
+
+        @Override
+        protected void performNearest(EventBinding.Source<?> binding, NodeSection nearest, NodeListSection oldNearest) {
+            if (oldNearest != null) {
+                for (WeakReference<Node> nodeRef : oldNearest.nodes) {
+                    Node oldNode = nodeRef.get();
+                    if (oldNode != null) {
+                        invalidateWrapper(oldNode);
+                    }
+                }
+                insertWrapper(nearest.node, nearest.section);
+            }
         }
     }
 
@@ -1361,13 +1505,28 @@ final class InstrumentationHandler {
         }
 
         @Override
-        protected void postVisitNotifications() {
+        protected void postVisitNotifications(Set<Class<?>> providedTags, SourceSection rootSourceSection) {
             if (notifyBindings) {
                 for (BindingLoadSourceSectionEvent loadEvent : sourceSectionLoadedList) {
                     notifySourceSectionLoaded(loadEvent.binding, loadEvent.node, loadEvent.sourceSection);
                 }
             }
+            if ((scope == Scope.ALL || scope == Scope.ONLY_ORIGINAL) && nearestNodeCollectors != null) {
+                visitNearestSections(providedTags, rootSourceSection);
+            }
         }
+
+        @Override
+        protected void performNearest(EventBinding.Source<?> binding, NodeSection nearest, NodeListSection oldNearest) {
+            if (oldNearest != null && !Objects.equals(oldNearest.section, nearest.section)) {
+                notifySourceSectionLoaded(binding, nearest.node, nearest.section);
+            }
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Set<Class<? extends Tag>> convertTags(Set<Class<?>> tags) {
+        return (Set<Class<? extends Tag>>) (Set<?>) tags;
     }
 
     private static class BindingLoadSourceSectionEvent {
@@ -1394,6 +1553,22 @@ final class InstrumentationHandler {
         @Override
         protected void perform(EventBinding.Source<?> binding, Node node, SourceSection section, boolean executedRoot) {
             invalidateWrapper(node);
+        }
+
+        @Override
+        protected void postVisitNotifications(Set<Class<?>> providedTags, SourceSection rootSourceSection) {
+            if ((scope == Scope.ALL || scope == Scope.ONLY_ORIGINAL)) {
+                for (EventBinding.Source<?> binding : bindingsAtConstructionTime) {
+                    if (binding instanceof EventBinding.NearestSourceSection) {
+                        List<Node> nodes = ((EventBinding.NearestSourceSection<?>) binding).getNearestNodes();
+                        if (nodes != null) {
+                            for (Node node : nodes) {
+                                invalidateWrapper(node);
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -1465,7 +1640,7 @@ final class InstrumentationHandler {
         }
 
         @Override
-        protected void postVisitNotifications() {
+        protected void postVisitNotifications(Set<Class<?>> providedTags, SourceSection rootSourceSection) {
             if (updateGlobalSourceList) {
                 if (newSources.isEmpty()) {
                     return;
@@ -1514,7 +1689,7 @@ final class InstrumentationHandler {
      * visitorBuilder.buildVisitor();
      * </pre>
      */
-    private class VisitorBuilder {
+    private final class VisitorBuilder {
         List<VisitOperation> operations = new ArrayList<>();
         boolean shouldMaterializeSyntaxNodes;
 
@@ -1568,6 +1743,26 @@ final class InstrumentationHandler {
                 shouldMaterializeSyntaxNodes = true;
             }
             return this;
+        }
+
+        // Correction of the nearest execution binding that takes loaded roots into account
+        boolean addInsertNearestWrapperCorrectionOperationForAllBindings(VisitOperation.Scope scope) {
+            CopyOnWriteList<EventBinding.Source<?>> nearestExecutionBindings = null;
+            for (EventBinding.Source<?> binding : executionBindings.getArray()) {
+                if (binding instanceof EventBinding.NearestExecution) {
+                    if (nearestExecutionBindings == null) {
+                        nearestExecutionBindings = new CopyOnWriteList<>(new EventBinding.Source<?>[]{binding});
+                    } else {
+                        nearestExecutionBindings.add(binding);
+                    }
+                }
+            }
+            if (nearestExecutionBindings != null) {
+                operations.add(new InsertWrapperOperation(scope, nearestExecutionBindings));
+                shouldMaterializeSyntaxNodes = true;
+                return true;
+            }
+            return false;
         }
 
         VisitorBuilder addInsertWrapperOperationForBinding(VisitOperation.Scope scope, EventBinding.Source<?> binding) {
@@ -1824,13 +2019,11 @@ final class InstrumentationHandler {
                  * materialized node that replaced the retired node. If the wrapper does not exist
                  * yet, we create it, otherwise the reference to the retired node would be lost.
                  */
-                WrapperNode wrapperNode = getWrapperNode(node);
-                if (wrapperNode == null) {
-                    insertWrapper(node, sourceSection);
+                ProbeNode probe = ((InstrumentableNode) node).findProbe();
+                if (probe == null) {
+                    probe = insertWrapper(node, sourceSection);
                 }
-                wrapperNode = getWrapperNode(node);
-                assert wrapperNode != null : "Node must have an instrumentation wrapper at this point!";
-                wrapperNode.getProbeNode().setRetiredNode(originalNode, materializeTags);
+                probe.setRetiredNode(originalNode, materializeTags);
                 /*
                  * We also need to traverse all children of the retired node that was just retired.
                  * This is necessary if the retired node is still currently executing and does not
@@ -1851,8 +2044,8 @@ final class InstrumentationHandler {
          */
         private boolean visitPreviouslyRetiredNodes(Node node) {
             if (!firstExecution) {
-                WrapperNode wrapperNode = getWrapperNode(node);
-                ProbeNode.RetiredNodeReference retiredNodeReference = (wrapperNode != null ? wrapperNode.getProbeNode().getRetiredNodeReference() : null);
+                ProbeNode probe = ((InstrumentableNode) node).findProbe();
+                ProbeNode.RetiredNodeReference retiredNodeReference = (probe != null ? probe.getRetiredNodeReference() : null);
                 if (retiredNodeReference != null) {
                     boolean hasRetiredNodes = false;
                     while (retiredNodeReference != null) {
@@ -1897,16 +2090,21 @@ final class InstrumentationHandler {
                     if (!(materializedNode instanceof Node)) {
                         throw new IllegalStateException("The returned materialized syntax node is not a Truffle Node.");
                     }
-                    if (((Node) materializedNode).getParent() != null) {
-                        throw new IllegalStateException("The returned materialized syntax node is already adopted.");
-                    }
                     SourceSection newSourceSection = ((Node) materializedNode).getSourceSection();
                     if (!Objects.equals(sourceSection, newSourceSection)) {
                         throw new IllegalStateException(String.format("The source section of the materialized syntax node must match the source section of the original node. %s != %s.", sourceSection,
                                         newSourceSection));
                     }
-
                     Node currentParent = ((Node) currentNode).getParent();
+
+                    if (((Node) materializedNode).getParent() == currentParent) {
+                        return (Node) materializedNode;
+                    }
+
+                    if (((Node) materializedNode).getParent() != null) {
+                        throw new IllegalStateException("The returned materialized syntax node is already adopted by a different parent.");
+                    }
+
                     // The current parent is a wrapper. We need to replace the wrapper.
                     if (currentParent instanceof WrapperNode && !NodeUtil.isReplacementSafe(currentParent, instrumentableNode, (Node) materializedNode)) {
                         ProbeNode probe = ((WrapperNode) currentParent).getProbeNode();
@@ -1927,8 +2125,10 @@ final class InstrumentationHandler {
             this.firstExecution = firstExec;
             this.root = r;
             this.providedTags = getProvidedTags(r);
+            Set<?> tags = (this.materializeLimitedTags == null ? this.providedTags : this.materializeLimitedTags);
+            this.materializeTags = (Set<Class<? extends Tag>>) tags;
+            InstrumentAccessor.NODES.prepareForInstrumentation(r, (Set<Class<?>>) tags);
             this.rootSourceSection = r.getSourceSection();
-            this.materializeTags = (Set<Class<? extends Tag>>) (this.materializeLimitedTags == null ? this.providedTags : this.materializeLimitedTags);
 
             for (VisitOperation operation : operations) {
                 operation.preVisit(r, rootSourceSection, setExecutedRootNodeBit || RootNodeBits.wasExecuted(rootBits), visitRoot);
@@ -1940,11 +2140,11 @@ final class InstrumentationHandler {
                 operation.postVisitCleanup();
             }
             for (VisitOperation operation : operations) {
-                operation.postVisitNotifications();
+                operation.postVisitNotifications(providedTags, rootSourceSection);
             }
         }
 
-        boolean shouldPerformForBinding(VisitOperation operation, EventBinding.Source<?> binding, Node parentInstrumentable, SourceSection parentSourceSection, Node instrumentableNode,
+        private boolean isInstrumented(VisitOperation operation, EventBinding.Source<?> binding, Node parentInstrumentable, SourceSection parentSourceSection, Node instrumentableNode,
                         SourceSection sourceSection) {
             if (singleBindingOptimization && operation.singleBindingOperation) {
                 if (singleBindingOptimizationPass) {
@@ -1954,8 +2154,23 @@ final class InstrumentationHandler {
                     return false;
                 }
             } else {
-                return binding.isInstrumentedFull(providedTags, root, instrumentableNode, sourceSection) ||
+                return binding.isInstrumentedFull(providedTags, root, instrumentableNode, sourceSection, false) ||
                                 binding.isChildInstrumentedFull(providedTags, root, parentInstrumentable, parentSourceSection, instrumentableNode, sourceSection);
+            }
+        }
+
+        boolean shouldPerformForBinding(VisitOperation operation, EventBinding.Source<?> binding, Node parentInstrumentable, SourceSection parentSourceSection, Node instrumentableNode,
+                        SourceSection sourceSection) {
+            if (isInstrumented(operation, binding, parentInstrumentable, parentSourceSection, instrumentableNode, sourceSection)) {
+                if (operation.updateNearestNode(binding, instrumentableNode, sourceSection, rootSourceSection)) {
+                    // We're collecting the nearest, no perform now.
+                    // We'll perform in postVisit().
+                    return false;
+                } else {
+                    return true;
+                }
+            } else {
+                return false;
             }
         }
 
@@ -1992,7 +2207,6 @@ final class InstrumentationHandler {
         }
     }
 
-    @SuppressWarnings("deprecation")
     private static void traceFilterCheck(String result, Node instrumentableNode, SourceSection sourceSection) {
         trace("  Filter %4s node:%s section:%s %n", result, instrumentableNode, sourceSection);
     }
@@ -2014,6 +2228,11 @@ final class InstrumentationHandler {
         }
 
         @Override
+        boolean isReadyForContextEvents() {
+            return InstrumentAccessor.engineAccess().isInstrumentReadyForContextEvents(env.getPolyglotInstrument());
+        }
+
+        @Override
         boolean isInstrumentableSource(Source source) {
             return true;
         }
@@ -2029,7 +2248,7 @@ final class InstrumentationHandler {
         }
 
         @Override
-        void verifyFilter(SourceSectionFilter filter) {
+        void verifyFilter(NearestSectionFilter nearestFilter, SourceSectionFilter sourceSectionFilter) {
         }
 
         String getInstrumentClassName() {
@@ -2054,10 +2273,10 @@ final class InstrumentationHandler {
         }
 
         private boolean checkServices(String[] expectedServices) {
-            LOOP: for (String name : expectedServices) {
+            loop: for (String name : expectedServices) {
                 for (Object obj : services) {
                     if (findType(name, obj.getClass())) {
-                        continue LOOP;
+                        continue loop;
                     }
                 }
                 failInstrumentInitialization(env, String.format("%s declares service %s but doesn't register it", instrumentClassName, name), null);
@@ -2137,6 +2356,11 @@ final class InstrumentationHandler {
     final class EngineInstrumenter extends AbstractInstrumenter {
 
         @Override
+        boolean isReadyForContextEvents() {
+            return true;
+        }
+
+        @Override
         void doFinalize() {
         }
 
@@ -2160,7 +2384,7 @@ final class InstrumentationHandler {
         }
 
         @Override
-        void verifyFilter(SourceSectionFilter filter) {
+        void verifyFilter(NearestSectionFilter nearestFilter, SourceSectionFilter sourceSectionFilter) {
         }
 
         @Override
@@ -2170,12 +2394,12 @@ final class InstrumentationHandler {
 
         @Override
         public <T extends ContextsListener> EventBinding<T> attachContextsListener(T listener, boolean includeActiveContexts) {
-            throw new UnsupportedOperationException("Not supported in engine instrumenter.");
+            return InstrumentationHandler.this.attachContextsListener(this, listener, includeActiveContexts);
         }
 
         @Override
         public <T extends ThreadsListener> EventBinding<T> attachThreadsListener(T listener, boolean includeStartedThreads) {
-            throw new UnsupportedOperationException("Not supported in engine instrumenter.");
+            return InstrumentationHandler.this.attachThreadsListener(this, listener, includeStartedThreads);
         }
 
         @Override
@@ -2196,6 +2420,11 @@ final class InstrumentationHandler {
         LanguageClientInstrumenter(TruffleLanguage<?> language) {
             this.language = language;
             this.languageInfo = InstrumentAccessor.langAccess().getLanguageInfo(language);
+        }
+
+        @Override
+        boolean isReadyForContextEvents() {
+            return true;
         }
 
         @Override
@@ -2225,10 +2454,16 @@ final class InstrumentationHandler {
         }
 
         @Override
-        void verifyFilter(SourceSectionFilter filter) {
+        void verifyFilter(NearestSectionFilter nearestFilter, SourceSectionFilter sourceSectionFilter) {
+            if (nearestFilter != null) {
+                verifyTags(nearestFilter, nearestFilter.getReferencedTags());
+            }
+            verifyTags(sourceSectionFilter, sourceSectionFilter.getReferencedTags());
+        }
+
+        void verifyTags(Object filter, Set<Class<?>> referencedTags) {
             Set<Class<?>> providedTags = getProvidedTags(language);
             // filters must not reference tags not declared in @RequiredTags
-            Set<Class<?>> referencedTags = filter.getReferencedTags();
             if (!providedTags.containsAll(referencedTags)) {
                 Set<Class<?>> missingTags = new HashSet<>(referencedTags);
                 missingTags.removeAll(providedTags);
@@ -2286,6 +2521,8 @@ final class InstrumentationHandler {
      */
     abstract class AbstractInstrumenter extends Instrumenter {
 
+        abstract boolean isReadyForContextEvents();
+
         abstract void doFinalize();
 
         abstract void dispose();
@@ -2300,7 +2537,7 @@ final class InstrumentationHandler {
             InstrumentationHandler.this.addSourceExecutionBinding(binding);
         }
 
-        void attachSourceSectionBinding(EventBinding.SourceSectionLoaded<?> binding) {
+        void attachSourceSectionBinding(EventBinding.Source<?> binding) {
             InstrumentationHandler.this.addSourceSectionBinding(binding);
         }
 
@@ -2345,33 +2582,37 @@ final class InstrumentationHandler {
             if (!InstrumentationHandler.isInstrumentableNode(node)) {
                 return null;
             }
-            Node p = node.getParent();
-            if (p instanceof WrapperNode) {
-                WrapperNode w = (WrapperNode) p;
-                return w.getProbeNode().lookupExecutionEventNode(binding);
-            } else {
-                return null;
+            ProbeNode probe = ((InstrumentableNode) node).findProbe();
+            if (probe != null) {
+                return probe.lookupExecutionEventNode(binding);
             }
+            return null;
         }
 
         @Override
         public <T extends ExecutionEventNodeFactory> EventBinding<T> attachExecutionEventFactory(SourceSectionFilter filter, SourceSectionFilter inputFilter, T factory) {
-            verifyFilter(filter);
-            return InstrumentationHandler.this.attachFactory(this, filter, inputFilter, factory);
+            verifyFilter(null, filter);
+            return InstrumentationHandler.this.attachFactory(this, null, filter, inputFilter, factory);
+        }
+
+        @Override
+        public <T extends ExecutionEventNodeFactory> EventBinding<T> attachExecutionEventFactory(NearestSectionFilter nearestFilter, SourceSectionFilter baseFilter, T factory) {
+            verifyFilter(nearestFilter, baseFilter);
+            return InstrumentationHandler.this.attachFactory(this, nearestFilter, baseFilter, null, factory);
         }
 
         @SuppressWarnings("deprecation")
         @Override
         public <T extends ExecutionEventListener> EventBinding<T> attachExecutionEventListener(SourceSectionFilter filter, SourceSectionFilter inputFilter, T listener) {
-            verifyFilter(filter);
+            verifyFilter(null, filter);
             return InstrumentationHandler.this.attachListener(this, filter, inputFilter, listener);
         }
 
-        @Override
         @SuppressWarnings("deprecation")
+        @Override
         public <T extends LoadSourceListener> EventBinding<T> attachLoadSourceListener(SourceSectionFilter filter, T listener, boolean includeExistingSources) {
             verifySourceOnly(filter);
-            verifyFilter(filter);
+            verifyFilter(null, filter);
             return InstrumentationHandler.this.attachSourceListener(this, filter, listener, includeExistingSources);
         }
 
@@ -2383,13 +2624,20 @@ final class InstrumentationHandler {
 
         @Override
         public <T extends LoadSourceSectionListener> EventBinding<T> attachLoadSourceSectionListener(SourceSectionFilter filter, T listener, boolean notifyLoaded) {
-            verifyFilter(filter);
-            return InstrumentationHandler.this.attachSourceSectionListener(this, filter, listener, notifyLoaded);
+            verifyFilter(null, filter);
+            return InstrumentationHandler.this.attachSourceSectionListener(this, null, filter, listener, notifyLoaded);
+        }
+
+        @Override
+        public <T extends LoadSourceSectionListener> EventBinding<T> attachLoadSourceSectionListener(NearestSectionFilter nearestFilter, SourceSectionFilter baseFilter, T listener,
+                        boolean notifyLoaded) {
+            verifyFilter(nearestFilter, baseFilter);
+            return InstrumentationHandler.this.attachSourceSectionListener(this, nearestFilter, baseFilter, listener, notifyLoaded);
         }
 
         @Override
         public void visitLoadedSourceSections(SourceSectionFilter filter, LoadSourceSectionListener listener) {
-            verifyFilter(filter);
+            verifyFilter(null, filter);
             InstrumentationHandler.this.visitLoadedSourceSections(this, filter, listener);
         }
 
@@ -2413,8 +2661,21 @@ final class InstrumentationHandler {
 
         @Override
         public <T extends LoadSourceSectionListener> EventBinding<T> createLoadSourceSectionBinding(SourceSectionFilter filter, T listener, boolean notifyLoaded) {
-            verifyFilter(filter);
+            verifyFilter(null, filter);
             return new EventBinding.SourceSectionLoaded<>(this, filter, null, listener, false, notifyLoaded);
+        }
+
+        @Override
+        public <T extends LoadSourceSectionListener> EventBinding<T> createLoadSourceSectionBinding(NearestSectionFilter nearestFilter, SourceSectionFilter baseFilter, T listener,
+                        boolean notifyLoaded) {
+            verifyFilter(nearestFilter, baseFilter);
+            EventBinding.Source<T> binding;
+            if (nearestFilter != null) {
+                binding = new EventBinding.LoadNearestSection<>(this, nearestFilter, baseFilter, listener, false, notifyLoaded);
+            } else {
+                binding = new EventBinding.SourceSectionLoaded<>(this, baseFilter, null, listener, false, notifyLoaded);
+            }
+            return binding;
         }
 
         @Override
@@ -2439,7 +2700,7 @@ final class InstrumentationHandler {
             }
         }
 
-        abstract void verifyFilter(SourceSectionFilter filter);
+        abstract void verifyFilter(NearestSectionFilter nearestFilter, SourceSectionFilter sourceSectionFilter);
 
     }
 
@@ -2472,7 +2733,7 @@ final class InstrumentationHandler {
 
         @Override
         public Iterator<E> iterator() {
-            return new Iterator<E>() {
+            return new Iterator<>() {
                 private final E[] snapshot = getArray();
                 private int cursor = 0;
 
@@ -2661,7 +2922,7 @@ final class InstrumentationHandler {
          */
         @Override
         public Iterator<R> iterator() {
-            return new Iterator<R>() {
+            return new Iterator<>() {
 
                 /*
                  * We need to capture the values field in the iterator to have a consistent view on

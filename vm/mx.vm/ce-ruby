@@ -1,3 +1,0 @@
-DYNAMIC_IMPORTS=/substratevm,/tools,truffleruby
-COMPONENTS=gvm,TruffleRuby,SubstrateVM,LibGraal,suite:tools
-DISABLE_INSTALLABLES=false

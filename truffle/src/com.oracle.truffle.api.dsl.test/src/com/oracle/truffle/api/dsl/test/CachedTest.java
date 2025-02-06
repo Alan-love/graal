@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2015, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2015, 2023, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -44,7 +44,9 @@ import static com.oracle.truffle.api.dsl.test.TestHelper.assertionsEnabled;
 import static com.oracle.truffle.api.dsl.test.TestHelper.createCallTarget;
 import static com.oracle.truffle.api.dsl.test.TestHelper.createNode;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
 import java.lang.reflect.Field;
@@ -55,9 +57,9 @@ import org.junit.Test;
 import com.oracle.truffle.api.CallTarget;
 import com.oracle.truffle.api.CompilerDirectives;
 import com.oracle.truffle.api.CompilerDirectives.CompilationFinal;
-import com.oracle.truffle.api.Truffle;
 import com.oracle.truffle.api.dsl.Cached;
 import com.oracle.truffle.api.dsl.GenerateUncached;
+import com.oracle.truffle.api.dsl.Idempotent;
 import com.oracle.truffle.api.dsl.NodeChild;
 import com.oracle.truffle.api.dsl.NodeChildren;
 import com.oracle.truffle.api.dsl.NodeField;
@@ -84,6 +86,7 @@ import com.oracle.truffle.api.dsl.test.CachedTestFactory.ChildrenNoAdoption5Fact
 import com.oracle.truffle.api.dsl.test.CachedTestFactory.ChildrenNoAdoption6Factory;
 import com.oracle.truffle.api.dsl.test.CachedTestFactory.NullChildAdoptionNodeGen;
 import com.oracle.truffle.api.dsl.test.CachedTestFactory.NullLiteralNodeGen;
+import com.oracle.truffle.api.dsl.test.CachedTestFactory.ProfileNodeGen;
 import com.oracle.truffle.api.dsl.test.CachedTestFactory.TestBoundCacheOverflowContainsFactory;
 import com.oracle.truffle.api.dsl.test.CachedTestFactory.TestCacheFieldFactory;
 import com.oracle.truffle.api.dsl.test.CachedTestFactory.TestCacheMethodFactory;
@@ -101,8 +104,10 @@ import com.oracle.truffle.api.frame.VirtualFrame;
 import com.oracle.truffle.api.nodes.Node;
 import com.oracle.truffle.api.nodes.NodeInterface;
 import com.oracle.truffle.api.nodes.RootNode;
+import com.oracle.truffle.api.profiles.ConditionProfile;
+import com.oracle.truffle.api.profiles.LoopConditionProfile;
 
-@SuppressWarnings("unused")
+@SuppressWarnings({"truffle-inlining", "truffle-neverdefault", "truffle-sharing", "unused"})
 public class CachedTest {
 
     @Test
@@ -319,6 +324,7 @@ public class CachedTest {
             return cachedValue;
         }
 
+        @Idempotent
         static boolean someMethod(int value) {
             invocations++;
             return true;
@@ -327,12 +333,12 @@ public class CachedTest {
     }
 
     private static boolean isCompileImmediately() {
-        CallTarget target = Truffle.getRuntime().createCallTarget(new RootNode(null) {
+        CallTarget target = new RootNode(null) {
             @Override
             public Object execute(VirtualFrame frame) {
                 return CompilerDirectives.inCompiledCode();
             }
-        });
+        }.getCallTarget();
         return (boolean) target.call();
     }
 
@@ -364,6 +370,7 @@ public class CachedTest {
             return cachedValue;
         }
 
+        @Idempotent
         static boolean cachedMethod(int value) {
             cachedMethodInvocations++;
             return true;
@@ -383,7 +390,7 @@ public class CachedTest {
     @NodeChildren({@NodeChild, @NodeChild})
     static class RegressionTestWarningInIsIdentical extends ValueNode {
 
-        @Specialization(guards = {"cachedName == name"})
+        @Specialization(guards = {"cachedName == name"}, limit = "3")
         protected Object directAccess(String receiver, String name, //
                         @Cached("name") String cachedName, //
                         @Cached("create(receiver, name)") Object callHandle) {
@@ -420,7 +427,7 @@ public class CachedTest {
     static class TestCachedWithProfile extends ValueNode {
 
         @Specialization
-        static int do1(int value, @Cached("create()") MySubClass mySubclass) {
+        static int do1(int value, @Cached MySubClass mySubclass) {
             return 42;
         }
     }
@@ -578,7 +585,7 @@ public class CachedTest {
 
         @Specialization
         static int do1(int value, //
-                        @Cached("createNode()") Node cachedValue) {
+                        @Cached(value = "createNode()", neverDefault = false) Node cachedValue) {
             return value;
         }
 
@@ -754,6 +761,7 @@ public class CachedTest {
     @NodeChild
     static class ConstantValueNode extends Node {
 
+        @Idempotent
         public int execute() {
             return 1;
         }
@@ -846,7 +854,7 @@ public class CachedTest {
         Node child = new ValueNode();
         root.execute(child);
         root.adoptChildren();
-        Assert.assertFalse(hasParent(root, child));
+        assertFalse(hasParent(root, child));
     }
 
     @Test
@@ -854,7 +862,7 @@ public class CachedTest {
         ChildrenNoAdoption2 root = createNode(ChildrenNoAdoption2Factory.getInstance(), false);
         Node[] children = new Node[]{new ValueNode()};
         root.execute(children);
-        Assert.assertFalse(hasParent(root, children[0]));
+        assertFalse(hasParent(root, children[0]));
     }
 
     @Test
@@ -862,7 +870,7 @@ public class CachedTest {
         ChildrenNoAdoption3 root = createNode(ChildrenNoAdoption3Factory.getInstance(), false);
         Node child = new ValueNode();
         root.execute(child);
-        Assert.assertFalse(hasParent(root, child));
+        assertFalse(hasParent(root, child));
     }
 
     @Test
@@ -870,7 +878,7 @@ public class CachedTest {
         ChildrenNoAdoption4 root = createNode(ChildrenNoAdoption4Factory.getInstance(), false);
         Node child = new ValueNode();
         root.execute(child);
-        Assert.assertFalse(hasParent(root, child));
+        assertFalse(hasParent(root, child));
     }
 
     @Test
@@ -878,7 +886,7 @@ public class CachedTest {
         ChildrenNoAdoption5 root = createNode(ChildrenNoAdoption5Factory.getInstance(), false);
         Node child = new ValueNode();
         root.execute(child);
-        Assert.assertFalse(hasParent(root, child));
+        assertFalse(hasParent(root, child));
     }
 
     @Test
@@ -886,7 +894,7 @@ public class CachedTest {
         ChildrenNoAdoption6 root = createNode(ChildrenNoAdoption6Factory.getInstance(), false);
         ConstantValueNode child = new ConstantValueNode();
         root.execute(child);
-        Assert.assertFalse(hasParent(root, child));
+        assertFalse(hasParent(root, child));
     }
 
     @GenerateUncached
@@ -910,6 +918,31 @@ public class CachedTest {
         assertNull(NullLiteralNodeGen.getUncached().execute(""));
     }
 
+    @GenerateUncached
+    abstract static class ProfileNode extends Node {
+        abstract Object execute(Object value);
+
+        @Specialization
+        static ConditionProfile do1(String value, //
+                        @Cached(inline = false) ConditionProfile conditionProfile) {
+            return conditionProfile;
+        }
+
+        @Specialization
+        static LoopConditionProfile do1(int value, //
+                        @Cached LoopConditionProfile loopProfile) {
+            return loopProfile;
+        }
+    }
+
+    @Test
+    public void testConditionProfileLoopConditionProfile() {
+        final Object conditionProfile = ProfileNodeGen.getUncached().execute("");
+        assertTrue(conditionProfile instanceof ConditionProfile);
+        assertFalse(conditionProfile instanceof LoopConditionProfile);
+        assertTrue(ProfileNodeGen.getUncached().execute(0) instanceof LoopConditionProfile);
+    }
+
     private static boolean hasParent(Node parent, Node node) {
         Node current = node != null ? node.getParent() : null;
         while (current != null) {
@@ -924,7 +957,7 @@ public class CachedTest {
     @NodeChild
     static class CacheDimensionsError1 extends ValueNode {
 
-        @Specialization(guards = "value == cachedValue")
+        @Specialization(guards = "value == cachedValue", limit = "3")
         static int[] do1(int[] value, //
                         @ExpectError("The cached dimensions attribute must be specified for array types.") @Cached("value") int[] cachedValue) {
             return cachedValue;
@@ -1038,6 +1071,31 @@ public class CachedTest {
                         @ExpectError("The cached dimensions attribute must be specified for array types.") //
                         @Cached(value = "value", adopt = false) Node[] cachedValue) {
             return cachedValue;
+        }
+
+    }
+
+    record TestRecord(boolean foo) {
+    }
+
+    @NodeChild
+    abstract static class CachedRecord extends ValueNode {
+
+        protected static TestRecord getRecord() {
+            return null;
+        }
+
+        // ensure that ElementUtils.elementEquals accepts records
+        @Specialization
+        static int do1(int x,
+                        @Cached("getRecord().foo()") boolean cached) {
+            return 0;
+        }
+
+        @Specialization
+        static int do1(double x,
+                        @Cached("getRecord().foo()") boolean cached) {
+            return 0;
         }
 
     }

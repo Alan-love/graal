@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2017, 2022, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -30,7 +30,9 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.logging.Level;
 
@@ -56,16 +58,18 @@ public final class InspectorExecutionContext {
 
     private final String name;
     private final TruffleInstrument.Env env;
+    private final PrintWriter infoOut;
     private final PrintWriter err;
     private final List<Listener> listeners = Collections.synchronizedList(new ArrayList<>(3));
     private final long id = LAST_ID.incrementAndGet();
-    private final boolean[] runPermission = new boolean[]{false};
+    private final CountDownLatch runPermission = new CountDownLatch(1);
     private final boolean inspectInternal;
     private final boolean inspectInitialization;
     private final List<URI> sourceRoots;
     private final TruffleLogger log;
     // Till the legacy TruffleLanguage.toString() is around, we must keep this as true
     private final boolean allowToStringSideEffects = true;
+    private final Long suspensionTimeout;
 
     private volatile DebuggerSuspendedInfo suspendedInfo;
     private volatile SuspendedThreadExecutor suspendThreadExecutor;
@@ -78,14 +82,17 @@ public final class InspectorExecutionContext {
     private boolean synchronous = false;
     private boolean customObjectFormatterEnabled = false;
 
-    public InspectorExecutionContext(String name, boolean inspectInternal, boolean inspectInitialization, TruffleInstrument.Env env, List<URI> sourceRoots, PrintWriter err) {
+    public InspectorExecutionContext(String name, boolean inspectInternal, boolean inspectInitialization, TruffleInstrument.Env env, List<URI> sourceRoots, PrintWriter infoOut, PrintWriter err,
+                    Long suspensionTimeout) {
         this.name = name;
         this.inspectInternal = inspectInternal;
         this.inspectInitialization = inspectInitialization;
         this.env = env;
         this.sourceRoots = sourceRoots;
+        this.infoOut = infoOut;
         this.err = err;
         this.log = env.getLogger("");
+        this.suspensionTimeout = suspensionTimeout;
     }
 
     public boolean isInspectInternal() {
@@ -106,6 +113,10 @@ public final class InspectorExecutionContext {
 
     public long getId() {
         return id;
+    }
+
+    public PrintWriter getInfoOutput() {
+        return infoOut;
     }
 
     public PrintWriter getErr() {
@@ -136,29 +147,36 @@ public final class InspectorExecutionContext {
 
     public void doRunIfWaitingForDebugger() {
         fireContextCreated();
-        synchronized (runPermission) {
-            runPermission[0] = true;
-            runPermission.notifyAll();
-        }
+        runPermission.countDown();
     }
 
     public boolean canRun() {
-        synchronized (runPermission) {
-            return runPermission[0];
-        }
+        return runPermission.getCount() == 0;
+    }
+
+    Long getSuspensionTimeout() {
+        return suspensionTimeout;
     }
 
     public ScriptsHandler acquireScriptsHandler() {
+        return acquireScriptsHandler(null);
+    }
+
+    // Acquire and associate with the debugger session.
+    ScriptsHandler acquireScriptsHandler(DebuggerSession debuggerSession) {
         ScriptsHandler sh;
         boolean attachListener = false;
         synchronized (this) {
             sh = scriptsHandler;
             if (sh == null) {
-                scriptsHandler = sh = new ScriptsHandler(inspectInternal);
+                scriptsHandler = sh = new ScriptsHandler(env, inspectInternal);
                 attachListener = true;
                 schCounter = 0;
             }
             schCounter++;
+        }
+        if (debuggerSession != null) {
+            sh.setDebuggerSession(debuggerSession);
         }
         if (attachListener) {
             schBinding = env.getInstrumenter().attachLoadSourceListener(SourceFilter.ANY, sh, true);
@@ -170,6 +188,7 @@ public final class InspectorExecutionContext {
         if (--schCounter == 0) {
             schBinding.dispose();
             schBinding = null;
+            scriptsHandler.dispose();
             scriptsHandler = null;
         }
     }
@@ -188,14 +207,19 @@ public final class InspectorExecutionContext {
         }
     }
 
-    public void waitForRunPermission() throws InterruptedException {
+    public boolean waitForRunPermission() throws InterruptedException {
+        return waitForRunPermission(null);
+    }
+
+    public boolean waitForRunPermission(Long timeoutMillis) throws InterruptedException {
         if (synchronous) {
-            return;
+            return true;
         }
-        synchronized (runPermission) {
-            while (!runPermission[0]) {
-                runPermission.wait();
-            }
+        if (timeoutMillis == null) {
+            runPermission.await();
+            return true;
+        } else {
+            return runPermission.await(timeoutMillis, TimeUnit.MILLISECONDS);
         }
     }
 
@@ -215,12 +239,16 @@ public final class InspectorExecutionContext {
     }
 
     void setValue(DebugValue debugValue, CallArgument newValue) {
+        debugValue.set(getDebugValue(newValue, debugValue.getSession()));
+    }
+
+    DebugValue getDebugValue(CallArgument newValue, DebuggerSession session) {
         String objectId = newValue.getObjectId();
         if (objectId != null) {
             RemoteObject obj = getRemoteObjectsHandler().getRemote(objectId);
-            debugValue.set(obj.getDebugValue());
+            return obj.getDebugValue();
         } else {
-            debugValue.set(newValue.getPrimitiveValue());
+            return session.createPrimitiveValue(newValue.getPrimitiveValue(), null);
         }
     }
 
@@ -312,16 +340,6 @@ public final class InspectorExecutionContext {
     }
 
     /**
-     * Returns the current debugger session if debugging is on.
-     *
-     * @return the current debugger session, or <code>null</code>.
-     */
-    public DebuggerSession getDebuggerSession() {
-        ScriptsHandler handler = this.scriptsHandler;
-        return (handler != null) ? handler.getDebuggerSession() : null;
-    }
-
-    /**
      * For test purposes only. Do not call from production code.
      */
     public static void resetIDs() {
@@ -333,10 +351,7 @@ public final class InspectorExecutionContext {
         this.suspendThreadExecutor = null;
         this.roh = null;
         assert scriptsHandler == null;
-        synchronized (runPermission) {
-            runPermission[0] = true;
-            runPermission.notifyAll();
-        }
+        runPermission.countDown();
     }
 
     public void setSynchronous(boolean synchronousExecution) {

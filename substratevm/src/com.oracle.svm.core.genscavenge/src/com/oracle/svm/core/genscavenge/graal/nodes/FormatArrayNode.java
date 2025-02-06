@@ -24,15 +24,16 @@
  */
 package com.oracle.svm.core.genscavenge.graal.nodes;
 
-import static org.graalvm.compiler.nodeinfo.NodeCycles.CYCLES_64;
-import static org.graalvm.compiler.nodeinfo.NodeSize.SIZE_64;
+import static jdk.graal.compiler.nodeinfo.NodeCycles.CYCLES_64;
+import static jdk.graal.compiler.nodeinfo.NodeSize.SIZE_64;
 
-import org.graalvm.compiler.core.common.type.StampFactory;
-import org.graalvm.compiler.graph.NodeClass;
-import org.graalvm.compiler.nodeinfo.NodeInfo;
-import org.graalvm.compiler.nodes.FixedWithNextNode;
-import org.graalvm.compiler.nodes.ValueNode;
-import org.graalvm.compiler.nodes.spi.Lowerable;
+import jdk.graal.compiler.core.common.type.StampFactory;
+import jdk.graal.compiler.graph.NodeClass;
+import jdk.graal.compiler.nodeinfo.NodeInfo;
+import jdk.graal.compiler.nodes.FixedWithNextNode;
+import jdk.graal.compiler.nodes.ValueNode;
+import jdk.graal.compiler.nodes.spi.Lowerable;
+import jdk.graal.compiler.replacements.AllocationSnippets;
 import org.graalvm.word.Pointer;
 
 @NodeInfo(cycles = CYCLES_64, size = SIZE_64)
@@ -45,11 +46,9 @@ public class FormatArrayNode extends FixedWithNextNode implements Lowerable {
     @Input protected ValueNode rememberedSet;
     @Input protected ValueNode unaligned;
     @Input protected ValueNode fillContents;
-    @Input protected ValueNode fillStartOffset;
     @Input protected ValueNode emitMemoryBarrier;
 
-    public FormatArrayNode(ValueNode memory, ValueNode hub, ValueNode length, ValueNode rememberedSet, ValueNode unaligned, ValueNode fillContents, ValueNode fillStartOffset,
-                    ValueNode emitMemoryBarrier) {
+    public FormatArrayNode(ValueNode memory, ValueNode hub, ValueNode length, ValueNode rememberedSet, ValueNode unaligned, ValueNode fillContents, ValueNode emitMemoryBarrier) {
         super(TYPE, StampFactory.objectNonNull());
         this.memory = memory;
         this.hub = hub;
@@ -57,7 +56,6 @@ public class FormatArrayNode extends FixedWithNextNode implements Lowerable {
         this.rememberedSet = rememberedSet;
         this.unaligned = unaligned;
         this.fillContents = fillContents;
-        this.fillStartOffset = fillStartOffset;
         this.emitMemoryBarrier = emitMemoryBarrier;
     }
 
@@ -85,14 +83,10 @@ public class FormatArrayNode extends FixedWithNextNode implements Lowerable {
         return fillContents;
     }
 
-    public ValueNode getFillStartOffset() {
-        return fillStartOffset;
-    }
-
     public ValueNode getEmitMemoryBarrier() {
         return emitMemoryBarrier;
     }
 
     @NodeIntrinsic
-    public static native Object formatArray(Pointer memory, Class<?> hub, int length, boolean rememberedSet, boolean unaligned, boolean fillContents, int fillStartOffset, boolean emitMemoryBarrier);
+    public static native Object formatArray(Pointer memory, Class<?> hub, int length, boolean rememberedSet, boolean unaligned, AllocationSnippets.FillContent fillContents, boolean emitMemoryBarrier);
 }

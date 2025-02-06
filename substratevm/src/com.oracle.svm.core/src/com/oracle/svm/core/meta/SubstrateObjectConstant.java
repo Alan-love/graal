@@ -24,9 +24,9 @@
  */
 package com.oracle.svm.core.meta;
 
-import com.oracle.svm.core.SubstrateUtil;
-import com.oracle.svm.core.hub.DynamicHub;
+import com.oracle.svm.util.ClassUtil;
 
+import jdk.graal.compiler.core.common.type.CompressibleConstant;
 import jdk.vm.ci.meta.Constant;
 import jdk.vm.ci.meta.JavaConstant;
 import jdk.vm.ci.meta.JavaKind;
@@ -36,14 +36,22 @@ import jdk.vm.ci.meta.VMConstant;
 
 public abstract class SubstrateObjectConstant implements JavaConstant, CompressibleConstant, VMConstant {
     public static JavaConstant forObject(Object object) {
-        return forObject(object, false);
+        return forObject(object, false, 0);
+    }
+
+    public static JavaConstant forObject(Object object, int identityHashCode) {
+        return forObject(object, false, identityHashCode);
     }
 
     public static JavaConstant forObject(Object object, boolean compressed) {
+        return forObject(object, compressed, 0);
+    }
+
+    public static JavaConstant forObject(Object object, boolean compressed, int identityHashCode) {
         if (object == null) {
             return compressed ? CompressedNullConstant.COMPRESSED_NULL : JavaConstant.NULL_POINTER;
         }
-        return new DirectSubstrateObjectConstant(object, compressed);
+        return new DirectSubstrateObjectConstant(object, compressed, identityHashCode);
     }
 
     public static JavaConstant forBoxedValue(JavaKind kind, Object value) {
@@ -154,27 +162,18 @@ public abstract class SubstrateObjectConstant implements JavaConstant, Compressi
         return getIdentityHashCode();
     }
 
+    public abstract ResolvedJavaType getType(MetaAccessProvider provider);
+
     public abstract int getIdentityHashCode();
 
-    public static int computeIdentityHashCode(Object object) {
-        if (SubstrateUtil.HOSTED && object instanceof DynamicHub) {
-            /*
-             * We need to use the identity hash code of the original java.lang.Class object and not
-             * of the DynamicHub, so that hash maps that are filled during image generation and use
-             * Class keys still work at run time.
-             */
-            return System.identityHashCode(((DynamicHub) object).getHostedJavaClass());
-        } else {
-            return System.identityHashCode(object);
-        }
+    protected static int computeIdentityHashCode(Object object) {
+        return System.identityHashCode(object);
     }
 
     @Override
     public String toString() {
-        return getClass().getSimpleName() + '[' + getJavaKind().getJavaName() + ']';
+        return ClassUtil.getUnqualifiedName(getClass()) + '[' + getJavaKind().getJavaName() + ']';
     }
-
-    public abstract ResolvedJavaType getType(MetaAccessProvider provider);
 
     @Override
     public abstract SubstrateObjectConstant compress();

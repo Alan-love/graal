@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020, Oracle and/or its affiliates.
+ * Copyright (c) 2020, 2023, Oracle and/or its affiliates.
  *
  * All rights reserved.
  *
@@ -29,17 +29,41 @@
  */
 package com.oracle.truffle.llvm.toolchain.launchers.common;
 
+import com.oracle.truffle.llvm.toolchain.launchers.darwin.DarwinLinker;
+import com.oracle.truffle.llvm.toolchain.launchers.linux.LinuxLinker;
+import com.oracle.truffle.llvm.toolchain.launchers.windows.WindowsLinker;
+
 import java.nio.file.Files;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
 
-import com.oracle.truffle.llvm.toolchain.launchers.darwin.DarwinLinker;
-import com.oracle.truffle.llvm.toolchain.launchers.linux.LinuxLinker;
-
 public abstract class ClangLikeBase extends Driver {
+
+    public enum Tool {
+        Clang,
+        ClangXX,
+        ClangCL,
+        Flang;
+
+        public String getToolName() {
+            switch (this) {
+                case Clang:
+                    return "clang";
+                case ClangXX:
+                    return "clang++";
+                case ClangCL:
+                    return "clang-cl";
+                case Flang:
+                    return "flang-new";
+                default:
+                    throw new IllegalArgumentException("Unknown Tool " + this.toString());
+            }
+        }
+    }
 
     public static final String NATIVE_PLATFORM = "native";
     public static final String XCRUN = "/usr/bin/xcrun";
@@ -51,18 +75,20 @@ public abstract class ClangLikeBase extends Driver {
     protected final boolean needCompilerFlags;
     protected final boolean verbose;
     protected final boolean help;
-    protected final boolean cxx;
+    protected final Tool tool;
     protected final boolean earlyExit;
     protected final OS os;
+    protected final Arch arch;
     protected final String[] args;
     protected final String platform;
     protected final int outputFlagPos;
     protected final boolean nostdincxx;
 
-    protected ClangLikeBase(String[] args, boolean cxx, OS os, String platform) {
-        super(cxx ? "clang++" : "clang");
-        this.cxx = cxx;
+    protected ClangLikeBase(String[] args, Tool tool, OS os, Arch arch, String platform) {
+        super(tool.getToolName());
+        this.tool = tool;
         this.os = os;
+        this.arch = arch;
         this.platform = platform;
         boolean mayHaveInputFiles = false;
         boolean mayBeLinkerInvocation = true;
@@ -114,7 +140,9 @@ public abstract class ClangLikeBase extends Driver {
                     break;
             }
             if (arg.startsWith("-fuse-ld=")) {
-                unsupportedFlagExit("-fuse-ld");
+                if (!isDefaultLinker(arg)) {
+                    unsupportedFlagExit("-fuse-ld");
+                }
             }
         }
         this.args = keepArgs ? args : Arrays.stream(args).filter(Objects::nonNull).toArray(String[]::new);
@@ -153,6 +181,9 @@ public abstract class ClangLikeBase extends Driver {
         List<String> sulongArgs = new ArrayList<>();
         if (os == OS.DARWIN && Files.isExecutable(Paths.get(XCRUN)) && Files.isExecutable(Paths.get(exe))) {
             sulongArgs.add(XCRUN);
+            if (verbose) {
+                sulongArgs.add("--verbose");
+            }
         }
         sulongArgs.add(exe);
 
@@ -170,13 +201,50 @@ public abstract class ClangLikeBase extends Driver {
     protected void getCompilerArgs(List<String> sulongArgs) {
         // use -gdwarf-5 instead of -g to enable source file checksums
         sulongArgs.addAll(Arrays.asList("-flto=full", "-gdwarf-5", "-O1"));
+        sulongArgs.addAll(getVectorInstructionSetFlags());
+
+        if (os == OS.WINDOWS) {
+            sulongArgs.add("-stdlib++-isystem");
+            sulongArgs.add(getSulongHome().resolve("include").resolve("c++").resolve("v1").toString());
+        }
+    }
+
+    private List<String> getVectorInstructionSetFlags() {
+        switch (arch) {
+            case X86_64:
+                return Arrays.asList("-mno-sse3", "-mno-avx");
+            default:
+                return Collections.emptyList();
+        }
+    }
+
+    private boolean isDefaultLinker(String useLdFlag) {
+        // Check whether the -fuse-ld= flag would select the same tool we're going to use.
+        String linker = useLdFlag.substring(useLdFlag.indexOf('=') + 1);
+        if (os == OS.LINUX) {
+            return LinuxLinker.LD_LLD.equals(linker) || LinuxLinker.LLD.equals(linker);
+        } else if (os == OS.WINDOWS) {
+            return WindowsLinker.LLD_LINK.equals(linker) || WindowsLinker.LLD_LINK_NO_EXE.equals(linker);
+        } else if (os == OS.DARWIN) {
+            return DarwinLinker.LD64_LLD.equals(linker) || DarwinLinker.LLD.equals(linker);
+        } else {
+            return false;
+        }
     }
 
     protected void getLinkerArgs(List<String> sulongArgs) {
         if (os == OS.LINUX) {
-            sulongArgs.addAll(Arrays.asList("-fuse-ld=" + getLLVMExecutable(LinuxLinker.LLD), "-Wl," + String.join(",", LinuxLinker.getLinkerFlags())));
+            sulongArgs.add("-fuse-ld=lld");
+            sulongArgs.add("--ld-path=" + getLLVMExecutable(LinuxLinker.LD_LLD));
+            sulongArgs.add("-Wl," + String.join(",", LinuxLinker.getLinkerFlags()));
+        } else if (os == OS.WINDOWS) {
+            sulongArgs.add("-fuse-ld=lld-link");
+            sulongArgs.add("--ld-path=" + getLLVMExecutable(WindowsLinker.LLD_LINK));
+            sulongArgs.add("-Wl," + String.join(",", WindowsLinker.getLinkerFlags()));
         } else if (os == OS.DARWIN) {
-            sulongArgs.add("-fuse-ld=" + DarwinLinker.LD);
+            sulongArgs.add("-fuse-ld=lld");
+            sulongArgs.add("--ld-path=" + getLLVMExecutable(DarwinLinker.LD64_LLD));
+            sulongArgs.add("-Wl," + String.join(",", DarwinLinker.getLinkerFlags()));
         }
     }
 

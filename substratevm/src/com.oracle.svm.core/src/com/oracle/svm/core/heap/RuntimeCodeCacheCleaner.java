@@ -31,12 +31,12 @@ import com.oracle.svm.core.code.CodeInfo;
 import com.oracle.svm.core.code.CodeInfoAccess;
 import com.oracle.svm.core.code.CodeInfoTable;
 import com.oracle.svm.core.code.RuntimeCodeCache.CodeInfoVisitor;
+import com.oracle.svm.core.code.RuntimeCodeInfoAccess;
+import com.oracle.svm.core.code.RuntimeCodeInfoHistory;
+import com.oracle.svm.core.code.RuntimeCodeInfoMemory;
 import com.oracle.svm.core.graal.meta.SharedRuntimeMethod;
 
 import jdk.vm.ci.meta.SpeculationLog.SpeculationReason;
-
-import com.oracle.svm.core.code.RuntimeCodeInfoAccess;
-import com.oracle.svm.core.code.RuntimeCodeInfoMemory;
 
 /**
  * Cleans the code cache and frees the unmanaged memory that is used by {@link CodeInfo} objects.
@@ -50,7 +50,7 @@ public final class RuntimeCodeCacheCleaner implements CodeInfoVisitor {
      * <ul>
      * <li>{@link SpeculationReason} objects are embedded in the code and only needed when a
      * deoptimization is triggered.</li>
-     * <li>{@link SharedRuntimeMethod} objects are sometimes used as artifical methods (e.g., for
+     * <li>{@link SharedRuntimeMethod} objects are sometimes used as artificial methods (e.g., for
      * adapter code) and are located in the frame info object constants.</li>
      * </ul>
      */
@@ -61,7 +61,7 @@ public final class RuntimeCodeCacheCleaner implements CodeInfoVisitor {
     }
 
     @Override
-    public <T extends CodeInfo> boolean visitCode(T codeInfo) {
+    public boolean visitCode(CodeInfo codeInfo) {
         if (RuntimeCodeInfoAccess.areAllObjectsOnImageHeap(codeInfo)) {
             return true;
         }
@@ -72,7 +72,7 @@ public final class RuntimeCodeCacheCleaner implements CodeInfoVisitor {
         } else if (state == CodeInfo.STATE_READY_FOR_INVALIDATION) {
             // All objects that are accessed during invalidation must still be reachable.
             CodeInfoTable.invalidateNonStackCodeAtSafepoint(codeInfo);
-            assert CodeInfoAccess.getState(codeInfo) == CodeInfo.STATE_PARTIALLY_FREED;
+            assert CodeInfoAccess.getState(codeInfo) == CodeInfo.STATE_INVALIDATED;
             freeMemory(codeInfo);
         }
         return true;
@@ -81,6 +81,7 @@ public final class RuntimeCodeCacheCleaner implements CodeInfoVisitor {
     private static void freeMemory(CodeInfo codeInfo) {
         boolean removed = RuntimeCodeInfoMemory.singleton().removeDuringGC(codeInfo);
         assert removed : "must have been present";
-        RuntimeCodeInfoAccess.releaseMethodInfoMemory(codeInfo, false);
+        RuntimeCodeInfoHistory.singleton().logFree(codeInfo);
+        RuntimeCodeInfoAccess.free(codeInfo);
     }
 }

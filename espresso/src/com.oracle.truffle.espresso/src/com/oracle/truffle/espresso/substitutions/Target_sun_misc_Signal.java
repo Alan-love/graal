@@ -28,11 +28,9 @@ import java.util.WeakHashMap;
 import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
 import com.oracle.truffle.api.TruffleLogger;
 import com.oracle.truffle.espresso.EspressoLanguage;
-import com.oracle.truffle.espresso.impl.Method;
-import com.oracle.truffle.espresso.impl.ObjectKlass;
 import com.oracle.truffle.espresso.meta.EspressoError;
 import com.oracle.truffle.espresso.meta.Meta;
-import com.oracle.truffle.espresso.runtime.StaticObject;
+import com.oracle.truffle.espresso.runtime.staticobject.StaticObject;
 
 import sun.misc.Signal;
 import sun.misc.SignalHandler;
@@ -45,8 +43,8 @@ public final class Target_sun_misc_Signal {
     @SuppressWarnings("unused")
     @Substitution(versionFilter = VersionFilter.Java8OrEarlier.class)
     @TruffleBoundary
-    public static int findSignal(@Host(String.class) StaticObject name,
-                    @InjectMeta Meta meta) {
+    public static int findSignal(@JavaType(String.class) StaticObject name,
+                    @Inject Meta meta) {
         if (StaticObject.isNull(name)) {
             throw meta.throwNullPointerException();
         }
@@ -60,8 +58,8 @@ public final class Target_sun_misc_Signal {
     @SuppressWarnings("unused")
     @Substitution(versionFilter = VersionFilter.Java8OrEarlier.class)
     @TruffleBoundary
-    public static void raise(@Host(Signal.class) StaticObject signal,
-                    @InjectMeta Meta meta) {
+    public static void raise(@JavaType(Signal.class) StaticObject signal,
+                    @Inject Meta meta) {
         if (StaticObject.isNull(signal)) {
             throw meta.throwNullPointerException();
         }
@@ -81,20 +79,20 @@ public final class Target_sun_misc_Signal {
     }
 
     private static StaticObject asGuestSignal(Signal signal, Meta meta) {
-        StaticObject guestSignal = meta.sun_misc_Signal.allocateInstance();
-        meta.sun_misc_Signal_init_String.invokeDirect(guestSignal, meta.toGuestString(signal.getName()));
+        StaticObject guestSignal = meta.sun_misc_Signal.allocateInstance(meta.getContext());
+        meta.sun_misc_Signal_init_String.invokeDirectSpecial(guestSignal, meta.toGuestString(signal.getName()));
         return guestSignal;
     }
 
     @SuppressWarnings("unused")
     @Substitution(versionFilter = VersionFilter.Java8OrEarlier.class)
     @TruffleBoundary
-    public static @Host(SignalHandler.class) StaticObject handle(@Host(Signal.class) StaticObject signal, @Host(SignalHandler.class) StaticObject handler,
-                    @InjectMeta Meta meta) {
+    public static @JavaType(SignalHandler.class) StaticObject handle(@JavaType(Signal.class) StaticObject signal, @JavaType(SignalHandler.class) StaticObject handler,
+                    @Inject Meta meta) {
         if (StaticObject.isNull(signal)) {
             throw meta.throwNullPointerException();
         }
-        if (!meta.getContext().EnableSignals) {
+        if (!meta.getContext().getEspressoEnv().EnableSignals) {
             logger.fine(() -> "failed to setup handler for " + asHostSignal(signal, meta) + ": signal handling is disabled ");
             throw meta.throwExceptionWithMessage(meta.java_lang_IllegalArgumentException, "Signal API is disabled");
         }
@@ -168,10 +166,7 @@ public final class Target_sun_misc_Signal {
             // the VM will call this on an un-attached thread
             Object prev = meta.getContext().getEnv().getContext().enter(null);
             try {
-                int iTableIndex = meta.sun_misc_SignalHandler_handle.getITableIndex();
-                Method handleMethod = ((ObjectKlass) guestHandler.getKlass()).itableLookup(meta.sun_misc_SignalHandler, iTableIndex);
-                assert handleMethod != null;
-                handleMethod.invokeDirect(guestHandler, asGuestSignal(sig, meta));
+                meta.sun_misc_SignalHandler_handle.invokeDirectInterface(guestHandler, asGuestSignal(sig, meta));
             } finally {
                 meta.getContext().getEnv().getContext().leave(null, prev);
             }

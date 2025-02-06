@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2017, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * The Universal Permissive License (UPL), Version 1.0
@@ -40,12 +40,14 @@
  */
 package com.oracle.truffle.nfi.test;
 
+import static com.oracle.truffle.nfi.test.NFITest.NFITestRootNode.getInterop;
 import static org.hamcrest.CoreMatchers.instanceOf;
 import static org.hamcrest.CoreMatchers.is;
 
 import java.util.HashMap;
 import java.util.Map;
 
+import org.hamcrest.MatcherAssert;
 import org.junit.Assert;
 import org.junit.Test;
 import org.junit.runner.RunWith;
@@ -63,12 +65,15 @@ import com.oracle.truffle.api.interop.TruffleObject;
 import com.oracle.truffle.api.library.CachedLibrary;
 import com.oracle.truffle.api.library.ExportLibrary;
 import com.oracle.truffle.api.library.ExportMessage;
+import com.oracle.truffle.api.nodes.IndirectCallNode;
 import com.oracle.truffle.api.nodes.Node;
-import static com.oracle.truffle.nfi.test.NFITest.NFITestRootNode.getInterop;
+import com.oracle.truffle.api.source.Source;
+import com.oracle.truffle.nfi.api.SignatureLibrary;
 import com.oracle.truffle.tck.TruffleRunner;
 import com.oracle.truffle.tck.TruffleRunner.Inject;
 
 @RunWith(TruffleRunner.class)
+@SuppressWarnings({"truffle-inlining", "truffle-neverdefault", "truffle-sharing"})
 public class RegisterPackageNFITest extends NFITest {
 
     private static final FunctionRegistry REGISTRY = new FunctionRegistry();
@@ -115,16 +120,20 @@ public class RegisterPackageNFITest extends NFITest {
 
             protected abstract void execute(FunctionRegistry receiver, String name, String signature, Object symbol);
 
-            @Specialization(limit = "3")
-            static void register(FunctionRegistry receiver, String name, String signature, Object symbol,
-                            @CachedLibrary("symbol") InteropLibrary interop) {
-                try {
-                    Object boundSymbol = interop.invokeMember(symbol, "bind", signature);
-                    receiver.add(name, boundSymbol);
-                } catch (InteropException ex) {
-                    CompilerDirectives.transferToInterpreter();
-                    throw new AssertionError(ex);
-                }
+            @TruffleBoundary
+            CallTarget parseSignature(String signature) {
+                Source source = Source.newBuilder("nfi", signature, "signature").build();
+                return runWithPolyglot.getTruffleTestEnv().parseInternal(source);
+            }
+
+            @Specialization
+            void register(FunctionRegistry receiver, String name, String sigString, Object symbol,
+                            @Cached IndirectCallNode callSignature,
+                            @CachedLibrary(limit = "5") SignatureLibrary signatures) {
+                CallTarget sigTarget = parseSignature(sigString);
+                Object signature = callSignature.call(sigTarget);
+                Object boundSymbol = signatures.bind(signature, symbol);
+                receiver.add(name, boundSymbol);
             }
         }
     }
@@ -173,7 +182,7 @@ public class RegisterPackageNFITest extends NFITest {
     @Test
     public void testPythagoras(@Inject(RegisterPackageTestNode.class) CallTarget callTarget) {
         Object ret = callTarget.call(3.0, 4.0);
-        Assert.assertThat("return value", ret, is(instanceOf(Double.class)));
+        MatcherAssert.assertThat("return value", ret, is(instanceOf(Double.class)));
         Assert.assertEquals("return value", 5.0, ret);
     }
 }

@@ -24,39 +24,31 @@
  */
 package com.oracle.svm.core.heap;
 
-//Checkstyle: allow reflection
-
 import java.lang.ref.PhantomReference;
 import java.lang.ref.Reference;
 import java.lang.reflect.Field;
 import java.util.function.BooleanSupplier;
 
-import com.oracle.svm.core.SubstrateUtil;
-import org.graalvm.compiler.api.directives.GraalDirectives;
 import org.graalvm.nativeimage.Platform;
 import org.graalvm.nativeimage.Platforms;
+import org.graalvm.nativeimage.hosted.FieldValueTransformer;
 
 import com.oracle.svm.core.SubstrateOptions;
+import com.oracle.svm.core.SubstrateUtil;
+import com.oracle.svm.core.Uninterruptible;
 import com.oracle.svm.core.annotate.Alias;
 import com.oracle.svm.core.annotate.Delete;
-import com.oracle.svm.core.annotate.ExcludeFromReferenceMap;
 import com.oracle.svm.core.annotate.Inject;
 import com.oracle.svm.core.annotate.KeepOriginal;
 import com.oracle.svm.core.annotate.RecomputeFieldValue;
-import com.oracle.svm.core.annotate.RecomputeFieldValue.CustomFieldValueComputer;
 import com.oracle.svm.core.annotate.Substitute;
 import com.oracle.svm.core.annotate.TargetClass;
 import com.oracle.svm.core.annotate.TargetElement;
-import com.oracle.svm.core.annotate.Uninterruptible;
-import com.oracle.svm.core.annotate.UnknownClass;
-import com.oracle.svm.core.jdk.JDK11OrLater;
-import com.oracle.svm.core.jdk.JDK16OrLater;
-import com.oracle.svm.core.jdk.JDK8OrEarlier;
+import com.oracle.svm.core.jdk.JDKLatest;
 import com.oracle.svm.core.util.VMError;
 import com.oracle.svm.util.ReflectionUtil;
 
-import jdk.vm.ci.meta.MetaAccessProvider;
-import jdk.vm.ci.meta.ResolvedJavaField;
+import jdk.graal.compiler.nodes.java.ReachabilityFenceNode;
 
 /**
  * Substitution of {@link Reference}, which is the abstract base class of all non-strong reference
@@ -86,6 +78,12 @@ public final class Target_java_lang_ref_Reference<T> {
     @Inject @RecomputeFieldValue(kind = RecomputeFieldValue.Kind.FieldOffset, name = ReferenceInternals.REFERENT_FIELD_NAME, declClass = Target_java_lang_ref_Reference.class) //
     static long referentFieldOffset;
 
+    @Inject @RecomputeFieldValue(kind = RecomputeFieldValue.Kind.FieldOffset, name = "queue", declClass = Target_java_lang_ref_Reference.class) //
+    static long queueFieldOffset;
+
+    @Inject @RecomputeFieldValue(kind = RecomputeFieldValue.Kind.FieldOffset, name = "next", declClass = Target_java_lang_ref_Reference.class) //
+    static long nextFieldOffset;
+
     @Inject @RecomputeFieldValue(kind = RecomputeFieldValue.Kind.FieldOffset, name = "discovered", declClass = Target_java_lang_ref_Reference.class) //
     static long discoveredFieldOffset;
 
@@ -98,12 +96,12 @@ public final class Target_java_lang_ref_Reference<T> {
      * {@link Target_java_lang_ref_Reference#clear0()} may set this field to null.
      */
     @Alias @RecomputeFieldValue(kind = RecomputeFieldValue.Kind.Custom, declClass = ComputeReferenceValue.class) //
-    @ExcludeFromReferenceMap(reason = "Field is manually processed by the garbage collector.") //
+    @ExcludeFromReferenceMap(reason = "The GC processes this field manually.") //
     T referent;
 
     @SuppressWarnings("unused") //
     @Alias @RecomputeFieldValue(kind = RecomputeFieldValue.Kind.Reset) //
-    @ExcludeFromReferenceMap(reason = "Some GCs process this field manually.", onlyIf = NotSerialGC.class) //
+    @ExcludeFromReferenceMap(reason = "The GC processes this field manually.") //
     transient Target_java_lang_ref_Reference<?> discovered;
 
     @Alias @RecomputeFieldValue(kind = RecomputeFieldValue.Kind.Custom, declClass = ComputeQueueValue.class) //
@@ -127,23 +125,25 @@ public final class Target_java_lang_ref_Reference<T> {
     @KeepOriginal
     native T get();
 
+    @KeepOriginal
+    native void clear();
+
     @Substitute
-    public void clear() {
+    private void clear0() {
         ReferenceInternals.clear(SubstrateUtil.cast(this, Reference.class));
     }
 
-    @Substitute
-    @TargetElement(onlyWith = JDK16OrLater.class)
-    private void clear0() {
-        clear();
-    }
+    @TargetElement(onlyWith = JDKLatest.class)
+    @KeepOriginal
+    native void clearImpl();
 
     @KeepOriginal
-    @TargetElement(onlyWith = JDK16OrLater.class)
+    native boolean refersToImpl(T obj);
+
+    @KeepOriginal
     public native boolean refersTo(T obj);
 
     @Substitute
-    @TargetElement(onlyWith = JDK16OrLater.class)
     boolean refersTo0(Object obj) {
         return ReferenceInternals.refersTo(SubstrateUtil.cast(this, Reference.class), obj);
     }
@@ -154,48 +154,31 @@ public final class Target_java_lang_ref_Reference<T> {
     @KeepOriginal
     native boolean isEnqueued();
 
-    @Substitute
-    @TargetElement(onlyWith = JDK8OrEarlier.class)
-    @SuppressWarnings("unused")
-    static boolean tryHandlePending(boolean waitForNotify) {
-        /*
-         * This method in JDK 8 was replaced by waitForReferenceProcessing in JDK 11. On JDK 8, it
-         * helped with reference handling by handling a single reference (if one is available). The
-         * only caller (apart from the reference handling thread itself) in the JDK is
-         * `Bits.reserveMemory`, which passes `false` as the parameter `waitForNotify`. So our
-         * substitution, which always waits, is a considerable change in semantics. However, since
-         * `Bits.reserveMemory` did not change much between JDK 8 and JDK 11, this is OK.
-         */
-        try {
-            return ReferenceInternals.waitForReferenceProcessing();
-        } catch (InterruptedException ex) {
-            Thread.currentThread().interrupt();
-            /*
-             * The caller might loop until "there is no more progress", i.e., until this method
-             * returns false. So returning true could lead to an infinite loop in the caller that is
-             * not interruptible.
-             */
-            return false;
-        }
-    }
-
     /** May be used by {@code JavaLangRefAccess} via {@code SharedSecrets}. */
     @Substitute
-    @TargetElement(onlyWith = JDK11OrLater.class)
     static boolean waitForReferenceProcessing() throws InterruptedException {
         return ReferenceInternals.waitForReferenceProcessing();
     }
 
     @Override
     @KeepOriginal //
-    @TargetElement(onlyWith = JDK11OrLater.class) //
     protected native Object clone() throws CloneNotSupportedException;
 
+    /** Intrinsified to a {@link ReachabilityFenceNode}. */
     @Substitute //
-    @TargetElement(onlyWith = JDK11OrLater.class) //
     @SuppressWarnings("unused")
     static void reachabilityFence(Object ref) {
-        GraalDirectives.blackhole(ref);
+        throw VMError.shouldNotReachHere("Unreachable, intrinsified during bytecode parsing");
+    }
+
+    @KeepOriginal
+    native T getFromInactiveFinalReference();
+
+    @Substitute //
+    void clearInactiveFinalReference() {
+        // assert this instanceof FinalReference;
+        assert next != null; // I.e. FinalReference is inactive
+        ReferenceInternals.clear(SubstrateUtil.cast(this, Reference.class));
     }
 }
 
@@ -206,12 +189,12 @@ final class Target_java_lang_ref_Reference_ReferenceHandler {
 }
 
 @Platforms(Platform.HOSTED_ONLY.class)
-class ComputeReferenceValue implements CustomFieldValueComputer {
+class ComputeReferenceValue implements FieldValueTransformer {
 
     private static final Field REFERENT_FIELD = ReflectionUtil.lookupField(Reference.class, "referent");
 
     @Override
-    public Object compute(MetaAccessProvider metaAccess, ResolvedJavaField original, ResolvedJavaField annotated, Object receiver) {
+    public Object transform(Object receiver, Object originalValue) {
         if (receiver instanceof PhantomReference) {
             /*
              * PhantomReference does not allow access to its object, so it is mostly useless to have
@@ -233,12 +216,12 @@ class ComputeReferenceValue implements CustomFieldValueComputer {
 }
 
 @Platforms(Platform.HOSTED_ONLY.class)
-class ComputeQueueValue implements CustomFieldValueComputer {
+class ComputeQueueValue implements FieldValueTransformer {
 
     private static final Field QUEUE_FIELD = ReflectionUtil.lookupField(Reference.class, "queue");
 
     @Override
-    public Object compute(MetaAccessProvider metaAccess, ResolvedJavaField original, ResolvedJavaField annotated, Object receiver) {
+    public Object transform(Object receiver, Object originalValue) {
         try {
             return QUEUE_FIELD.get(receiver);
         } catch (ReflectiveOperationException ex) {
@@ -248,9 +231,9 @@ class ComputeQueueValue implements CustomFieldValueComputer {
 }
 
 @Platforms(Platform.HOSTED_ONLY.class)
-class NotSerialGC implements BooleanSupplier {
+class NotSerialNotEpsilonGC implements BooleanSupplier {
     @Override
     public boolean getAsBoolean() {
-        return !SubstrateOptions.UseSerialGC.getValue();
+        return !SubstrateOptions.useSerialGC() && !SubstrateOptions.useEpsilonGC();
     }
 }

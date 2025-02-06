@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2021, Oracle and/or its affiliates.
+# Copyright (c) 2021, 2022, Oracle and/or its affiliates.
 #
 # All rights reserved.
 #
@@ -27,7 +27,7 @@
 # NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED
 # OF THE POSSIBILITY OF SUCH DAMAGE.
 #
-cmake_minimum_required(VERSION 3.10)
+cmake_minimum_required(VERSION 3.15)
 project(com.oracle.truffle.llvm.libraries.graalvm.llvm.libs LANGUAGES C)
 
 set(GRAALVM_LLVM_INCLUDE_DIR)
@@ -46,15 +46,25 @@ else()
     set(CMAKE_INSTALL_RPATH "\$ORIGIN")
 endif()
 
-
 # using glob patterns is not recommended: https://cmake.org/cmake/help/latest/command/file.html#glob
 add_library(graalvm-llvm SHARED
     src/common.c
     src/handles.c
+    src/intrinsics.c
     src/polyglot.c
+    src/polyglot-buffer.c
+    src/polyglot-time.c
     src/toolchain-api.c
     src/truffle-compat.c
 )
+
+if(WIN32)
+  target_sources(graalvm-llvm PRIVATE
+    src/threads.c
+    graalvm-llvm.def)
+endif()
+
 target_include_directories(graalvm-llvm PRIVATE ${GRAALVM_LLVM_INCLUDE_DIR})
+target_include_directories(graalvm-llvm PRIVATE include)
 set_target_properties(graalvm-llvm PROPERTIES VERSION 1)
 install(TARGETS graalvm-llvm DESTINATION bin)
